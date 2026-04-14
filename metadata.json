@@ -1,0 +1,5 @@
+{
+  "name": "VoxLeads AI",
+  "description": "Automated AI voice sales agent for lead management and appointment scheduling.",
+  "requestFramePermissions": ["microphone"]
+}
