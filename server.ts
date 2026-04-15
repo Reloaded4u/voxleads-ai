@@ -54,7 +54,6 @@ function sanitizeForFirestore(obj: any): any {
   }
 
   // Check if it's a special Firestore object (like FieldValue)
-  // In admin SDK, these are usually instances of FieldValue
   if (obj instanceof admin.firestore.FieldValue) {
     return obj;
   }
@@ -452,7 +451,7 @@ function checkRateLimit(uid: string) {
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = process.env.PORT || 3000;
 
   app.use(express.json());
   app.use(express.urlencoded({ extended: false }));
@@ -462,7 +461,7 @@ async function startServer() {
     res.json({ status: "ok" });
   });
 
-  // Proxy for AI Voice (Mocking for now, but ready for Twilio/ElevenLabs)
+  // Proxy for AI Voice
   app.post("/api/voice/call", async (req, res) => {
     const { leadId, phoneNumber, callId, knowledgeBase } = req.body;
     const authHeader = req.headers.authorization;
@@ -489,7 +488,6 @@ async function startServer() {
       const uid = decodedToken.uid;
       console.log(`[Backend] Auth verified for user: ${uid}`);
       
-      // Fetch user settings for recording
       const userDoc = await admin.firestore().collection('users').doc(uid).get();
       const userData = userDoc.data();
       const recordingEnabled = userData?.communication?.recordingEnabled || false;
@@ -510,7 +508,6 @@ async function startServer() {
           recordingStatusCallback: `${APP_URL}/api/webhooks/twilio/recording?callId=${callId}`
         });
 
-        // Update Firestore with Twilio SID and status
         await admin.firestore().collection('calls').doc(callId).update({
           callSid: call.sid,
           provider: 'twilio',
@@ -528,7 +525,6 @@ async function startServer() {
 
       console.log(`[Backend] Initiating mock call to ${phoneNumber} for lead ${leadId} (Call ID: ${callId})`);
       
-      // Fallback to mock
       res.json({ 
         success: true, 
         message: "Call initiated (mock)",
@@ -577,8 +573,6 @@ async function startServer() {
         });
         messageId = message.sid;
         status = message.status === 'failed' ? 'failed' : 'sent';
-      } else {
-        console.log(`[Backend] Twilio not configured, mocking SMS to ${recipient}`);
       }
       
       if (logId) {
@@ -638,7 +632,6 @@ async function startServer() {
             const greeting = kb.guidance?.greeting || "Hello";
             const pitch = kb.guidance?.mainPitch || "We are calling to follow up on your interest.";
             
-            // Construct a dynamic message
             message = `${greeting}. This is a call from ${businessName}. ${pitch}`;
             console.log(`[Backend] Using KB-driven message for call ${callId}`);
           }
@@ -648,7 +641,6 @@ async function startServer() {
       console.error('[Backend] Error fetching KB for TwiML:', err);
     }
 
-    // Phase 1: Simple message playback
     response.say({ 
       voice: 'Polly.Amy',
       language: 'en-US'
@@ -701,7 +693,6 @@ async function startServer() {
     try {
       await admin.firestore().collection('calls').doc(callId as string).update(sanitizeForFirestore(updates));
       
-      // Update Queue Item if linked
       if (queueItemId) {
         const queueStatusMap: Record<string, string> = {
           'completed': 'completed',
@@ -725,7 +716,6 @@ async function startServer() {
                 updatedAt: admin.firestore.FieldValue.serverTimestamp()
               });
             } else {
-              // Handle Retries for busy/no-answer/failed
               const userDoc = await db.collection('users').doc(queueData.ownerId).get();
               const userData = userDoc.data();
               const maxAttempts = userData?.settings?.maxRetryAttempts || 3;
@@ -781,7 +771,7 @@ async function startServer() {
     res.status(200).send('OK');
   });
 
-  // Voice Control Route (Agent Join/Takeover)
+  // Voice Control Route
   app.post("/api/voice/control", async (req, res) => {
     const { callId, state, agentId } = req.body;
     const authHeader = req.headers.authorization;
@@ -795,10 +785,7 @@ async function startServer() {
     try {
       const decodedToken = await admin.auth().verifyIdToken(idToken);
       const uid = decodedToken.uid;
-
       console.log(`[Backend] User ${uid} updating call ${callId} control state to ${state}`);
-
-      // Here you would use Twilio's Update Call API to bridge the agent or modify the TwiML
       res.json({ success: true });
     } catch (error) {
       console.error('[Backend] Voice control error:', error);
@@ -820,10 +807,7 @@ async function startServer() {
     try {
       const decodedToken = await admin.auth().verifyIdToken(idToken);
       const uid = decodedToken.uid;
-
       console.log(`[Backend] User ${uid} ${enabled ? 'enabling' : 'disabling'} recording for call ${callId}`);
-
-      // Here you would use Twilio's Recording API
       res.json({ success: true });
     } catch (error) {
       console.error('[Backend] Recording control error:', error);
@@ -831,7 +815,7 @@ async function startServer() {
     }
   });
 
-  // Webhook Test Endpoint with Security Hardening
+  // Webhook Test Endpoint
   app.post("/api/webhooks/test", async (req, res) => {
     const { url } = req.body;
     const authHeader = req.headers.authorization;
@@ -843,11 +827,9 @@ async function startServer() {
     const idToken = authHeader.split('Bearer ')[1];
 
     try {
-      // 1. Verify Authentication
       const decodedToken = await admin.auth().verifyIdToken(idToken);
       const uid = decodedToken.uid;
 
-      // 2. Rate Limiting
       if (!checkRateLimit(uid)) {
         return res.status(429).json({ 
           success: false, 
@@ -855,7 +837,6 @@ async function startServer() {
         });
       }
 
-      // 3. URL Validation & SSRF Protection
       if (!url) return res.status(400).json({ success: false, message: "URL is required" });
       await validateWebhookUrl(url);
 
@@ -886,16 +867,7 @@ async function startServer() {
     } catch (error) {
       console.error('Webhook test error:', error);
       const message = error instanceof Error ? error.message : "Failed to connect to webhook URL";
-      
-      // Handle Firebase Auth errors specifically
-      if (message.includes('decoding Firebase ID token') || message.includes('expired')) {
-        return res.status(401).json({ success: false, message: "Invalid or expired session" });
-      }
-
-      res.status(message.includes('not allowed') || message.includes('Invalid URL') ? 400 : 500).json({ 
-        success: false, 
-        message 
-      });
+      res.status(500).json({ success: false, message });
     }
   });
 
@@ -910,12 +882,8 @@ async function startServer() {
     try {
       const decodedToken = await admin.auth().verifyIdToken(idToken);
       const uid = decodedToken.uid;
-      
       console.log(`[Backend] Manual queue process triggered by user ${uid}`);
-      
-      // Trigger processing for this specific user only
       await processGlobalQueue(uid);
-      
       res.json({ success: true, message: "Queue processing triggered" });
     } catch (error) {
       console.error('[Backend] Manual queue process error:', error);
@@ -923,7 +891,7 @@ async function startServer() {
     }
   });
 
-  // Website Import Route for Knowledge Base
+  // Website Import Route
   app.post("/api/knowledge-base/import", async (req, res) => {
     const { url } = req.body;
     const authHeader = req.headers.authorization;
@@ -935,11 +903,9 @@ async function startServer() {
     const idToken = authHeader.split('Bearer ')[1];
 
     try {
-      // 1. Verify Authentication
       const decodedToken = await admin.auth().verifyIdToken(idToken);
       const uid = decodedToken.uid;
 
-      // 2. Rate Limiting
       if (!checkRateLimit(uid)) {
         return res.status(429).json({ 
           success: false, 
@@ -947,12 +913,9 @@ async function startServer() {
         });
       }
 
-      // 3. URL Validation & SSRF Protection
       if (!url) return res.status(400).json({ success: false, message: "URL is required" });
       await validateWebhookUrl(url);
 
-      console.log(`User ${uid} importing from website: ${url}`);
-      
       const response = await fetch(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
@@ -968,23 +931,17 @@ async function startServer() {
 
       const html = await response.text();
       const $ = cheerio.load(html);
-
-      // Remove noise
       $('script, style, nav, footer, header, iframe, noscript, .ads, #ads').remove();
 
-      // Extract meaningful text
       const title = $('title').text().trim();
       const metaDescription = $('meta[name="description"]').attr('content') || '';
-      
-      // Get main content areas
       const mainContent = $('main, article, #content, .content, .main').text() || $('body').text();
       
-      // Clean up whitespace
       const cleanText = mainContent
         .replace(/\s+/g, ' ')
         .replace(/\n+/g, '\n')
         .trim()
-        .substring(0, 15000); // Limit to 15k chars for AI processing
+        .substring(0, 15000);
 
       res.json({ 
         success: true, 
@@ -1002,9 +959,6 @@ async function startServer() {
     }
   });
 
-  // Call Queue Worker
-  // Removed redundant processCallQueue in favor of startCallQueueWorker
-  
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -1013,8 +967,14 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
+    const distPath = path.resolve(__dirname, "dist");
+    console.log(`[Production] Serving static assets from: ${distPath}`);
+    
+    app.use(express.static(distPath, {
+      maxAge: '1d',
+      etag: true
+    }));
+
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
