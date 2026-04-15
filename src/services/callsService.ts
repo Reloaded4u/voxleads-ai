@@ -6,7 +6,7 @@ import { callContextBuilder } from './callContextBuilder';
 import { errorHandler, OperationType } from '../utils/errorHandler';
 import { timeUtils } from '../utils/timeUtils';
 import { sanitizeForFirestore } from '../lib/utils';
-import { toast } from 'sonner';
+import { toast } from '../lib/toast';
 
 export const callsService = {
   subscribeToCalls(userId: string, callback: (calls: CallRecord[]) => void) {

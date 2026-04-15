@@ -7,7 +7,7 @@ import { useCalls } from '../hooks/useCalls';
 import { useAuth } from '../hooks/useAuth';
 import { callSimulationService } from '../services/callSimulationService';
 import { callControlService } from '../services/callControlService';
-import { toast } from 'sonner';
+import { toast } from '../lib/toast';
 
 interface CallInterfaceProps {
   lead: Lead;
@@ -30,6 +30,7 @@ export default function CallInterface({ lead, onClose }: CallInterfaceProps) {
   
   const transcriptRef = useRef(transcript);
   const durationRef = useRef(duration);
+  const hasStarted = useRef(false);
 
   useEffect(() => {
     transcriptRef.current = transcript;
@@ -60,17 +61,21 @@ export default function CallInterface({ lead, onClose }: CallInterfaceProps) {
 
   useEffect(() => {
     const startCall = async () => {
+      if (hasStarted.current) return;
+      hasStarted.current = true;
+
       try {
         const result = await initiateCall(lead.id, lead.phone);
         setCallId(result.callId);
         setKb(result.kb);
         
         if (result.mode === 'test') {
-          toast.info('Real calling is not configured. Running in test mode.');
           runSimulation(result.kb);
-        } else {
-          toast.success('Live call initiated successfully');
+        } else if (result.mode === 'live') {
           setStatus('active');
+        } else if (result.mode === 'queued') {
+          // Mode 'queued' is handled by toast in callsService
+          onClose();
         }
       } catch (error) {
         console.error('Failed to initiate call:', error);

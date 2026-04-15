@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { CallRecord } from '../types';
 import { callsService } from '../services/callsService';
 import { useAuth } from './useAuth';
@@ -25,7 +25,7 @@ export function useCalls() {
     return () => unsubscribe();
   }, [user]);
 
-  const initiateCall = async (leadId: string, phoneNumber: string) => {
+  const initiateCall = useCallback(async (leadId: string, phoneNumber: string) => {
     if (!user) {
       console.error('[useCalls] initiateCall failed: User not authenticated');
       throw new Error('User not authenticated');
@@ -40,16 +40,16 @@ export function useCalls() {
       setError(err as Error);
       throw err;
     }
-  };
+  }, [user, profile?.integrations]);
 
-  const finalizeCall = async (callId: string, leadId: string, transcript: string, duration: number) => {
+  const finalizeCall = useCallback(async (callId: string, leadId: string, transcript: string, duration: number) => {
     try {
       return await callsService.finalizeCall(callId, leadId, transcript, duration);
     } catch (err) {
       setError(err as Error);
       throw err;
     }
-  };
+  }, []);
 
   return {
     calls,

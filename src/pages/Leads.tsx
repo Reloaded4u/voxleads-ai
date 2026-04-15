@@ -16,7 +16,7 @@ import { useLeads } from '../hooks/useLeads';
 import { useAuth } from '../hooks/useAuth';
 import { leadsService } from '../services/leadsService';
 import { queueService } from '../services/queueService';
-import { toast } from 'sonner';
+import { toast } from '../lib/toast';
 import { mapHeaders, validateRow, normalizePhone } from '../utils/leadImport';
 
 export default function Leads() {

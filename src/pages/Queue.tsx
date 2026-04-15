@@ -19,7 +19,7 @@ import { queueService } from '../services/queueService';
 import { QueueItem } from '../types';
 import { format } from 'date-fns';
 import { cn } from '../lib/utils';
-import { toast } from 'sonner';
+import { toast } from '../lib/toast';
 
 export default function Queue() {
   const { user } = useAuth();
