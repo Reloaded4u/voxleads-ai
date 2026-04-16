@@ -22,8 +22,6 @@ admin.initializeApp({
   projectId: config.projectId
 });
 
-const db = admin.firestore(config.firestoreDatabaseId);
-
 // Initialize Twilio
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
@@ -85,7 +83,7 @@ async function validateTwilioRequest(req: any, res: any, next: any) {
 
   try {
     // Fetch call record to find owner
-    const callDoc = await db.collection('calls').doc(callId as string).get();
+    const callDoc = await admin.firestore().collection('calls').doc(callId as string).get();
     if (!callDoc.exists) {
       console.warn('[Twilio Webhook] Call record not found for validation:', callId);
       return res.status(404).send('Call not found');
@@ -93,7 +91,7 @@ async function validateTwilioRequest(req: any, res: any, next: any) {
     const ownerId = callDoc.data()?.ownerId;
     
     // Fetch owner's Twilio config
-    const userDoc = await db.collection('users').doc(ownerId).get();
+    const userDoc = await admin.firestore().collection('users').doc(ownerId).get();
     const userData = userDoc.data();
     const authToken = userData?.integrations?.twilioAuthToken || process.env.TWILIO_AUTH_TOKEN;
 
@@ -120,18 +118,13 @@ async function validateTwilioRequest(req: any, res: any, next: any) {
 
 // Helper to get Twilio config for a user
 async function getTwilioConfig(uid: string) {
-  const userDoc = await db.collection('users').doc(uid).get();
+  const userDoc = await admin.firestore().collection('users').doc(uid).get();
   const userData = userDoc.data();
   const userIntegrations = userData?.integrations;
 
   const sid = userIntegrations?.twilioSid || process.env.TWILIO_ACCOUNT_SID;
   const token = userIntegrations?.twilioAuthToken || process.env.TWILIO_AUTH_TOKEN;
   const phone = userIntegrations?.twilioPhoneNumber || process.env.TWILIO_PHONE_NUMBER;
-
-  console.log(`[getTwilioConfig] uid: ${uid}`);
-  console.log(`[getTwilioConfig] SID found: ${!!sid} (${userIntegrations?.twilioSid ? 'User' : 'System'})`);
-  console.log(`[getTwilioConfig] Token found: ${!!token} (${userIntegrations?.twilioAuthToken ? 'User' : 'System'})`);
-  console.log(`[getTwilioConfig] Phone found: ${!!phone} (${userIntegrations?.twilioPhoneNumber ? 'User' : 'System'})`);
 
   if (sid && token && phone) {
     return {
@@ -188,6 +181,7 @@ async function startCallQueueWorker() {
 
 async function processGlobalQueue(targetUid?: string) {
   try {
+    const db = admin.firestore();
     const now = admin.firestore.Timestamp.now();
     
     let usersQuery;
@@ -263,6 +257,7 @@ async function processGlobalQueue(targetUid?: string) {
 }
 
 async function processQueueItem(queueDocId: string, userData: any) {
+  const db = admin.firestore();
   const queueRef = db.collection('callQueue').doc(queueDocId);
 
   try {
@@ -365,11 +360,7 @@ async function processQueueItem(queueDocId: string, userData: any) {
     const item = queueDoc.data();
     
     if (item) {
-      const attempts = (item.attempts || 0); // attempts already incremented if setDoc/updateDoc worked, but wait
-      // Actually attempts was incremented in the happy path. 
-      // If it failed BEFORE increment, we should increment here.
-      // But wait, the transaction marked it as processing.
-      
+      const attempts = (item.attempts || 0) + 1;
       const maxAttempts = userData.settings?.maxRetryAttempts || 3;
       const retryDelay = userData.settings?.retryDelayMinutes || 20;
       
@@ -377,7 +368,7 @@ async function processQueueItem(queueDocId: string, userData: any) {
         const nextRetry = new Date(Date.now() + retryDelay * 60 * 1000);
         await queueRef.update(sanitizeForFirestore({
           status: 'scheduled',
-          attempts: admin.firestore.FieldValue.increment(1),
+          attempts: attempts,
           nextRetryAt: admin.firestore.Timestamp.fromDate(nextRetry),
           scheduledTime: admin.firestore.Timestamp.fromDate(nextRetry),
           retryReason: error instanceof Error ? error.message : String(error),
@@ -387,6 +378,7 @@ async function processQueueItem(queueDocId: string, userData: any) {
       } else {
         await queueRef.update(sanitizeForFirestore({
           status: 'failed',
+          attempts: attempts,
           retryReason: 'Max attempts exceeded',
           lastError: error instanceof Error ? error.message : String(error),
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -475,7 +467,7 @@ async function startServer() {
     const { leadId, phoneNumber, callId, knowledgeBase } = req.body;
     const authHeader = req.headers.authorization;
     
-    console.log(`[Backend] 1. Request received for leadId: ${leadId}, callId: ${callId}`);
+    console.log(`[Backend] Voice call request received for lead ${leadId}`);
     if (knowledgeBase) {
       console.log(`[Backend] Knowledge Base context received for call ${callId}`);
     }
@@ -495,66 +487,45 @@ async function startServer() {
     try {
       const decodedToken = await admin.auth().verifyIdToken(idToken);
       const uid = decodedToken.uid;
-      console.log(`[Backend] 2. Auth verified for user: ${uid}`);
+      console.log(`[Backend] Auth verified for user: ${uid}`);
       
       // Fetch user settings for recording
-      const userDoc = await db.collection('users').doc(uid).get();
+      const userDoc = await admin.firestore().collection('users').doc(uid).get();
       const userData = userDoc.data();
       const recordingEnabled = userData?.communication?.recordingEnabled || false;
-      const liveCallingEnabled = userData?.communication?.liveCallingEnabled || false;
-      
-      console.log(`[Backend] 4. liveCallingEnabled: ${liveCallingEnabled}`);
 
       const normalizedPhone = normalizePhoneNumber(phoneNumber);
-      console.log(`[Backend] 5. Normalized phone: ${normalizedPhone}`);
-      
       const twilioConfig = await getTwilioConfig(uid);
-      console.log(`[Backend] 3. Twilio config result: ${twilioConfig ? 'Config found' : 'No config found'}`);
 
       if (twilioConfig) {
-        console.log(`[Backend] 6. Entering Twilio branch: YES`);
+        console.log(`[Backend] Initiating real Twilio call to ${normalizedPhone} (Call ID: ${callId}) using ${twilioConfig.isUserConfig ? 'user' : 'system'} credentials`);
         
-        try {
-          console.log(`[Backend] Initiating real Twilio call to ${normalizedPhone} (Call ID: ${callId}) using ${twilioConfig.isUserConfig ? 'user' : 'system'} credentials`);
-          
-          const call = await twilioConfig.client.calls.create({
-            from: twilioConfig.phoneNumber,
-            to: normalizedPhone,
-            url: `${APP_URL}/api/voice/twiml?callId=${callId}&ownerId=${uid}`,
-            statusCallback: `${APP_URL}/api/webhooks/twilio/status?callId=${callId}`,
-            statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-            record: recordingEnabled,
-            recordingStatusCallback: `${APP_URL}/api/webhooks/twilio/recording?callId=${callId}`
-          });
-          
-          console.log(`[Backend] Twilio call created successfully. SID: ${call.sid}`);
+        const call = await twilioConfig.client.calls.create({
+          from: twilioConfig.phoneNumber,
+          to: normalizedPhone,
+          url: `${APP_URL}/api/voice/twiml?callId=${callId}&ownerId=${uid}`,
+          statusCallback: `${APP_URL}/api/webhooks/twilio/status?callId=${callId}`,
+          statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+          record: recordingEnabled,
+          recordingStatusCallback: `${APP_URL}/api/webhooks/twilio/recording?callId=${callId}`
+        });
 
-          // Update Firestore with Twilio SID and status
-          await db.collection('calls').doc(callId).update({
-            callSid: call.sid,
-            provider: 'twilio',
-            status: 'initiated',
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-          });
+        // Update Firestore with Twilio SID and status
+        await admin.firestore().collection('calls').doc(callId).update({
+          callSid: call.sid,
+          provider: 'twilio',
+          status: 'initiated',
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
 
-          return res.json({ 
-            success: true, 
-            message: "Twilio call initiated",
-            callSid: call.sid,
-            mode: 'live'
-          });
-        } catch (twilioError) {
-          console.error(`[Backend] 7. Error thrown by twilio.calls.create():`, twilioError);
-          const errorMessage = twilioError instanceof Error ? twilioError.message : String(twilioError);
-          return res.status(500).json({
-            success: false,
-            message: `Twilio call creation failed: ${errorMessage}`,
-            mode: 'failed'
-          });
-        }
+        return res.json({ 
+          success: true, 
+          message: "Twilio call initiated",
+          callSid: call.sid,
+          mode: 'live'
+        });
       }
 
-      console.log(`[Backend] 6. Entering Twilio branch: NO (Fallback to mock)`);
       console.log(`[Backend] Initiating mock call to ${phoneNumber} for lead ${leadId} (Call ID: ${callId})`);
       
       // Fallback to mock
@@ -565,11 +536,11 @@ async function startServer() {
         mode: 'test'
       });
     } catch (error) {
-      console.error('[Backend] Firebase ID token verification or processing failed:', error);
-      const message = error instanceof Error ? error.message : "Internal server error";
-      res.status(500).json({ 
+      console.error('[Backend] Firebase ID token verification failed:', error);
+      const message = error instanceof Error ? error.message : "Token verification failed";
+      res.status(401).json({ 
         success: false, 
-        message: `Processing failed: ${message}` 
+        message: `Authentication failed: ${message}` 
       });
     }
   });
@@ -612,7 +583,7 @@ async function startServer() {
       
       if (logId) {
         try {
-          await db.collection('smsLogs').doc(logId).update({
+          await admin.firestore().collection('smsLogs').doc(logId).update({
             status: status,
             providerMessageId: messageId,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -632,7 +603,7 @@ async function startServer() {
       
       if (req.body.logId) {
         try {
-          await db.collection('smsLogs').doc(req.body.logId).update({
+          await admin.firestore().collection('smsLogs').doc(req.body.logId).update({
             status: 'failed',
             error: error instanceof Error ? error.message : 'Unknown backend error',
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -657,7 +628,7 @@ async function startServer() {
 
     try {
       if (callId) {
-        const callDoc = await db.collection('calls').doc(callId as string).get();
+        const callDoc = await admin.firestore().collection('calls').doc(callId as string).get();
         if (callDoc.exists) {
           const callData = callDoc.data();
           const kb = callData?.knowledgeBaseSnapshot;
@@ -728,7 +699,7 @@ async function startServer() {
     }
 
     try {
-      await db.collection('calls').doc(callId as string).update(sanitizeForFirestore(updates));
+      await admin.firestore().collection('calls').doc(callId as string).update(sanitizeForFirestore(updates));
       
       // Update Queue Item if linked
       if (queueItemId) {
@@ -742,6 +713,7 @@ async function startServer() {
 
         const finalQueueStatus = queueStatusMap[CallStatus];
         if (finalQueueStatus) {
+          const db = admin.firestore();
           const queueRef = db.collection('callQueue').doc(queueItemId as string);
           const queueDoc = await queueRef.get();
           const queueData = queueDoc.data();
@@ -795,7 +767,7 @@ async function startServer() {
     console.log(`[Twilio Webhook] Recording update for ${callId}: ${RecordingStatus}`);
 
     try {
-      await db.collection('calls').doc(callId as string).update(sanitizeForFirestore({
+      await admin.firestore().collection('calls').doc(callId as string).update(sanitizeForFirestore({
         recordingUrl: RecordingUrl,
         recordingSid: RecordingSid,
         recordingStatus: RecordingStatus === 'completed' ? 'completed' : 'processing',
