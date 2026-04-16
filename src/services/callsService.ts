@@ -102,8 +102,9 @@ export const callsService = {
           }
           return { ...liveResult, kb };
         } catch (liveError) {
+          const errorMessage = liveError instanceof Error ? liveError.message : 'Unknown error';
           console.warn('[CallsService] Live call initiation failed, falling back to test mode:', liveError);
-          toast.info('Live calling failed. Running in test mode.');
+          toast.error(`Live calling failed: ${errorMessage}. Running in test mode.`);
           // Fallback to mock call if live fails
           return { ...(await this.startMockCall(callId)), kb };
         }
