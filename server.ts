@@ -1,4 +1,4 @@
- import express from "express";
+import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -15,14 +15,16 @@ const resolve4 = promisify(dns.resolve4);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Initialize Firebase Admin from Render environment variables
+// Initialize Firebase Admin from Render JSON environment variable
+if (!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+  throw new Error("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON");
+}
+
 if (!admin.apps.length) {
+  const serviceAccount = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
+
   admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-     privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
-    }),
+    credential: admin.credential.cert(serviceAccount),
   });
 }
 
