@@ -16,16 +16,25 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Initialize Firebase Admin from Render JSON environment variable
-if (!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
-  throw new Error("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON");
-}
+try {
+  console.log("[Startup] GOOGLE_APPLICATION_CREDENTIALS_JSON present:", !!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
 
-if (!admin.apps.length) {
+  if (!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+    throw new Error("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON");
+  }
+
   const serviceAccount = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
 
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
+  if (!admin.apps.length) {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+  }
+
+  console.log("[Startup] Firebase Admin initialized successfully");
+} catch (err) {
+  console.error("[Startup] Firebase Admin initialization failed:", err);
+  throw err;
 }
 
 // Initialize Twilio
