@@ -3,9 +3,11 @@ import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
 import admin from "firebase-admin";
+import { getFirestore } from "firebase-admin/firestore";
 import validator from "validator";
 import dns from "dns";
 import { promisify } from "util";
+import fs from "fs";
 import * as cheerio from "cheerio";
 import { formatInTimeZone, toZonedTime, fromZonedTime } from "date-fns-tz";
 import twilio from "twilio";
@@ -15,7 +17,9 @@ const resolve4 = promisify(dns.resolve4);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Initialize Firebase Admin from Render JSON environment variable
+// Initialize Firebase Admin and Firestore with correct database ID
+let db: admin.firestore.Firestore;
+
 try {
   console.log("[Startup] GOOGLE_APPLICATION_CREDENTIALS_JSON present:", !!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
 
@@ -31,7 +35,28 @@ try {
     });
   }
 
-  console.log("[Startup] Firebase Admin initialized successfully");
+  // Get the database ID from environment variable or from the local config file
+  let databaseId = process.env.FIREBASE_DATABASE_ID;
+  
+  try {
+    const configPath = path.resolve(__dirname, "firebase-applet-config.json");
+    if (fs.existsSync(configPath)) {
+      const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      if (!databaseId) databaseId = config.firestoreDatabaseId;
+      console.log("[Startup] Found database ID in config file:", databaseId);
+    }
+  } catch (e) {
+    console.warn("[Startup] Could not load database ID from config file, will use fallback or default");
+  }
+
+  // Initialize Firestore with the database ID
+  if (databaseId && databaseId !== "(default)") {
+  db = getFirestore(databaseId);
+} else {
+  db = getFirestore();
+};
+
+  console.log(`[Startup] Firebase Admin and Firestore initialized successfully. Using Database: ${databaseId || 'default'}`);
 } catch (err) {
   console.error("[Startup] Firebase Admin initialization failed:", err);
   throw err;
@@ -45,6 +70,7 @@ const twilioClient =
 
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER;
 const APP_URL = process.env.APP_URL || "";
+
 // Phone Number Normalization
 function normalizePhoneNumber(phone: string) {
   let cleaned = phone.replace(/[^\d+]/g, '');
@@ -69,7 +95,6 @@ function sanitizeForFirestore(obj: any): any {
   }
 
   // Check if it's a special Firestore object (like FieldValue)
-  // In admin SDK, these are usually instances of FieldValue
   if (obj instanceof admin.firestore.FieldValue) {
     return obj;
   }
@@ -378,11 +403,7 @@ async function processQueueItem(queueDocId: string, userData: any) {
     const item = queueDoc.data();
     
     if (item) {
-      const attempts = (item.attempts || 0); // attempts already incremented if setDoc/updateDoc worked, but wait
-      // Actually attempts was incremented in the happy path. 
-      // If it failed BEFORE increment, we should increment here.
-      // But wait, the transaction marked it as processing.
-      
+      const attempts = (item.attempts || 0);
       const maxAttempts = userData.settings?.maxRetryAttempts || 3;
       const retryDelay = userData.settings?.retryDelayMinutes || 20;
       
@@ -489,9 +510,6 @@ async function startServer() {
     const authHeader = req.headers.authorization;
     
     console.log(`[Backend] 1. Request received for leadId: ${leadId}, callId: ${callId}`);
-    if (knowledgeBase) {
-      console.log(`[Backend] Knowledge Base context received for call ${callId}`);
-    }
 
     if (!authHeader) {
       console.error('[Backend] Authorization header missing');
@@ -839,7 +857,6 @@ async function startServer() {
 
       console.log(`[Backend] User ${uid} updating call ${callId} control state to ${state}`);
 
-      // Here you would use Twilio's Update Call API to bridge the agent or modify the TwiML
       res.json({ success: true });
     } catch (error) {
       console.error('[Backend] Voice control error:', error);
@@ -864,7 +881,6 @@ async function startServer() {
 
       console.log(`[Backend] User ${uid} ${enabled ? 'enabling' : 'disabling'} recording for call ${callId}`);
 
-      // Here you would use Twilio's Recording API
       res.json({ success: true });
     } catch (error) {
       console.error('[Backend] Recording control error:', error);
@@ -884,11 +900,9 @@ async function startServer() {
     const idToken = authHeader.split('Bearer ')[1];
 
     try {
-      // 1. Verify Authentication
       const decodedToken = await admin.auth().verifyIdToken(idToken);
       const uid = decodedToken.uid;
 
-      // 2. Rate Limiting
       if (!checkRateLimit(uid)) {
         return res.status(429).json({ 
           success: false, 
@@ -896,7 +910,6 @@ async function startServer() {
         });
       }
 
-      // 3. URL Validation & SSRF Protection
       if (!url) return res.status(400).json({ success: false, message: "URL is required" });
       await validateWebhookUrl(url);
 
@@ -928,7 +941,6 @@ async function startServer() {
       console.error('Webhook test error:', error);
       const message = error instanceof Error ? error.message : "Failed to connect to webhook URL";
       
-      // Handle Firebase Auth errors specifically
       if (message.includes('decoding Firebase ID token') || message.includes('expired')) {
         return res.status(401).json({ success: false, message: "Invalid or expired session" });
       }
@@ -954,7 +966,6 @@ async function startServer() {
       
       console.log(`[Backend] Manual queue process triggered by user ${uid}`);
       
-      // Trigger processing for this specific user only
       await processGlobalQueue(uid);
       
       res.json({ success: true, message: "Queue processing triggered" });
@@ -976,11 +987,9 @@ async function startServer() {
     const idToken = authHeader.split('Bearer ')[1];
 
     try {
-      // 1. Verify Authentication
       const decodedToken = await admin.auth().verifyIdToken(idToken);
       const uid = decodedToken.uid;
 
-      // 2. Rate Limiting
       if (!checkRateLimit(uid)) {
         return res.status(429).json({ 
           success: false, 
@@ -988,7 +997,6 @@ async function startServer() {
         });
       }
 
-      // 3. URL Validation & SSRF Protection
       if (!url) return res.status(400).json({ success: false, message: "URL is required" });
       await validateWebhookUrl(url);
 
@@ -1010,22 +1018,18 @@ async function startServer() {
       const html = await response.text();
       const $ = cheerio.load(html);
 
-      // Remove noise
       $('script, style, nav, footer, header, iframe, noscript, .ads, #ads').remove();
 
-      // Extract meaningful text
       const title = $('title').text().trim();
       const metaDescription = $('meta[name="description"]').attr('content') || '';
       
-      // Get main content areas
       const mainContent = $('main, article, #content, .content, .main').text() || $('body').text();
       
-      // Clean up whitespace
       const cleanText = mainContent
         .replace(/\s+/g, ' ')
         .replace(/\n+/g, '\n')
         .trim()
-        .substring(0, 15000); // Limit to 15k chars for AI processing
+        .substring(0, 15000); 
 
       res.json({ 
         success: true, 
@@ -1043,9 +1047,6 @@ async function startServer() {
     }
   });
 
-  // Call Queue Worker
-  // Removed redundant processCallQueue in favor of startCallQueueWorker
-  
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -1062,15 +1063,15 @@ async function startServer() {
       etag: true
     }));
 
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
-  }
+   app.get("*", (req, res) => {
+  res.sendFile(path.join(distPath, "index.html"));
+});
+}
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-    startCallQueueWorker();
-  });
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on http://0.0.0.0:${PORT}`);
+  startCallQueueWorker();
+});
 }
 
 startServer();
