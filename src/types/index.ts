@@ -81,7 +81,25 @@ export interface IntegrationSettings {
   twilioSid: string;
   twilioAuthToken: string;
   twilioPhoneNumber: string;
-  elevenLabsApiKey: string;
+
+  ttsProvider: 'elevenlabs' | 'azure' | 'google' | 'polly' | 'custom';
+
+  elevenLabsApiKey?: string;
+  elevenLabsVoiceId?: string;
+
+  azureApiKey?: string;
+  azureRegion?: string;
+  azureVoiceName?: string;
+
+  googleApiKey?: string;
+  googleVoiceName?: string;
+  googleLanguageCode?: string;
+
+  pollyVoiceId?: string;
+  pollyEngine?: 'standard' | 'neural';
+
+  customTtsUrl?: string;
+
   googleCalendarConnected: boolean;
   googleSheetsConnected: boolean;
 }
