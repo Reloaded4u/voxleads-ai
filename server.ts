@@ -209,6 +209,11 @@ async function getTwilioConfig(uid: string) {
   const userData = userDoc.data();
   const userIntegrations = userData?.integrations;
 
+  if (userIntegrations?.telephonyProvider && userIntegrations.telephonyProvider !== 'twilio') {
+    console.log(`[getTwilioConfig] User has selected ${userIntegrations.telephonyProvider}, bypassing Twilio.`);
+    return null;
+  }
+
   const sid = userIntegrations?.twilioSid || process.env.TWILIO_ACCOUNT_SID;
   const token = userIntegrations?.twilioAuthToken || process.env.TWILIO_AUTH_TOKEN;
   const phone = userIntegrations?.twilioPhoneNumber || process.env.TWILIO_PHONE_NUMBER;

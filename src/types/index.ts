@@ -81,6 +81,11 @@ export interface IntegrationSettings {
   twilioSid: string;
   twilioAuthToken: string;
   twilioPhoneNumber: string;
+  telephonyProvider: 'twilio' | 'exotel';
+  exotelApiKey?: string;
+  exotelApiToken?: string;
+  exotelSubdomain?: string;
+  exotelSid?: string;
 
   ttsProvider: 'elevenlabs' | 'azure' | 'google' | 'polly' | 'custom';
 

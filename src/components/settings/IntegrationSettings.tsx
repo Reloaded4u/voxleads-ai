@@ -14,6 +14,11 @@ export default function IntegrationSettings() {
     twilioSid: '',
     twilioAuthToken: '',
     twilioPhoneNumber: '',
+    telephonyProvider: 'twilio',
+    exotelApiKey: '',
+    exotelApiToken: '',
+    exotelSubdomain: '',
+    exotelSid: '',
     ttsProvider: 'polly',
     elevenLabsApiKey: '',
     elevenLabsVoiceId: '21m00Tcm4TlvDq8ikWAM',
@@ -41,6 +46,11 @@ export default function IntegrationSettings() {
 
   const handleSave = async () => {
     if (!user) return;
+
+    if (integrations.telephonyProvider === 'exotel' && (!integrations.exotelApiKey || !integrations.exotelApiToken || !integrations.exotelSid)) {
+      toast.error('Exotel API Key, Token, and Account SID are required');
+      return;
+    }
 
     if (integrations.ttsProvider === 'elevenlabs' && !integrations.elevenLabsApiKey) {
       toast.error('ElevenLabs API Key is required');
@@ -100,86 +110,151 @@ export default function IntegrationSettings() {
             </p>
           </div>
 
-          <div className="space-y-4">
+          <div className="space-y-6">
             <div className="flex items-center gap-3 mb-2">
               <div className="w-8 h-8 bg-blue-50 rounded-lg flex items-center justify-center text-blue-600">
                 <Phone size={18} />
               </div>
-              <h4 className="text-sm font-bold text-zinc-900">Twilio Configuration</h4>
+              <h4 className="text-sm font-bold text-zinc-900">Telephony Configuration</h4>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="space-y-4">
               <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Account SID</label>
-                  {!integrations.twilioSid && (
-                    <span className="text-[9px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded uppercase">
-                      System Default
-                    </span>
-                  )}
-                </div>
-                <div className="relative">
-                  <input
-                    type={showSecrets['twilioSid'] ? 'text' : 'password'}
-                    value={integrations.twilioSid}
-                    onChange={(e) => setIntegrations({ ...integrations, twilioSid: e.target.value })}
-                    className="w-full px-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:bg-white focus:border-orange-500 focus:ring-0 transition-all pr-10"
-                    placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxx"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => toggleSecret('twilioSid')}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600"
-                  >
-                    {showSecrets['twilioSid'] ? <EyeOff size={16} /> : <Eye size={16} />}
-                  </button>
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Auth Token</label>
-                  {!integrations.twilioAuthToken && (
-                    <span className="text-[9px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded uppercase">
-                      System Default
-                    </span>
-                  )}
-                </div>
-                <div className="relative">
-                  <input
-                    type={showSecrets['twilioAuthToken'] ? 'text' : 'password'}
-                    value={integrations.twilioAuthToken}
-                    onChange={(e) => setIntegrations({ ...integrations, twilioAuthToken: e.target.value })}
-                    className="w-full px-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:bg-white focus:border-orange-500 focus:ring-0 transition-all pr-10"
-                    placeholder="Your Twilio Auth Token"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => toggleSecret('twilioAuthToken')}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600"
-                  >
-                    {showSecrets['twilioAuthToken'] ? <EyeOff size={16} /> : <Eye size={16} />}
-                  </button>
-                </div>
-              </div>
-
-              <div className="space-y-2 sm:col-span-2">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Twilio Phone Number</label>
-                  {!integrations.twilioPhoneNumber && (
-                    <span className="text-[9px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded uppercase">
-                      System Default
-                    </span>
-                  )}
-                </div>
-                <input
-                  type="text"
-                  value={integrations.twilioPhoneNumber}
-                  onChange={(e) => setIntegrations({ ...integrations, twilioPhoneNumber: e.target.value })}
+                <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Telephony Provider</label>
+                <select 
+                  value={integrations.telephonyProvider}
+                  onChange={(e) => setIntegrations({ ...integrations, telephonyProvider: e.target.value as any })}
                   className="w-full px-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:bg-white focus:border-orange-500 focus:ring-0 transition-all"
-                  placeholder="+1234567890"
-                />
+                >
+                  <option value="twilio">Twilio</option>
+                  <option value="exotel">Exotel</option>
+                </select>
               </div>
+
+              {integrations.telephonyProvider === 'twilio' ? (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 anim-fade-in">
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Account SID</label>
+                      {!integrations.twilioSid && (
+                        <span className="text-[9px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded uppercase">System Default</span>
+                      )}
+                    </div>
+                    <div className="relative">
+                      <input 
+                        type={showSecrets['twilioSid'] ? 'text' : 'password'}
+                        value={integrations.twilioSid}
+                        onChange={(e) => setIntegrations({ ...integrations, twilioSid: e.target.value })}
+                        className="w-full px-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:bg-white focus:border-orange-500 focus:ring-0 transition-all pr-10"
+                        placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxx"
+                      />
+                      <button 
+                        onClick={() => toggleSecret('twilioSid')}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600"
+                      >
+                        {showSecrets['twilioSid'] ? <EyeOff size={16} /> : <Eye size={16} />}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Auth Token</label>
+                      {!integrations.twilioAuthToken && (
+                        <span className="text-[9px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded uppercase">System Default</span>
+                      )}
+                    </div>
+                    <div className="relative">
+                      <input 
+                        type={showSecrets['twilioAuthToken'] ? 'text' : 'password'}
+                        value={integrations.twilioAuthToken}
+                        onChange={(e) => setIntegrations({ ...integrations, twilioAuthToken: e.target.value })}
+                        className="w-full px-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:bg-white focus:border-orange-500 focus:ring-0 transition-all pr-10"
+                        placeholder="Your Twilio Auth Token"
+                      />
+                      <button 
+                        onClick={() => toggleSecret('twilioAuthToken')}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600"
+                      >
+                        {showSecrets['twilioAuthToken'] ? <EyeOff size={16} /> : <Eye size={16} />}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="space-y-2 sm:col-span-2">
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Twilio Phone Number</label>
+                      {!integrations.twilioPhoneNumber && (
+                        <span className="text-[9px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded uppercase">System Default</span>
+                      )}
+                    </div>
+                    <input 
+                      type="text"
+                      value={integrations.twilioPhoneNumber}
+                      onChange={(e) => setIntegrations({ ...integrations, twilioPhoneNumber: e.target.value })}
+                      className="w-full px-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:bg-white focus:border-orange-500 focus:ring-0 transition-all"
+                      placeholder="+1234567890"
+                    />
+                  </div>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 anim-fade-in">
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Exotel API Key</label>
+                    <div className="relative">
+                      <input 
+                        type={showSecrets['exotelApiKey'] ? 'text' : 'password'}
+                        value={integrations.exotelApiKey}
+                        onChange={(e) => setIntegrations({ ...integrations, exotelApiKey: e.target.value })}
+                        className="w-full px-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:bg-white focus:border-orange-500 focus:ring-0 transition-all pr-10"
+                        placeholder="Exotel API Key"
+                      />
+                      <button 
+                        onClick={() => toggleSecret('exotelApiKey')}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600"
+                      >
+                        {showSecrets['exotelApiKey'] ? <EyeOff size={16} /> : <Eye size={16} />}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Exotel API Token</label>
+                    <div className="relative">
+                      <input 
+                        type={showSecrets['exotelApiToken'] ? 'text' : 'password'}
+                        value={integrations.exotelApiToken}
+                        onChange={(e) => setIntegrations({ ...integrations, exotelApiToken: e.target.value })}
+                        className="w-full px-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:bg-white focus:border-orange-500 focus:ring-0 transition-all pr-10"
+                        placeholder="Exotel API Token"
+                      />
+                      <button 
+                        onClick={() => toggleSecret('exotelApiToken')}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600"
+                      >
+                        {showSecrets['exotelApiToken'] ? <EyeOff size={16} /> : <Eye size={16} />}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Subdomain / Cluster</label>
+                    <input 
+                      type="text"
+                      value={integrations.exotelSubdomain}
+                      onChange={(e) => setIntegrations({ ...integrations, exotelSubdomain: e.target.value })}
+                      className="w-full px-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:bg-white focus:border-orange-500 focus:ring-0 transition-all"
+                      placeholder="e.g. api.exotel.com"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Account SID</label>
+                    <input 
+                      type="text"
+                      value={integrations.exotelSid}
+                      onChange={(e) => setIntegrations({ ...integrations, exotelSid: e.target.value })}
+                      className="w-full px-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:bg-white focus:border-orange-500 focus:ring-0 transition-all"
+                      placeholder="Exotel Account SID"
+                    />
+                  </div>
+                </div>
+              )}
             </div>
           </div>
 
