@@ -82,6 +82,53 @@ function normalizePhoneNumber(phone: string) {
 }
 
 /**
+ * Escapes characters for XML to prevent TwiML or SSML injection/errors.
+ */
+function escapeXml(unsafe: string): string {
+  return unsafe.replace(/[<>&"']/g, (c) => {
+    switch (c) {
+      case '<': return '&lt;';
+      case '>': return '&gt;';
+      case '&': return '&amp;';
+      case '"': return '&quot;';
+      case "'": return '&apos;';
+      default: return c;
+    }
+  });
+}
+
+/**
+ * Orchestrates speech placement in TwiML based on user provider configuration.
+ * Only uses <Play> for providers with a fully implemented proxy streaming endpoint.
+ */
+async function addSpeechToResponse(response: any, message: string, ownerId: string) {
+  try {
+    const userDoc = await db.collection('users').doc(ownerId).get();
+    const userData = userDoc.data();
+    const integrations = userData?.integrations || {};
+    const provider = integrations.ttsProvider || 'polly';
+
+    console.log(`[TwiML] Dispatching synthesis to: ${provider} (User: ${ownerId})`);
+
+    // Use audio proxy ONLY for providers currently implemented in the streaming endpoint
+    if (provider === 'elevenlabs' || provider === 'azure') {
+      const speechUrl = `${APP_URL}/api/voice/speech?message=${encodeURIComponent(message)}&ownerId=${ownerId}`;
+      response.play(speechUrl);
+    } else {
+      // Fallback for 'polly', 'google', 'custom' (uses Twilio's native Amazon Polly engine)
+      const voiceId = integrations.pollyVoiceId || 'Polly.Amy';
+      response.say({ 
+        voice: voiceId,
+        language: 'en-US'
+      }, message);
+    }
+  } catch (error) {
+    console.error('[TwiML] Error in speech strategy logic, using emergency fallback:', error);
+    response.say(message);
+  }
+}
+
+/**
  * Recursively removes undefined values from an object.
  * Firestore does not support undefined values in documents.
  */
@@ -677,14 +724,12 @@ async function startServer() {
     }
   });
 
-  // Twilio TwiML Route
+  // Twilio TwiML Route: Handles incoming call orchestration
   app.post("/api/voice/twiml", async (req, res) => {
     const { callId, ownerId } = req.query;
     const response = new twilio.twiml.VoiceResponse();
     
-    console.log(`[Backend] Generating TwiML for call ${callId}`);
-
-    let message = "Hello, this is an automated call from your AI assistant. We are testing the real telephony integration. Have a great day!";
+    let message = "Hello, this is an automated call from your AI assistant. We are testing the real telephony integration.";
 
     try {
       if (callId) {
@@ -697,27 +742,110 @@ async function startServer() {
             const businessName = kb.profile?.name || "our company";
             const greeting = kb.guidance?.greeting || "Hello";
             const pitch = kb.guidance?.mainPitch || "We are calling to follow up on your interest.";
-            
-            // Construct a dynamic message
             message = `${greeting}. This is a call from ${businessName}. ${pitch}`;
-            console.log(`[Backend] Using KB-driven message for call ${callId}`);
           }
         }
       }
     } catch (err) {
-      console.error('[Backend] Error fetching KB for TwiML:', err);
+      console.error('[Backend] Error fetching call context for TwiML:', err);
     }
 
-    // Phase 1: Simple message playback
-    response.say({ 
-      voice: 'Polly.Amy',
-      language: 'en-US'
-    }, message);
+    if (ownerId) {
+      await addSpeechToResponse(response, message, ownerId as string);
+    } else {
+      response.say(message);
+    }
     
     response.hangup();
 
     res.type('text/xml');
     res.send(response.toString());
+  });
+
+  // Speech Proxy: Streams audio from external providers to Twilio <Play> tags
+  app.get("/api/voice/speech", async (req, res) => {
+    const { message, ownerId } = req.query;
+
+    if (!message || !ownerId) {
+      return res.status(400).send("Bad Request: Missing message or ownerId");
+    }
+
+    try {
+      const userDoc = await db.collection('users').doc(ownerId as string).get();
+      const userData = userDoc.data();
+      const integrations = userData?.integrations || {};
+      const provider = integrations.ttsProvider || 'polly';
+
+      // ElevenLabs Implementation
+      if (provider === 'elevenlabs') {
+        const apiKey = integrations.elevenLabsApiKey || process.env.ELEVENLABS_API_KEY;
+        const voiceId = integrations.elevenLabsVoiceId || '21m00Tcm4TlvDq8ikWAM';
+        
+        if (!apiKey) throw new Error("ElevenLabs API Key missing");
+
+        const ttsResponse = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'xi-api-key': apiKey },
+          body: JSON.stringify({
+            text: message as string,
+            model_id: 'eleven_multilingual_v2',
+            voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+          })
+        });
+
+        if (!ttsResponse.ok) throw new Error(`ElevenLabs error: ${ttsResponse.status}`);
+        
+        res.setHeader('Content-Type', 'audio/mpeg');
+        // @ts-ignore
+        const reader = ttsResponse.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(value);
+        }
+        return res.end();
+      }
+
+      // Azure Implementation
+      if (provider === 'azure') {
+        const key = integrations.azureApiKey;
+        const region = integrations.azureRegion;
+        const voice = integrations.azureVoiceName || 'en-US-JennyNeural';
+
+        if (!key || !region) throw new Error("Azure credentials missing");
+
+        const escapedMsg = escapeXml(message as string);
+        const ssml = `<speak version='1.0' xml:lang='en-US'><voice xml:lang='en-US' name='${voice}'>${escapedMsg}</voice></speak>`;
+
+        const ttsResponse = await fetch(`https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`, {
+          method: 'POST',
+          headers: {
+            'Ocp-Apim-Subscription-Key': key,
+            'Content-Type': 'application/ssml+xml',
+            'X-Microsoft-OutputFormat': 'audio-16khz-128kbitrate-mono-mp3',
+            'User-Agent': 'VoxLeadsAI'
+          },
+          body: ssml
+        });
+
+        if (!ttsResponse.ok) throw new Error(`Azure error: ${ttsResponse.status}`);
+        
+        res.setHeader('Content-Type', 'audio/mpeg');
+        // @ts-ignore
+        const reader = ttsResponse.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(value);
+        }
+        return res.end();
+      }
+
+      res.status(404).send(`Provider ${provider} not supported for proxy.`);
+    } catch (error) {
+      console.error('[Speech Proxy] Fatal synthesis error:', error);
+      res.status(500).send("Speech generation failed");
+    }
   });
 
   // Twilio Status Webhook
