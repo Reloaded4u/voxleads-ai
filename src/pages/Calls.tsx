@@ -30,9 +30,11 @@ export default function Calls() {
   const [searchTerm, setSearchTerm] = useState('');
   const audioRef = useRef<HTMLAudioElement>(null);
 
-  const filteredCalls = calls.filter(call => 
+  const filteredCalls = calls.filter(call =>
     call.summary.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    call.leadId.toLowerCase().includes(searchTerm.toLowerCase())
+    call.leadId.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    (call.leadName || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
+    (call.leadPhone || '').toLowerCase().includes(searchTerm.toLowerCase())
   );
 
   const togglePlayback = (call: CallRecord) => {
@@ -87,7 +89,7 @@ export default function Calls() {
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" size={18} />
             <input 
               type="text" 
-              placeholder="Search by lead ID or summary..." 
+              placeholder="Search by name, phone, or summary..." 
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               className="w-full pl-10 pr-4 py-2 bg-zinc-50 border-transparent rounded-lg text-sm focus:bg-white focus:border-orange-500 focus:ring-0 transition-all"
@@ -118,7 +120,9 @@ export default function Calls() {
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-3">
-                        <h4 className="text-base font-bold text-zinc-900">Lead ID: {call.leadId}</h4>
+                        <h4 className="text-base font-bold text-zinc-900 truncate">
+                          {call.leadName || call.leadPhone || `Lead ID: ${call.leadId}`}
+                        </h4>
                         <span className={cn(
                           "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wide border",
                           call.status === 'completed' ? "bg-green-50 text-green-600 border-green-100" : 
@@ -135,6 +139,17 @@ export default function Calls() {
                             {call.provider}
                           </span>
                         )}
+                      </div>
+                      <div className="flex items-center gap-2 mt-1">
+                        {call.leadPhone && call.leadName && (
+                          <span className="text-xs font-medium text-zinc-500 bg-zinc-100 px-2 py-0.5 rounded">
+                            {call.leadPhone}
+                          </span>
+                        )}
+
+                        <span className="text-[10px] text-zinc-400 font-mono">
+                          ID: {call.leadId}
+                        </span>
                       </div>
                       <p className="text-sm text-zinc-600 mt-2 line-clamp-2 leading-relaxed">
                         {call.summary || (call.status === 'in-progress' ? 'Call is currently active...' : 'No summary available.')}

@@ -60,9 +60,15 @@ export const callsService = {
       const timezone = settings.timezone || 'UTC';
       const isWithinHours = timeUtils.isWithinCallingHours(startTime, endTime, timezone);
 
+      // Fetch lead details for snapshotting
+      const leadSnap = await firebase.getDoc(firebase.doc(firebase.db, 'leads', leadId));
+      const leadData = leadSnap.exists() ? leadSnap.data() : null;
+
       const callData: Omit<CallRecord, 'id'> = {
         ownerId,
         leadId,
+        leadName: leadData?.name || 'Unknown Lead',
+        leadPhone: phoneNumber,
         createdAt: firebase.serverTimestamp(),
         updatedAt: firebase.serverTimestamp(),
         duration: 0,

@@ -31,6 +31,8 @@ export interface CallRecord {
   cost?: number;
   summary: string;
   transcript: string;
+  leadName?: string;
+  leadPhone?: string;
   recordingUrl?: string;
   recordingSid?: string;
   recordingStatus?: 'requested' | 'processing' | 'completed' | 'failed';

@@ -385,11 +385,26 @@ async function processQueueItem(queueDocId: string, userData: any) {
     // 2. Trigger Call
     const callId = `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const callRef = db.collection('calls').doc(callId);
-    
+
+    // Fetch lead details for snapshotting
+    let leadName = 'Unknown Lead';
+
+    try {
+      const leadSnap = await db.collection('leads').doc(item.leadId).get();
+
+      if (leadSnap.exists) {
+        leadName = leadSnap.data()?.name || leadName;
+      }
+    } catch (e) {
+      console.error('[Worker] Error fetching lead for snapshot:', e);
+    }
+
     await callRef.set(sanitizeForFirestore({
       id: callId,
       ownerId: item.ownerId,
       leadId: item.leadId,
+      leadName,
+      leadPhone: item.phone,
       status: 'initiated',
       provider: 'mock',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
