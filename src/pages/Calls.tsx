@@ -131,14 +131,7 @@ export default function Calls() {
                         )}>
                           {call.status.replace('-', ' ')}
                         </span>
-                        {call.provider && (
-                          <span className={cn(
-                            "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wide border",
-                            call.provider === 'twilio' ? "bg-blue-50 text-blue-600 border-blue-100" : "bg-zinc-50 text-zinc-600 border-zinc-100"
-                          )}>
-                            {call.provider}
-                          </span>
-                        )}
+
                       </div>
                       <div className="flex items-center gap-2 mt-1">
                         {call.leadPhone && call.leadName && (
