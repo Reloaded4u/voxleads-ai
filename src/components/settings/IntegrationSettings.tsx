@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Loader2, Save, Eye, EyeOff, Calendar, FileSpreadsheet, Phone, Mic } from 'lucide-react';
+import { Loader2, Save, Eye, EyeOff, ExternalLink, Calendar, FileSpreadsheet, Phone, Mic, Link2, Link2Off, Download } from 'lucide-react';
 import { useAuth } from '../../hooks/useAuth';
 import { integrationsService } from '../../services/integrationsService';
 import { toast } from 'sonner';
@@ -40,6 +40,24 @@ export default function IntegrationSettings() {
     }
   }, [profile]);
 
+  useEffect(() => {
+    const listener = (event: MessageEvent) => {
+      if (event.data?.type === 'OAUTH_AUTH_SUCCESS') {
+        setIntegrations(prev => ({
+          ...prev,
+          googleCalendarConnected: true,
+          googleSheetsConnected: true
+        }));
+
+        toast.success('Google connected!');
+      }
+    };
+
+    window.addEventListener('message', listener);
+
+    return () => window.removeEventListener('message', listener);
+  }, []);
+
   const handleSave = async () => {
     if (!user) return;
 
@@ -77,6 +95,52 @@ export default function IntegrationSettings() {
 
   const toggleSecret = (key: string) => {
     setShowSecrets(prev => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  const handleConnectGoogle = async () => {
+    try {
+      const { url } = await integrationsService.getGoogleAuthUrl();
+      const popup = window.open(url, 'google_auth', 'width=600,height=700');
+      if (!popup) toast.error('Popup blocked');
+    } catch (error) {
+      toast.error('Failed to initiate Google connection');
+    }
+  };
+
+  const handleDisconnectGoogle = async () => {
+    if (!window.confirm('Disconnect Google?')) return;
+
+    try {
+      await integrationsService.disconnectGoogle();
+
+      setIntegrations(prev => ({
+        ...prev,
+        googleCalendarConnected: false,
+        googleSheetsConnected: false
+      }));
+
+      toast.success('Disconnected');
+    } catch (error) {
+      toast.error('Failed to disconnect');
+    }
+  };
+
+  const handleExportLeads = async () => {
+    const tid = toast.loading('Exporting...');
+
+    try {
+      const res = await integrationsService.exportLeadsToSheets();
+
+      toast.success(res.message || 'Export complete', {
+        id: tid,
+        action: {
+          label: 'Open',
+          onClick: () => window.open(res.spreadsheetUrl, '_blank')
+        }
+      });
+    } catch (error) {
+      toast.error('Export failed', { id: tid });
+    }
   };
 
   return (
@@ -424,12 +488,23 @@ export default function IntegrationSettings() {
                 <p className="text-xs text-zinc-500 mt-0.5">Automatically sync site visits to your calendar.</p>
               </div>
             </div>
-            <button
-              disabled
-              className="px-4 py-2 bg-zinc-100 text-zinc-500 rounded-lg text-sm font-bold opacity-50 cursor-not-allowed"
-            >
-              Coming Soon
-            </button>
+            {integrations.googleCalendarConnected ? (
+              <button
+                onClick={handleDisconnectGoogle}
+                className="px-4 py-2 bg-zinc-100 text-zinc-600 rounded-lg text-sm font-bold flex items-center gap-2"
+              >
+                <Link2Off size={16} />
+                Disconnect
+              </button>
+            ) : (
+              <button
+                onClick={handleConnectGoogle}
+                className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-bold flex items-center gap-2"
+              >
+                <Link2 size={16} />
+                Connect
+              </button>
+            )}
           </div>
 
           <div className="flex items-center justify-between p-4 rounded-xl border border-zinc-100">
@@ -442,12 +517,32 @@ export default function IntegrationSettings() {
                 <p className="text-xs text-zinc-500 mt-0.5">Export leads to a Google Sheet in real-time.</p>
               </div>
             </div>
-            <button
-              disabled
-              className="px-4 py-2 bg-zinc-100 text-zinc-500 rounded-lg text-sm font-bold opacity-50 cursor-not-allowed"
-            >
-              Coming Soon
-            </button>
+            {integrations.googleSheetsConnected ? (
+              <div className="flex gap-2">
+                <button
+                  onClick={handleExportLeads}
+                  className="px-4 py-2 bg-green-50 text-green-700 rounded-lg text-sm font-bold border border-green-200 flex items-center gap-2"
+                >
+                  <Download size={16} />
+                  Export Now
+                </button>
+
+                <button
+                  onClick={handleDisconnectGoogle}
+                  className="p-2 bg-zinc-100 text-zinc-600 rounded-lg"
+                >
+                  <Link2Off size={16} />
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={handleConnectGoogle}
+                className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-bold flex items-center gap-2"
+              >
+                <Link2 size={16} />
+                Connect
+              </button>
+            )}
           </div>
         </div>
       </div>

@@ -14,5 +14,33 @@ export const integrationsService = {
       errorHandler.handleGeneralError(error, 'IntegrationsService.updateIntegrations');
       throw error;
     }
+  },
+
+  async getGoogleAuthUrl() {
+    const user = firebase.auth.currentUser;
+    const idToken = await user!.getIdToken();
+    const response = await fetch('/api/auth/google/url', {
+      headers: { 'Authorization': `Bearer ${idToken}` }
+    });
+    return await response.json();
+  },
+
+  async disconnectGoogle() {
+    const user = firebase.auth.currentUser;
+    const idToken = await user!.getIdToken();
+    await fetch('/api/integrations/google/disconnect', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${idToken}` }
+    });
+  },
+
+  async exportLeadsToSheets() {
+    const user = firebase.auth.currentUser;
+    const idToken = await user!.getIdToken();
+    const response = await fetch('/api/integrations/sheets/export', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${idToken}` }
+    });
+    return await response.json();
   }
 };

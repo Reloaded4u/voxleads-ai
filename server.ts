@@ -11,6 +11,7 @@ import fs from "fs";
 import * as cheerio from "cheerio";
 import { formatInTimeZone, toZonedTime, fromZonedTime } from "date-fns-tz";
 import twilio from "twilio";
+import { google } from "googleapis";
 
 const resolve4 = promisify(dns.resolve4);
 
@@ -71,6 +72,41 @@ const twilioClient =
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER;
 const APP_URL = process.env.APP_URL || "";
 
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GOOGLE_REDIRECT_URI = `${APP_URL}/auth/callback/google`;
+
+function getGoogleOAuthClient() {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+    return null;
+  }
+
+  return new google.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    GOOGLE_REDIRECT_URI
+  );
+}
+
+async function getGoogleClientForUser(uid: string) {
+  const oauth2Client = getGoogleOAuthClient();
+
+  if (!oauth2Client) return null;
+
+  try {
+    const tokenDoc = await db.collection('googleTokens').doc(uid).get();
+
+    if (!tokenDoc.exists) return null;
+
+    oauth2Client.setCredentials(tokenDoc.data() as any);
+
+    return oauth2Client;
+  } catch (error) {
+    console.error(`[Google Auth] Failed for user ${uid}:`, error);
+    return null;
+  }
+}
+
 // Phone Number Normalization
 function normalizePhoneNumber(phone: string) {
   let cleaned = phone.replace(/[^\d+]/g, '');
@@ -125,6 +161,32 @@ async function addSpeechToResponse(response: any, message: string, ownerId: stri
   } catch (error) {
     console.error('[TwiML] Error in speech strategy logic, using emergency fallback:', error);
     response.say(message);
+  }
+}
+
+async function authenticate(req: any, res: any, next: any) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({
+      success: false,
+      message: 'Missing auth token'
+    });
+  }
+
+  const idToken = authHeader.split('Bearer ')[1];
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    req.uid = decoded.uid;
+    next();
+  } catch (error) {
+    console.error('[Auth] Invalid token:', error);
+
+    return res.status(401).json({
+      success: false,
+      message: 'Unauthorized'
+    });
   }
 }
 
@@ -1192,6 +1254,150 @@ async function startServer() {
       console.error('Website import error:', error);
       const message = error instanceof Error ? error.message : "Failed to import from website";
       res.status(500).json({ success: false, message });
+    }
+  });
+
+  // Google OAuth Routes
+
+  app.get('/api/auth/google/url', authenticate, (req: any, res) => {
+    const oauth2Client = getGoogleOAuthClient();
+
+    if (!oauth2Client) {
+      return res.status(500).json({
+        success: false,
+        message: 'Google OAuth not configured'
+      });
+    }
+
+    const url = oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      prompt: 'consent',
+      scope: [
+        'https://www.googleapis.com/auth/userinfo.email',
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive.file'
+      ],
+      state: req.uid
+    });
+
+    res.json({ url });
+  });
+
+  app.get('/auth/callback/google', async (req, res) => {
+    const { code, state } = req.query;
+
+    if (!code || !state) {
+      return res.status(400).send('Missing callback parameters');
+    }
+
+    const oauth2Client = getGoogleOAuthClient();
+
+    if (!oauth2Client) {
+      return res.status(500).send('OAuth not configured');
+    }
+
+    try {
+      const { tokens } = await oauth2Client.getToken(code as string);
+
+      await db.collection('googleTokens').doc(state as string).set(
+        sanitizeForFirestore(tokens)
+      );
+
+      await db.collection('users').doc(state as string).update({
+        'integrations.googleCalendarConnected': true,
+        'integrations.googleSheetsConnected': true,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      res.send(`
+        <html>
+          <body>
+            <script>
+              if (window.opener) {
+                window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS' }, '*');
+                window.close();
+              }
+            </script>
+          </body>
+        </html>
+      `);
+    } catch (error) {
+      console.error(error);
+      res.status(500).send('Authentication failed');
+    }
+  });
+
+  app.post('/api/integrations/google/disconnect', authenticate, async (req: any, res) => {
+    try {
+      await db.collection('googleTokens').doc(req.uid).delete();
+
+      await db.collection('users').doc(req.uid).update({
+        'integrations.googleCalendarConnected': false,
+        'integrations.googleSheetsConnected': false
+      });
+
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ success: false });
+    }
+  });
+
+  app.post('/api/integrations/sheets/export', authenticate, async (req: any, res) => {
+    try {
+      const auth = await getGoogleClientForUser(req.uid);
+
+      if (!auth) {
+        return res.status(401).json({
+          success: false,
+          message: 'Google not connected'
+        });
+      }
+
+      const sheets = google.sheets({ version: 'v4', auth });
+
+      const leadsSnap = await db.collection('leads')
+        .where('ownerId', '==', req.uid)
+        .get();
+
+      const leads = leadsSnap.docs.map(doc => doc.data());
+
+      const spreadsheet = await sheets.spreadsheets.create({
+        requestBody: {
+          properties: {
+            title: `VoxLeads Export ${new Date().toLocaleDateString()}`
+          }
+        }
+      });
+
+      const rows = [
+        ['Name', 'Phone', 'Email', 'Status'],
+        ...leads.map((l: any) => [
+          l.name || '',
+          l.phone || '',
+          l.email || '',
+          l.status || ''
+        ])
+      ];
+
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: spreadsheet.data.spreadsheetId!,
+        range: 'Sheet1!A1',
+        valueInputOption: 'RAW',
+        requestBody: { values: rows }
+      });
+
+      res.json({
+        success: true,
+        spreadsheetUrl: spreadsheet.data.spreadsheetUrl,
+        message: 'Export successful'
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Export failed'
+      });
     }
   });
 
