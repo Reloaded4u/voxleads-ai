@@ -530,7 +530,7 @@ async function processQueueItem(queueDocId: string, userData: any) {
           to: normalizedPhone,
           url: `${APP_URL}/api/voice/twiml?callId=${callId}&ownerId=${item.ownerId}`,
           statusCallback: `${APP_URL}/api/webhooks/twilio/status?callId=${callId}&queueItemId=${queueDocId}`,
-          statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed', 'busy', 'failed', 'no-answer', 'canceled'],
+          statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
           record: recordingEnabled,
           recordingStatusCallback: `${APP_URL}/api/webhooks/twilio/recording?callId=${callId}`
         });
@@ -729,7 +729,7 @@ async function startServer() {
             to: normalizedPhone,
             url: `${APP_URL}/api/voice/twiml?callId=${callId}&ownerId=${uid}`,
             statusCallback: `${APP_URL}/api/webhooks/twilio/status?callId=${callId}`,
-            statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed', 'busy', 'failed', 'no-answer', 'canceled'],
+            statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
             record: recordingEnabled,
             recordingStatusCallback: `${APP_URL}/api/webhooks/twilio/recording?callId=${callId}`
           });
@@ -1233,7 +1233,7 @@ async function startServer() {
     res.status(200).send('OK');
   });
 
-  // Voice Control Route (Agent Join/Takeover)
+  // Voice Control Route (Agent Join/Takeover/End Call)
   app.post("/api/voice/control", async (req, res) => {
     const { callId, state, agentId } = req.body;
     const authHeader = req.headers.authorization;
@@ -1250,10 +1250,28 @@ async function startServer() {
 
       console.log(`[Backend] User ${uid} updating call ${callId} control state to ${state}`);
 
+      const updates: any = {
+        controlState: state,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+
+      if (state === 'call_ended' || state === 'call_ended_manually') {
+        updates.status = 'completed';
+        updates.endedAt = admin.firestore.FieldValue.serverTimestamp();
+      }
+
+      if (agentId) {
+        updates.assignedAgentId = agentId;
+      }
+
+      await db.collection('calls').doc(callId).update(
+        sanitizeForFirestore(updates)
+      );
+
       res.json({ success: true });
     } catch (error) {
       console.error('[Backend] Voice control error:', error);
-      res.status(500).json({ success: false, message: "Failed to update call control" });
+      res.status(500).json({ success: false, message: "Failed to update control state" });
     }
   });
 
