@@ -1000,12 +1000,22 @@ async function startServer() {
     };
 
     const finalStatus = statusMap[event as string] || "completed";
+    const isFinalStatus = ["completed", "failed", "busy", "no-answer"].includes(finalStatus);
 
     try {
-      await db.collection("calls").doc(callId as string).update({
+      const updates: any = {
         status: finalStatus,
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
+      };
+
+      if (isFinalStatus) {
+        updates.endedAt = admin.firestore.FieldValue.serverTimestamp();
+        updates.controlState = "call_ended";
+      }
+
+      await db.collection("calls").doc(callId as string).update(
+        sanitizeForFirestore(updates)
+      );
     } catch (error) {
       console.error("[Vobiz Webhook] Update failed:", error);
     }
@@ -1130,8 +1140,12 @@ async function startServer() {
       updates.startedAt = admin.firestore.FieldValue.serverTimestamp();
     }
 
-    if (CallStatus === 'completed') {
+    const finalTwilioStatuses = ['completed', 'busy', 'failed', 'no-answer', 'canceled'];
+
+    if (finalTwilioStatuses.includes(CallStatus)) {
       updates.endedAt = admin.firestore.FieldValue.serverTimestamp();
+      updates.controlState = "call_ended";
+
       if (CallDuration) {
         updates.duration = parseInt(CallDuration, 10);
       }
