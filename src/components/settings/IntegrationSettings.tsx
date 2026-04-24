@@ -15,6 +15,9 @@ export default function IntegrationSettings() {
     twilioAuthToken: '',
     twilioPhoneNumber: '',
     telephonyProvider: 'twilio',
+    vobizAuthId: '',
+    vobizAuthToken: '',
+    vobizPhoneNumber: '',
     ttsProvider: 'polly',
     elevenLabsApiKey: '',
     elevenLabsVoiceId: '21m00Tcm4TlvDq8ikWAM',
@@ -174,6 +177,46 @@ export default function IntegrationSettings() {
             </div>
 
             <div className="space-y-4">
+
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">
+                  Telephony Provider
+                </label>
+
+                <div className="flex bg-zinc-100 p-1 rounded-xl border border-zinc-200">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setIntegrations({ ...integrations, telephonyProvider: 'twilio' })
+                    }
+                    className={cn(
+                      "flex-1 px-4 py-2 rounded-lg text-xs font-bold transition-all",
+                      integrations.telephonyProvider === 'twilio'
+                        ? "bg-white text-zinc-900 shadow-sm"
+                        : "text-zinc-500"
+                    )}
+                  >
+                    Twilio
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setIntegrations({ ...integrations, telephonyProvider: 'vobiz' })
+                    }
+                    className={cn(
+                      "flex-1 px-4 py-2 rounded-lg text-xs font-bold transition-all",
+                      integrations.telephonyProvider === 'vobiz'
+                        ? "bg-white text-zinc-900 shadow-sm"
+                        : "text-zinc-500"
+                    )}
+                  >
+                    Vobiz
+                  </button>
+                </div>
+              </div>
+
+              {integrations.telephonyProvider === 'twilio' && (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 anim-fade-in">
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
@@ -247,6 +290,58 @@ export default function IntegrationSettings() {
                   />
                 </div>
               </div>
+              )}
+
+              {integrations.telephonyProvider === 'vobiz' && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 anim-fade-in">
+
+                <div className="space-y-2">
+                  <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">
+                    Vobiz Auth ID
+                  </label>
+                  <input
+                    type="text"
+                    value={integrations.vobizAuthId || ''}
+                    onChange={(e) =>
+                      setIntegrations({ ...integrations, vobizAuthId: e.target.value })
+                    }
+                    className="w-full px-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm"
+                    placeholder="Enter Vobiz Auth ID"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">
+                    Vobiz Auth Token
+                  </label>
+                  <input
+                    type="text"
+                    value={integrations.vobizAuthToken || ''}
+                    onChange={(e) =>
+                      setIntegrations({ ...integrations, vobizAuthToken: e.target.value })
+                    }
+                    className="w-full px-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm"
+                    placeholder="Enter Vobiz Auth Token"
+                  />
+                </div>
+
+                <div className="space-y-2 sm:col-span-2">
+                  <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">
+                    Caller Number
+                  </label>
+                  <input
+                    type="text"
+                    value={integrations.vobizPhoneNumber || ''}
+                    onChange={(e) =>
+                      setIntegrations({ ...integrations, vobizPhoneNumber: e.target.value })
+                    }
+                    className="w-full px-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm"
+                    placeholder="+91xxxxxxxxxx"
+                  />
+                </div>
+
+              </div>
+              )}
             </div>
           </div>
 

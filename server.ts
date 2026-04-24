@@ -295,6 +295,46 @@ async function getTwilioConfig(uid: string) {
   return null;
 }
 
+async function getVobizConfig(userId?: string) {
+  let authId = process.env.VOBIZ_AUTH_ID;
+  let authToken = process.env.VOBIZ_AUTH_TOKEN;
+  let phoneNumber = process.env.VOBIZ_PHONE_NUMBER;
+
+  if (userId) {
+    const userDoc = await db.collection('users').doc(userId).get();
+
+    if (userDoc.exists) {
+      const data = userDoc.data();
+
+      if (data?.integrations?.vobizAuthId) {
+        authId = data.integrations.vobizAuthId;
+      }
+
+      if (data?.integrations?.vobizAuthToken) {
+        authToken = data.integrations.vobizAuthToken;
+      }
+
+      if (data?.integrations?.vobizPhoneNumber) {
+        phoneNumber = data.integrations.vobizPhoneNumber;
+      }
+    }
+  }
+
+  console.log(`[getVobizConfig] Auth ID found: ${!!authId}`);
+  console.log(`[getVobizConfig] Auth Token found: ${!!authToken}`);
+  console.log(`[getVobizConfig] Phone found: ${!!phoneNumber}`);
+
+  if (!authId || !authToken || !phoneNumber) {
+    return null;
+  }
+
+  return {
+    authId,
+    authToken,
+    phoneNumber
+  };
+}
+
 // Helper to check if it's currently within a user's calling hours
 function isWithinCallingHours(startTime: string, endTime: string, timezone: string) {
   try {
@@ -662,16 +702,23 @@ async function startServer() {
       const userData = userDoc.data();
       const recordingEnabled = userData?.communication?.recordingEnabled || false;
       const liveCallingEnabled = userData?.communication?.liveCallingEnabled || false;
+      const telephonyProvider = userData?.integrations?.telephonyProvider || 'twilio';
       
       console.log(`[Backend] 4. liveCallingEnabled: ${liveCallingEnabled}`);
 
       const normalizedPhone = normalizePhoneNumber(phoneNumber);
       console.log(`[Backend] 5. Normalized phone: ${normalizedPhone}`);
       
-      const twilioConfig = await getTwilioConfig(uid);
-      console.log(`[Backend] 3. Twilio config result: ${twilioConfig ? 'Config found' : 'No config found'}`);
+      const twilioConfig = telephonyProvider === 'twilio' ? await getTwilioConfig(uid) : null;
+      const vobizConfig = telephonyProvider === 'vobiz' ? await getVobizConfig(uid) : null;
 
-      if (twilioConfig) {
+      console.log(`[Backend] 3. Selected telephony provider: ${telephonyProvider}`);
+      console.log(`[Backend] 3A. Twilio config result: ${twilioConfig ? 'Config found' : 'No config found'}`);
+      console.log(`[Backend] 3B. Vobiz config result: ${vobizConfig ? 'Config found' : 'No config found'}`);
+
+      if (!liveCallingEnabled) {
+        console.log(`[Backend] Live calling disabled. Falling back to mock.`);
+      } else if (twilioConfig) {
         console.log(`[Backend] 6. Entering Twilio branch: YES`);
         
         try {
@@ -712,9 +759,65 @@ async function startServer() {
             mode: 'failed'
           });
         }
+      } else if (vobizConfig) {
+        console.log(`[Backend] 6. Entering Vobiz branch: YES`);
+
+        try {
+          const vobizPayload = {
+            from: vobizConfig.phoneNumber,
+            to: normalizedPhone,
+            answer_url: `${APP_URL}/api/voice/vobizxml?callId=${callId}&ownerId=${uid}`,
+            hangup_url: `${APP_URL}/api/webhooks/vobiz/status?callId=${callId}&event=hangup`,
+            ring_url: `${APP_URL}/api/webhooks/vobiz/status?callId=${callId}&event=ringing`,
+            fallback_url: `${APP_URL}/api/webhooks/vobiz/status?callId=${callId}&event=failed`
+          };
+
+          console.log(`[Backend] Initiating real Vobiz call to ${normalizedPhone} (Call ID: ${callId})`);
+
+          const vobizResponse = await fetch(`https://api.vobiz.ai/api/v1/Account/${vobizConfig.authId}/Call/`, {
+            method: 'POST',
+            headers: {
+              'X-Auth-ID': vobizConfig.authId,
+              'X-Auth-Token': vobizConfig.authToken,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(vobizPayload)
+          });
+
+          const vobizData = await vobizResponse.json();
+
+          if (!vobizResponse.ok) {
+            throw new Error(vobizData?.message || `Vobiz API failed with status ${vobizResponse.status}`);
+          }
+
+          const vobizCallId = vobizData.call_id || vobizData.id || vobizData.uuid || `vobiz-${Date.now()}`;
+
+          await db.collection('calls').doc(callId).update({
+            callSid: vobizCallId,
+            provider: 'vobiz',
+            status: 'initiated',
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+
+          return res.json({
+            success: true,
+            message: "Vobiz call initiated",
+            callSid: vobizCallId,
+            mode: 'live'
+          });
+        } catch (vobizError) {
+          console.error(`[Backend] Vobiz call creation failed:`, vobizError);
+          const errorMessage = vobizError instanceof Error ? vobizError.message : String(vobizError);
+
+          return res.status(500).json({
+            success: false,
+            message: `Vobiz call creation failed: ${errorMessage}`,
+            mode: 'failed'
+          });
+        }
       }
 
-      console.log(`[Backend] 6. Entering Twilio branch: NO (Fallback to mock)`);
+      console.log(`[Backend] 6. No live provider available. Fallback to mock`);
       console.log(`[Backend] Initiating mock call to ${phoneNumber} for lead ${leadId} (Call ID: ${callId})`);
       
       // Fallback to mock
@@ -842,6 +945,72 @@ async function startServer() {
 
     res.type('text/xml');
     res.send(response.toString());
+  });
+
+  // Vobiz XML Route
+  app.post("/api/voice/vobizxml", async (req, res) => {
+    const { callId, ownerId } = req.query;
+
+    let message =
+      "Hello, this is an automated call from VoxLeads AI.";
+
+    try {
+      if (callId) {
+        const callDoc = await db.collection('calls').doc(callId as string).get();
+
+        if (callDoc.exists) {
+          const callData = callDoc.data();
+          const kb = callData?.knowledgeBaseSnapshot;
+
+          if (kb) {
+            const businessName = kb.profile?.name || "our company";
+            const greeting = kb.guidance?.greeting || "Hello";
+            const pitch =
+              kb.guidance?.mainPitch ||
+              "We are calling to follow up on your inquiry.";
+
+            message = `${greeting}. This is a call from ${businessName}. ${pitch}`;
+          }
+        }
+      }
+    } catch (error) {
+      console.error("[Vobiz XML] Error:", error);
+    }
+
+    const xml = `
+<Response>
+  <Speak>${message}</Speak>
+  <Hangup/>
+</Response>`;
+
+    res.type("text/xml");
+    res.send(xml);
+  });
+
+  // Vobiz Status Webhook
+  app.post("/api/webhooks/vobiz/status", async (req, res) => {
+    const { callId, event } = req.query;
+
+    console.log(`[Vobiz Webhook] ${callId}: ${event}`);
+
+    const statusMap: any = {
+      ringing: "ringing",
+      hangup: "completed",
+      failed: "failed"
+    };
+
+    const finalStatus = statusMap[event as string] || "completed";
+
+    try {
+      await db.collection("calls").doc(callId as string).update({
+        status: finalStatus,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    } catch (error) {
+      console.error("[Vobiz Webhook] Update failed:", error);
+    }
+
+    res.status(200).send("OK");
   });
 
   // Speech Proxy: Streams audio from external providers to Twilio <Play> tags

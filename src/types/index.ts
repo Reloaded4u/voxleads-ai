@@ -24,13 +24,15 @@ export interface CallRecord {
   updatedAt: any;
   duration: number;
   status: 'queued' | 'in-progress' | 'completed' | 'missed' | 'failed' | 'ringing' | 'no-answer' | 'busy' | 'initiated';
-  provider?: 'twilio' | 'mock';
+  provider?: 'twilio' | 'vobiz' | 'mock';
   callSid?: string;
   startedAt?: any;
   endedAt?: any;
   cost?: number;
   summary: string;
   transcript: string;
+  leadName?: string;
+  leadPhone?: string;
   recordingUrl?: string;
   recordingSid?: string;
   recordingStatus?: 'requested' | 'processing' | 'completed' | 'failed';
@@ -81,7 +83,28 @@ export interface IntegrationSettings {
   twilioSid: string;
   twilioAuthToken: string;
   twilioPhoneNumber: string;
-  elevenLabsApiKey: string;
+  telephonyProvider: 'twilio' | 'vobiz';
+  vobizAuthId?: string;
+  vobizAuthToken?: string;
+  vobizPhoneNumber?: string;
+  ttsProvider: 'elevenlabs' | 'azure' | 'google' | 'polly' | 'custom';
+
+  elevenLabsApiKey?: string;
+  elevenLabsVoiceId?: string;
+
+  azureApiKey?: string;
+  azureRegion?: string;
+  azureVoiceName?: string;
+
+  googleApiKey?: string;
+  googleVoiceName?: string;
+  googleLanguageCode?: string;
+
+  pollyVoiceId?: string;
+  pollyEngine?: 'standard' | 'neural';
+
+  customTtsUrl?: string;
+
   googleCalendarConnected: boolean;
   googleSheetsConnected: boolean;
 }

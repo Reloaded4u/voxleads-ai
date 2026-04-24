@@ -132,6 +132,12 @@ export default function Calls() {
                           {call.status.replace('-', ' ')}
                         </span>
 
+                        {call.provider && (
+                          <span className="px-2 py-1 rounded-full text-[10px] font-bold uppercase bg-blue-50 text-blue-700 border border-blue-200">
+                            {call.provider}
+                          </span>
+                        )}
+
                       </div>
                       <div className="flex items-center gap-2 mt-1">
                         {call.leadPhone && call.leadName && (
