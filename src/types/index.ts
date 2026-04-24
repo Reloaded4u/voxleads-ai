@@ -31,8 +31,6 @@ export interface CallRecord {
   cost?: number;
   summary: string;
   transcript: string;
-  leadName?: string;
-  leadPhone?: string;
   recordingUrl?: string;
   recordingSid?: string;
   recordingStatus?: 'requested' | 'processing' | 'completed' | 'failed';
@@ -83,25 +81,7 @@ export interface IntegrationSettings {
   twilioSid: string;
   twilioAuthToken: string;
   twilioPhoneNumber: string;
-  telephonyProvider: 'twilio';
-  ttsProvider: 'elevenlabs' | 'azure' | 'google' | 'polly' | 'custom';
-
-  elevenLabsApiKey?: string;
-  elevenLabsVoiceId?: string;
-
-  azureApiKey?: string;
-  azureRegion?: string;
-  azureVoiceName?: string;
-
-  googleApiKey?: string;
-  googleVoiceName?: string;
-  googleLanguageCode?: string;
-
-  pollyVoiceId?: string;
-  pollyEngine?: 'standard' | 'neural';
-
-  customTtsUrl?: string;
-
+  elevenLabsApiKey: string;
   googleCalendarConnected: boolean;
   googleSheetsConnected: boolean;
 }
