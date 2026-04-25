@@ -530,7 +530,7 @@ async function processQueueItem(queueDocId: string, userData: any) {
           to: normalizedPhone,
           url: `${APP_URL}/api/voice/twiml?callId=${callId}&ownerId=${item.ownerId}`,
           statusCallback: `${APP_URL}/api/webhooks/twilio/status?callId=${callId}&queueItemId=${queueDocId}`,
-          statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+          statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed', 'busy', 'failed', 'no-answer', 'canceled'],
           record: recordingEnabled,
           recordingStatusCallback: `${APP_URL}/api/webhooks/twilio/recording?callId=${callId}`
         });
@@ -729,7 +729,7 @@ async function startServer() {
             to: normalizedPhone,
             url: `${APP_URL}/api/voice/twiml?callId=${callId}&ownerId=${uid}`,
             statusCallback: `${APP_URL}/api/webhooks/twilio/status?callId=${callId}`,
-            statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+            statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed', 'busy', 'failed', 'no-answer', 'canceled'],
             record: recordingEnabled,
             recordingStatusCallback: `${APP_URL}/api/webhooks/twilio/recording?callId=${callId}`
           });
