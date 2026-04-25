@@ -1,4 +1,6 @@
 import express from "express";
+import { createServer } from "http";
+import { WebSocketServer } from "ws";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -115,6 +117,54 @@ function normalizePhoneNumber(phone: string) {
     else if (cleaned.length === 12 && cleaned.startsWith('91')) cleaned = '+' + cleaned;
   }
   return cleaned;
+}
+
+async function generateAiResponse(userSpeech: string, callData: any, kb: any) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return "I'm sorry, I cannot process your request right now.";
+
+  const businessName = kb?.profile?.name || "our company";
+  const mission = kb?.profile?.mission || "assisting customers";
+
+  const context = `You are a professional AI sales assistant for ${businessName}.
+Mission: ${mission}.
+Caller: ${callData.leadName || 'unknown'}.
+Phone: ${callData.leadPhone || 'unknown'}.
+
+Knowledge Base:
+Greeting: ${kb?.guidance?.greeting || 'Hello'}
+Main Pitch: ${kb?.guidance?.mainPitch || 'How can I help you?'}
+Objection Handling: ${kb?.guidance?.objectionHandling || 'Address concerns professionally.'}
+
+Rules:
+- Keep response under 2 short sentences.
+- Speak naturally like a sales assistant.
+- Do not use markdown.
+- If unsure, offer a human callback.
+
+Conversation so far:
+${callData.transcript || 'No previous history.'}
+
+Caller said: "${userSpeech}"
+
+Reply naturally.`;
+
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: context }] }]
+      })
+    });
+
+    const data = await response.json();
+    const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "I'm sorry, I missed that. Could you please repeat?";
+    return reply.trim();
+  } catch (error) {
+    console.error('[AI Response] Gemini error:', error);
+    return "I'm sorry, I'm having trouble processing that. Can you please repeat?";
+  }
 }
 
 /**
@@ -663,6 +713,8 @@ function checkRateLimit(uid: string) {
 
 async function startServer() {
   const app = express();
+  const server = createServer(app);
+  const wss = new WebSocketServer({ noServer: true });
   const PORT = parseInt(process.env.PORT || "3000", 10);
 
   app.use(express.json());
@@ -671,6 +723,39 @@ async function startServer() {
   // API routes
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
+  });
+
+  server.on("upgrade", (request, socket, head) => {
+    const pathname = new URL(request.url || "", `http://${request.headers.host}`).pathname;
+
+    if (pathname === "/ws/vobiz-stream") {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit("connection", ws, request);
+      });
+    } else {
+      socket.destroy();
+    }
+  });
+
+  wss.on("connection", (ws, request) => {
+    const urlParams = new URLSearchParams(request.url?.split("?")[1] || "");
+    const callId = urlParams.get("callId");
+    const ownerId = urlParams.get("ownerId");
+
+    console.log(`[Vobiz Stream] Connected | callId=${callId} ownerId=${ownerId}`);
+
+    ws.on("message", (message) => {
+      try {
+        const data = JSON.parse(message.toString());
+        console.log(`[Vobiz Stream] Event received: ${data.event}`);
+      } catch {
+        console.log("[Vobiz Stream] Raw message received");
+      }
+    });
+
+    ws.on("close", () => {
+      console.log(`[Vobiz Stream] Closed | callId=${callId}`);
+    });
   });
 
   // Proxy for AI Voice (Mocking for now, but ready for Twilio/ElevenLabs)
@@ -766,7 +851,7 @@ async function startServer() {
           const vobizPayload = {
             from: vobizConfig.phoneNumber,
             to: normalizedPhone,
-            answer_url: `${APP_URL}/api/voice/vobizxml?callId=${callId}&ownerId=${uid}`,
+            answer_url: `${APP_URL}/api/voice/vobiz-streamxml?callId=${callId}&ownerId=${uid}`,
             hangup_url: `${APP_URL}/api/webhooks/vobiz/status?callId=${callId}&event=hangup`,
             ring_url: `${APP_URL}/api/webhooks/vobiz/status?callId=${callId}&event=ringing`,
             fallback_url: `${APP_URL}/api/webhooks/vobiz/status?callId=${callId}&event=failed`
@@ -925,7 +1010,9 @@ async function startServer() {
           
           if (kb) {
             const businessName = kb.profile?.name || "our company";
-            const greeting = kb.guidance?.greeting || "Hello";
+            let greeting = kb.guidance?.greeting || "Hello";
+            const leadName = callData?.leadName || "there";
+            greeting = greeting.replace(/\[Lead Name\]/g, leadName).replace(/\[Name\]/g, leadName);
             const pitch = kb.guidance?.mainPitch || "We are calling to follow up on your interest.";
             message = `${greeting}. This is a call from ${businessName}. ${pitch}`;
           }
@@ -935,16 +1022,99 @@ async function startServer() {
       console.error('[Backend] Error fetching call context for TwiML:', err);
     }
 
+    const gather = response.gather({
+      input: ['speech'],
+      action: `${APP_URL}/api/voice/respond?callId=${callId}&ownerId=${ownerId}`,
+      enhanced: true,
+      speechTimeout: 'auto'
+    });
+
     if (ownerId) {
-      await addSpeechToResponse(response, message, ownerId as string);
+      await addSpeechToResponse(gather, message, ownerId as string);
     } else {
-      response.say(message);
+      gather.say(message);
     }
     
-    response.hangup();
 
     res.type('text/xml');
     res.send(response.toString());
+  });
+
+  app.post("/api/voice/respond", async (req, res) => {
+    const { callId, ownerId } = req.query;
+    const { SpeechResult } = req.body;
+    const response = new twilio.twiml.VoiceResponse();
+
+    if (!SpeechResult) {
+      response.say("I'm sorry, I didn't catch that. Could you please repeat?");
+      response.gather({
+        input: ['speech'],
+        action: `${APP_URL}/api/voice/respond?callId=${callId}&ownerId=${ownerId}`,
+        enhanced: true,
+        speechTimeout: 'auto'
+      });
+
+      res.type('text/xml');
+      return res.send(response.toString());
+    }
+
+    try {
+      const callRef = db.collection('calls').doc(callId as string);
+      const callDoc = await callRef.get();
+
+      if (!callDoc.exists) {
+        throw new Error("Call not found");
+      }
+
+      const callData = callDoc.data();
+      const currentTranscript = callData?.transcript || "";
+      const newTranscript = currentTranscript + `\nLead: ${SpeechResult}`;
+
+      const aiReply = await generateAiResponse(
+        SpeechResult,
+        { ...callData, transcript: newTranscript },
+        callData?.knowledgeBaseSnapshot
+      );
+
+      await callRef.update({
+        transcript: newTranscript + `\nAI: ${aiReply}`,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      if (ownerId) {
+        await addSpeechToResponse(response, aiReply, ownerId as string);
+      } else {
+        response.say(aiReply);
+      }
+
+      response.gather({
+        input: ['speech'],
+        action: `${APP_URL}/api/voice/respond?callId=${callId}&ownerId=${ownerId}`,
+        enhanced: true,
+        speechTimeout: 'auto'
+      });
+    } catch (err) {
+      console.error('[Twilio Respond] Error:', err);
+      response.say("I'm sorry, something went wrong. A team member will follow up with you.");
+      response.hangup();
+    }
+
+    res.type('text/xml');
+    res.send(response.toString());
+  });
+
+  app.post("/api/voice/vobiz-streamxml", async (req, res) => {
+    const { callId, ownerId } = req.query;
+
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="wss://voxleads-ai.onrender.com/ws/vobiz-stream?callId=${callId}&amp;ownerId=${ownerId}" />
+  </Connect>
+</Response>`;
+
+    res.type("text/xml");
+    res.send(xml);
   });
 
   // Vobiz XML Route
@@ -964,7 +1134,9 @@ async function startServer() {
 
           if (kb) {
             const businessName = kb.profile?.name || "our company";
-            const greeting = kb.guidance?.greeting || "Hello";
+            let greeting = kb.guidance?.greeting || "Hello";
+            const leadName = callData?.leadName || "there";
+            greeting = greeting.replace(/\[Lead Name\]/g, leadName).replace(/\[Name\]/g, leadName);
             const pitch =
               kb.guidance?.mainPitch ||
               "We are calling to follow up on your inquiry.";
@@ -1623,7 +1795,7 @@ async function startServer() {
 });
 }
 
-app.listen(PORT, "0.0.0.0", () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on http://0.0.0.0:${PORT}`);
   startCallQueueWorker();
 });
