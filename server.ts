@@ -1,6 +1,5 @@
 import express from "express";
 import { createServer } from "http";
-import { WebSocketServer } from "ws";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -714,7 +713,6 @@ function checkRateLimit(uid: string) {
 async function startServer() {
   const app = express();
   const server = createServer(app);
-  const wss = new WebSocketServer({ noServer: true });
   const PORT = parseInt(process.env.PORT || "3000", 10);
 
   app.use(express.json());
@@ -723,39 +721,6 @@ async function startServer() {
   // API routes
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
-  });
-
-  server.on("upgrade", (request, socket, head) => {
-    const pathname = new URL(request.url || "", `http://${request.headers.host}`).pathname;
-
-    if (pathname === "/ws/vobiz-stream") {
-      wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit("connection", ws, request);
-      });
-    } else {
-      socket.destroy();
-    }
-  });
-
-  wss.on("connection", (ws, request) => {
-    const urlParams = new URLSearchParams(request.url?.split("?")[1] || "");
-    const callId = urlParams.get("callId");
-    const ownerId = urlParams.get("ownerId");
-
-    console.log(`[Vobiz Stream] Connected | callId=${callId} ownerId=${ownerId}`);
-
-    ws.on("message", (message) => {
-      try {
-        const data = JSON.parse(message.toString());
-        console.log(`[Vobiz Stream] Event received: ${data.event}`);
-      } catch {
-        console.log("[Vobiz Stream] Raw message received");
-      }
-    });
-
-    ws.on("close", () => {
-      console.log(`[Vobiz Stream] Closed | callId=${callId}`);
-    });
   });
 
   // Proxy for AI Voice (Mocking for now, but ready for Twilio/ElevenLabs)
@@ -1103,20 +1068,6 @@ async function startServer() {
     res.send(response.toString());
   });
 
-  app.post("/api/voice/vobiz-streamxml", async (req, res) => {
-    const { callId, ownerId } = req.query;
-
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="wss://voxleads-ai.onrender.com/ws/vobiz-stream?callId=${callId}&amp;ownerId=${ownerId}" />
-  </Connect>
-</Response>`;
-
-    res.type("text/xml");
-    res.send(xml);
-  });
-
   // Vobiz XML Route
   app.post("/api/voice/vobizxml", async (req, res) => {
     const { callId, ownerId } = req.query;
@@ -1149,10 +1100,59 @@ async function startServer() {
       console.error("[Vobiz XML] Error:", error);
     }
 
-    const xml = `
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Speak>${message}</Speak>
-  <Hangup/>
+  <Gather inputType="speech" action="${APP_URL}/api/voice/vobizxml/respond?callId=${callId}&amp;ownerId=${ownerId}" method="POST" speechEndTimeout="auto" speechModel="phone_call" language="en-IN">
+    <Speak>${escapeXml(message)}</Speak>
+  </Gather>
+</Response>`;
+
+    res.type("text/xml");
+    res.send(xml);
+  });
+
+  // Vobiz Conversational Respond Route
+  app.post("/api/voice/vobizxml/respond", async (req, res) => {
+    const { callId, ownerId } = req.query;
+    const userSpeech = req.body?.Speech || req.body?.speech || req.query?.Speech || "";
+
+    console.log(`[Vobiz Respond] callId=${callId} Speech="${userSpeech}"`);
+
+    let aiReply = "I'm sorry, I didn't catch that. Could you repeat please?";
+
+    try {
+      const callRef = db.collection("calls").doc(callId as string);
+      const callDoc = await callRef.get();
+
+      if (callDoc.exists) {
+        const callData = callDoc.data();
+        const transcript = callData?.transcript || "";
+
+        if (userSpeech) {
+          const newTranscript = `${transcript}\nLead: ${userSpeech}`;
+
+          aiReply = await generateAiResponse(
+            userSpeech,
+            { ...callData, transcript: newTranscript },
+            callData?.knowledgeBaseSnapshot
+          );
+
+          await callRef.update({
+            transcript: `${newTranscript}\nAI: ${aiReply}`,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        }
+      }
+    } catch (err) {
+      console.error("[Vobiz Respond] Error:", err);
+      aiReply = "Sorry, something went wrong.";
+    }
+
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather inputType="speech" action="${APP_URL}/api/voice/vobizxml/respond?callId=${callId}&amp;ownerId=${ownerId}" method="POST" speechEndTimeout="auto" speechModel="phone_call" language="en-IN">
+    <Speak>${escapeXml(aiReply)}</Speak>
+  </Gather>
 </Response>`;
 
     res.type("text/xml");
