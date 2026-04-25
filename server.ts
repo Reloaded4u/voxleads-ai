@@ -925,7 +925,9 @@ async function startServer() {
           
           if (kb) {
             const businessName = kb.profile?.name || "our company";
-            const greeting = kb.guidance?.greeting || "Hello";
+            let greeting = kb.guidance?.greeting || "Hello";
+            const leadName = callData?.leadName || "there";
+            greeting = greeting.replace(/\[Lead Name\]/g, leadName).replace(/\[Name\]/g, leadName);
             const pitch = kb.guidance?.mainPitch || "We are calling to follow up on your interest.";
             message = `${greeting}. This is a call from ${businessName}. ${pitch}`;
           }
@@ -964,7 +966,9 @@ async function startServer() {
 
           if (kb) {
             const businessName = kb.profile?.name || "our company";
-            const greeting = kb.guidance?.greeting || "Hello";
+            let greeting = kb.guidance?.greeting || "Hello";
+            const leadName = callData?.leadName || "there";
+            greeting = greeting.replace(/\[Lead Name\]/g, leadName).replace(/\[Name\]/g, leadName);
             const pitch =
               kb.guidance?.mainPitch ||
               "We are calling to follow up on your inquiry.";
