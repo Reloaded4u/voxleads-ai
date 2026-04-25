@@ -1102,7 +1102,7 @@ async function startServer() {
 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather inputType="speech" action="${APP_URL}/api/voice/vobizxml/respond?callId=${callId}&amp;ownerId=${ownerId}" method="POST" speechEndTimeout="auto" speechModel="phone_call" language="en-IN">
+  <Gather inputType="speech" action="${APP_URL}/api/voice/vobizxml/respond?callId=${callId}&amp;ownerId=${ownerId}">
     <Speak>${escapeXml(message)}</Speak>
   </Gather>
 </Response>`;
@@ -1150,7 +1150,7 @@ async function startServer() {
 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather inputType="speech" action="${APP_URL}/api/voice/vobizxml/respond?callId=${callId}&amp;ownerId=${ownerId}" method="POST" speechEndTimeout="auto" speechModel="phone_call" language="en-IN">
+  <Gather inputType="speech" action="${APP_URL}/api/voice/vobizxml/respond?callId=${callId}&amp;ownerId=${ownerId}">
     <Speak>${escapeXml(aiReply)}</Speak>
   </Gather>
 </Response>`;
