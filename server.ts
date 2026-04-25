@@ -1,5 +1,6 @@
 import express from "express";
 import { createServer } from "http";
+import { WebSocketServer } from "ws";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -713,6 +714,7 @@ function checkRateLimit(uid: string) {
 async function startServer() {
   const app = express();
   const server = createServer(app);
+  const wss = new WebSocketServer({ noServer: true });
   const PORT = parseInt(process.env.PORT || "3000", 10);
 
   app.use(express.json());
@@ -721,6 +723,36 @@ async function startServer() {
   // API routes
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
+  });
+
+  // WebSocket upgrade handler for Vobiz audio stream
+  server.on("upgrade", (request, socket, head) => {
+    const pathname = new URL(request.url || "", `http://${request.headers.host}`).pathname;
+
+    if (pathname === "/ws/vobiz-stream") {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit("connection", ws, request);
+      });
+    } else {
+      socket.destroy();
+    }
+  });
+
+  // Vobiz WebSocket connection handler — raw audio frames, not JSON
+  wss.on("connection", (ws, request) => {
+    const urlParams = new URLSearchParams(request.url?.split("?")[1] || "");
+    const callId = urlParams.get("callId");
+    const ownerId = urlParams.get("ownerId");
+
+    console.log(`[Vobiz Stream] Connection opened | callId=${callId} ownerId=${ownerId}`);
+
+    ws.on("message", (message: Buffer) => {
+      console.log(`[Vobiz Stream] Raw frame received | bytes=${message.length} | callId=${callId}`);
+    });
+
+    ws.on("close", () => {
+      console.log(`[Vobiz Stream] Connection closed | callId=${callId}`);
+    });
   });
 
   // Proxy for AI Voice (Mocking for now, but ready for Twilio/ElevenLabs)
@@ -816,7 +848,7 @@ async function startServer() {
           const vobizPayload = {
             from: vobizConfig.phoneNumber,
             to: normalizedPhone,
-            answer_url: `${APP_URL}/api/voice/vobizxml?callId=${callId}&ownerId=${uid}`,
+            answer_url: `${APP_URL}/api/voice/vobiz-streamxml?callId=${callId}&ownerId=${uid}`,
             hangup_url: `${APP_URL}/api/webhooks/vobiz/status?callId=${callId}&event=hangup`,
             ring_url: `${APP_URL}/api/webhooks/vobiz/status?callId=${callId}&event=ringing`,
             fallback_url: `${APP_URL}/api/webhooks/vobiz/status?callId=${callId}&event=failed`
@@ -1066,6 +1098,21 @@ async function startServer() {
 
     res.type('text/xml');
     res.send(response.toString());
+  });
+
+  // Vobiz Stream XML Route — opens WebSocket audio stream
+  app.post("/api/voice/vobiz-streamxml", async (req, res) => {
+    const { callId, ownerId } = req.query;
+
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Stream bidirectional="true" audioTrack="inbound" streamTimeout="7200" keepCallAlive="true">
+    wss://voxleads-ai.onrender.com/ws/vobiz-stream?callId=${callId}&amp;ownerId=${ownerId}
+  </Stream>
+</Response>`;
+
+    res.type("text/xml");
+    res.send(xml);
   });
 
   // Vobiz XML Route
