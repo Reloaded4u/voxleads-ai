@@ -1,4 +1,5 @@
 import express from "express";
+import { createServer } from "http";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -711,6 +712,7 @@ function checkRateLimit(uid: string) {
 
 async function startServer() {
   const app = express();
+  const server = createServer(app);
   const PORT = parseInt(process.env.PORT || "3000", 10);
 
   app.use(express.json());
