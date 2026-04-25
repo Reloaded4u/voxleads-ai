@@ -50,9 +50,11 @@ export default function CallInterface({ lead, onClose }: CallInterfaceProps) {
           ['ai_active', 'agent_join_requested', 'agent_joined', 'handoff_completed', 'call_ended'].includes(e.type)
         );
         if (lastStateEvent) {
+          console.log(`[CallInterface] Control state event received: ${lastStateEvent.type}`);
           setControlState(lastStateEvent.type);
 
           if (lastStateEvent.type === 'call_ended' && status !== 'ended' && !isFinalizing) {
+            console.log(`[CallInterface] DEBUG: Triggering auto-end via control state: call_ended`);
             handleEndCall();
           }
         }
@@ -67,6 +69,7 @@ export default function CallInterface({ lead, onClose }: CallInterfaceProps) {
     const unsubscribe = onSnapshot(doc(db, 'calls', callId), (snapshot) => {
       const data = snapshot.data();
       if (!data) return;
+      console.log(`[CallInterface] Firestore Status Sync - callId: ${callId}, status: ${data.status}`);
 
       const externallyEnded =
         data.status === 'completed' ||
@@ -76,7 +79,7 @@ export default function CallInterface({ lead, onClose }: CallInterfaceProps) {
         data.controlState === 'call_ended';
 
       if (externallyEnded && status === 'active') {
-        console.info(`[CallInterface] Auto-ending UI: call marked ${data.status || data.controlState} in Firestore`);
+        console.log(`[CallInterface] DEBUG: Auto-ending UI triggered by physical status: ${data.status}`);
         handleEndCall();
       }
     });
@@ -99,6 +102,7 @@ export default function CallInterface({ lead, onClose }: CallInterfaceProps) {
 
       try {
         const result = await initiateCall(lead.id, lead.phone);
+        console.log(`[CallInterface] Call initiated - callId: ${result.callId}, mode: ${result.mode}`);
         setCallId(result.callId);
         setKb(result.kb);
         
