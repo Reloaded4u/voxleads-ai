@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { doc, onSnapshot } from 'firebase/firestore';
 import { PhoneOff, Mic, MicOff, MessageSquare, User, X, Settings, Loader2, Clock } from 'lucide-react';
+import { db } from '../firebase/config';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from '../lib/utils';
 import { Lead, KnowledgeBase, CallEvent } from '../types';
@@ -37,6 +39,10 @@ export default function CallInterface({ lead, onClose }: CallInterfaceProps) {
   }, [transcript]);
 
   useEffect(() => {
+    durationRef.current = duration;
+  }, [duration]);
+
+  useEffect(() => {
     if (callId) {
       const unsubscribe = callControlService.subscribeToEvents(callId, (newEvents) => {
         setEvents(newEvents);
@@ -45,11 +51,38 @@ export default function CallInterface({ lead, onClose }: CallInterfaceProps) {
         );
         if (lastStateEvent) {
           setControlState(lastStateEvent.type);
+
+          if (lastStateEvent.type === 'call_ended' && status !== 'ended' && !isFinalizing) {
+            handleEndCall();
+          }
         }
       });
       return () => unsubscribe();
     }
-  }, [callId]);
+  }, [callId, status, isFinalizing]);
+
+  useEffect(() => {
+    if (!callId || status === 'ended' || isFinalizing) return;
+
+    const unsubscribe = onSnapshot(doc(db, 'calls', callId), (snapshot) => {
+      const data = snapshot.data();
+      if (!data) return;
+
+      const externallyEnded =
+        data.status === 'completed' ||
+        data.status === 'failed' ||
+        data.status === 'busy' ||
+        data.status === 'no-answer' ||
+        data.controlState === 'call_ended';
+
+      if (externallyEnded && status === 'active') {
+        console.info(`[CallInterface] Auto-ending UI: call marked ${data.status || data.controlState} in Firestore`);
+        handleEndCall();
+      }
+    });
+
+    return () => unsubscribe();
+  }, [callId, status, isFinalizing]);
 
   useEffect(() => {
     let timer: any;
