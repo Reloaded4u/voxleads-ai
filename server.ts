@@ -812,7 +812,7 @@ async function startServer() {
           mediaBuffers.push(audioBuffer);
           console.log("[DEBUG] bufferCount=", mediaBuffers.length);
 
-          if (mediaBuffers.length >= 50) {
+          if (mediaBuffers.length >= 20) {
             const combined = Buffer.concat(mediaBuffers);
             mediaBuffers = [];
             console.log("[DEBUG] Sending buffer to Deepgram bytes=", combined.length);
