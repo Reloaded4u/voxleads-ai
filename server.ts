@@ -950,7 +950,7 @@ async function startServer() {
           const vobizPayload = {
             from: vobizConfig.phoneNumber,
             to: normalizedPhone,
-            answer_url: `${APP_URL}/api/voice/vobizxml?callId=${callId}&ownerId=${uid}`,
+            answer_url: `${APP_URL}/api/voice/vobiz-streamxml?callId=${callId}&ownerId=${uid}`,
             hangup_url: `${APP_URL}/api/webhooks/vobiz/status?callId=${callId}&event=hangup`,
             ring_url: `${APP_URL}/api/webhooks/vobiz/status?callId=${callId}&event=ringing`,
             fallback_url: `${APP_URL}/api/webhooks/vobiz/status?callId=${callId}&event=failed`
