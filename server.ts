@@ -729,11 +729,19 @@ async function startServer() {
   server.on("upgrade", (request, socket, head) => {
     const pathname = new URL(request.url || "", `http://${request.headers.host}`).pathname;
 
+    console.log(`[WS Upgrade] Incoming upgrade request`);
+    console.log(`[WS Upgrade] request.url=${request.url}`);
+    console.log(`[WS Upgrade] pathname=${pathname}`);
+    console.log(`[WS Upgrade] matches /ws/vobiz-stream=${pathname === "/ws/vobiz-stream"}`);
+
     if (pathname === "/ws/vobiz-stream") {
+      console.log(`[WS Upgrade] Calling handleUpgrade...`);
       wss.handleUpgrade(request, socket, head, (ws) => {
+        console.log(`[WS Upgrade] handleUpgrade succeeded, emitting connection`);
         wss.emit("connection", ws, request);
       });
     } else {
+      console.log(`[WS Upgrade] No match — destroying socket`);
       socket.destroy();
     }
   });
