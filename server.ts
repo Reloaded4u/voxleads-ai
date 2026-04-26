@@ -746,8 +746,47 @@ async function startServer() {
 
     console.log(`[Vobiz Stream] Connection opened | callId=${callId} ownerId=${ownerId}`);
 
-    ws.on("message", (message: Buffer) => {
-      console.log(`[Vobiz Stream] Raw frame received | bytes=${message.length} | callId=${callId}`);
+    ws.on("message", (message) => {
+      try {
+        const raw = message.toString();
+        const data = JSON.parse(raw);
+
+        if (data.event === "connected") {
+          console.log(`[Vobiz Stream] Connected event | protocol=${data.protocol || "unknown"}`);
+          return;
+        }
+
+        if (data.event === "start") {
+          console.log(
+            `[Vobiz Stream] Start | callId=${data.start?.callId || data.start?.call_id} streamId=${data.start?.streamId || data.start?.stream_id} encoding=${data.start?.mediaFormat?.encoding} sampleRate=${data.start?.mediaFormat?.sampleRate}`
+          );
+          return;
+        }
+
+        if (data.event === "media") {
+          const audioBuffer = Buffer.from(data.media?.payload || "", "base64");
+          console.log(
+            `[Vobiz Stream] Media | bytes=${audioBuffer.length} contentType=${data.media?.contentType} sampleRate=${data.media?.sampleRate}`
+          );
+          return;
+        }
+
+        if (data.event === "dtmf") {
+          console.log(`[Vobiz Stream] DTMF | digit=${data.dtmf?.digit || data.digit}`);
+          return;
+        }
+
+        if (data.event === "stop") {
+          console.log(`[Vobiz Stream] Stop | streamId=${data.streamId || data.stream_id} reason=${data.reason || "unknown"}`);
+          return;
+        }
+
+        console.log(`[Vobiz Stream] Unknown event=${data.event}`);
+      } catch (error) {
+        console.log(
+          `[Vobiz Stream] Non-JSON message received | bytes=${Buffer.isBuffer(message) ? message.length : String(message).length}`
+        );
+      }
     });
 
     ws.on("close", () => {
