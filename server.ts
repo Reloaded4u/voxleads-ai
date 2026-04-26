@@ -752,11 +752,10 @@ async function startServer() {
     const callId = urlParams.get("callId");
     const ownerId = urlParams.get("ownerId");
 
-    console.log(`[Vobiz Stream] Connection opened | callId=${callId} ownerId=${ownerId}`);
+    console.log(`[WS OPEN] callId=${callId} ownerId=${ownerId}`);
 
-    // Per-call audio buffering state
+    // Per-call audio buffering state — persists for full call duration
     let mediaBuffers: Buffer[] = [];
-    let lastTranscriptionAt = Date.now();
 
     const transcribeBuffer = async (audioBuffer: Buffer) => {
       try {
@@ -783,9 +782,11 @@ async function startServer() {
       } catch (err) {
         console.error(`[Deepgram STT] Error:`, err);
       }
+      // No ws.close() or terminate() — connection stays alive for next chunk
     };
 
     ws.on("message", (message) => {
+      console.log(`[WS MESSAGE] callId=${callId} bytes=${Buffer.isBuffer(message) ? message.length : String(message).length}`);
       try {
         const raw = message.toString();
         const data = JSON.parse(raw);
@@ -814,9 +815,9 @@ async function startServer() {
           if (mediaBuffers.length >= 50) {
             const combined = Buffer.concat(mediaBuffers);
             mediaBuffers = [];
-            lastTranscriptionAt = Date.now();
             console.log("[DEBUG] Sending buffer to Deepgram bytes=", combined.length);
             transcribeBuffer(combined);
+            // Connection remains open — buffering continues after transcription
           }
           return;
         }
@@ -829,10 +830,11 @@ async function startServer() {
         if (data.event === "stop") {
           console.log(`[Vobiz Stream] Stop | streamId=${data.streamId || data.stream_id} reason=${data.reason || "unknown"}`);
 
-          // Flush any remaining audio on stop
+          // Flush remaining audio on Vobiz stop event
           if (mediaBuffers.length > 0) {
             const combined = Buffer.concat(mediaBuffers);
             mediaBuffers = [];
+            console.log("[DEBUG] Sending buffer to Deepgram bytes=", combined.length);
             transcribeBuffer(combined);
           }
           return;
@@ -841,19 +843,25 @@ async function startServer() {
         console.log(`[Vobiz Stream] Unknown event=${data.event}`);
       } catch (error) {
         console.log(
-          `[Vobiz Stream] Non-JSON message received | bytes=${Buffer.isBuffer(message) ? message.length : String(message).length}`
+          `[WS MESSAGE] Non-JSON | callId=${callId} bytes=${Buffer.isBuffer(message) ? message.length : String(message).length}`
         );
       }
     });
 
-    ws.on("close", () => {
+    ws.on("error", (err) => {
+      console.error(`[WS ERROR] callId=${callId} error=${err.message}`);
+    });
+
+    ws.on("close", (code, reason) => {
+      console.log(`[WS CLOSE] callId=${callId} code=${code} reason=${reason?.toString() || "none"}`);
+
+      // Flush any remaining buffered audio on disconnect
       if (mediaBuffers.length > 0) {
         const combined = Buffer.concat(mediaBuffers);
         mediaBuffers = [];
         console.log("[DEBUG] Sending buffer to Deepgram bytes=", combined.length);
         transcribeBuffer(combined);
       }
-      console.log(`[Vobiz Stream] Connection closed | callId=${callId}`);
     });
   });
 
@@ -1208,7 +1216,6 @@ async function startServer() {
 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Wait length="2"/>
   <Stream bidirectional="true" audioTrack="inbound" streamTimeout="7200" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000" statusCallbackUrl="https://voxleads-ai.onrender.com/api/vobiz/stream-status" statusCallbackMethod="POST">
     wss://voxleads-ai.onrender.com/ws/vobiz-stream?callId=${callId}&amp;ownerId=${ownerId}
   </Stream>
