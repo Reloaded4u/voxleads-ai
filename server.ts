@@ -752,6 +752,7 @@ async function startServer() {
 
     const transcribeBuffer = async (audioBuffer: Buffer) => {
       try {
+        console.log("[DEBUG] Deepgram request started");
         const response = await fetch(
           "https://api.deepgram.com/v1/listen?model=nova-2&language=en-IN&encoding=linear16&sample_rate=8000&channels=1&punctuate=true",
           {
@@ -764,6 +765,7 @@ async function startServer() {
           }
         );
         const result = await response.json() as any;
+        console.log("[DEBUG] Deepgram raw result:", JSON.stringify(result).slice(0, 1000));
         const transcript = result?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
         if (transcript) {
           console.log(`[Deepgram STT] Transcript: ${transcript}`);
@@ -799,12 +801,13 @@ async function startServer() {
           );
 
           mediaBuffers.push(audioBuffer);
+          console.log("[DEBUG] bufferCount=", mediaBuffers.length);
 
-          const now = Date.now();
-          if (now - lastTranscriptionAt >= 3000 && mediaBuffers.length > 0) {
+          if (mediaBuffers.length >= 25) {
             const combined = Buffer.concat(mediaBuffers);
             mediaBuffers = [];
-            lastTranscriptionAt = now;
+            lastTranscriptionAt = Date.now();
+            console.log("[DEBUG] Sending buffer to Deepgram bytes=", combined.length);
             transcribeBuffer(combined);
           }
           return;
