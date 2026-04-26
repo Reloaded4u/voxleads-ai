@@ -754,7 +754,7 @@ async function startServer() {
       try {
         console.log("[DEBUG] Deepgram request started");
         const response = await fetch(
-          "https://api.deepgram.com/v1/listen?model=nova-2&language=en-IN&encoding=mulaw&sample_rate=8000&channels=1&punctuate=true",
+          "https://api.deepgram.com/v1/listen?model=nova-2&language=en-IN&encoding=linear16&sample_rate=8000&channels=1&punctuate=true",
           {
             method: "POST",
             headers: {
