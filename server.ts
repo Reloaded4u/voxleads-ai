@@ -746,6 +746,35 @@ async function startServer() {
 
     console.log(`[Vobiz Stream] Connection opened | callId=${callId} ownerId=${ownerId}`);
 
+    // Per-call audio buffering state
+    let mediaBuffers: Buffer[] = [];
+    let lastTranscriptionAt = Date.now();
+
+    const transcribeBuffer = async (audioBuffer: Buffer) => {
+      try {
+        const response = await fetch(
+          "https://api.deepgram.com/v1/listen?model=nova-2&language=en-IN&encoding=linear16&sample_rate=8000&channels=1&punctuate=true",
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`,
+              "Content-Type": "audio/raw",
+            },
+            body: audioBuffer,
+          }
+        );
+        const result = await response.json() as any;
+        const transcript = result?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
+        if (transcript) {
+          console.log(`[Deepgram STT] Transcript: ${transcript}`);
+        } else {
+          console.log(`[Deepgram STT] Empty transcript`);
+        }
+      } catch (err) {
+        console.error(`[Deepgram STT] Error:`, err);
+      }
+    };
+
     ws.on("message", (message) => {
       try {
         const raw = message.toString();
@@ -768,6 +797,16 @@ async function startServer() {
           console.log(
             `[Vobiz Stream] Media | bytes=${audioBuffer.length} contentType=${data.media?.contentType} sampleRate=${data.media?.sampleRate}`
           );
+
+          mediaBuffers.push(audioBuffer);
+
+          const now = Date.now();
+          if (now - lastTranscriptionAt >= 3000 && mediaBuffers.length > 0) {
+            const combined = Buffer.concat(mediaBuffers);
+            mediaBuffers = [];
+            lastTranscriptionAt = now;
+            transcribeBuffer(combined);
+          }
           return;
         }
 
@@ -778,6 +817,13 @@ async function startServer() {
 
         if (data.event === "stop") {
           console.log(`[Vobiz Stream] Stop | streamId=${data.streamId || data.stream_id} reason=${data.reason || "unknown"}`);
+
+          // Flush any remaining audio on stop
+          if (mediaBuffers.length > 0) {
+            const combined = Buffer.concat(mediaBuffers);
+            mediaBuffers = [];
+            transcribeBuffer(combined);
+          }
           return;
         }
 
