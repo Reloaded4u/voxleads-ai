@@ -1216,7 +1216,7 @@ async function startServer() {
 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Stream bidirectional="true" audioTrack="inbound" streamTimeout="7200" keepCallAlive="true" contentType="audio/x-mulaw" statusCallbackUrl="https://voxleads-ai.onrender.com/api/vobiz/stream-status" statusCallbackMethod="POST">
+  <Stream bidirectional="true" audioTrack="inbound" streamTimeout="7200" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000" statusCallbackUrl="https://voxleads-ai.onrender.com/api/vobiz/stream-status" statusCallbackMethod="POST">
     wss://voxleads-ai.onrender.com/ws/vobiz-stream?callId=${callId}&amp;ownerId=${ownerId}
   </Stream>
 </Response>`;
