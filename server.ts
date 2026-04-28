@@ -714,7 +714,8 @@ function checkRateLimit(uid: string) {
 async function startServer() {
   const app = express();
   const server = createServer(app);
-  const wss = new WebSocketServer({ noServer: true });
+  // Attach wss directly to server with path — works correctly behind Render's reverse proxy
+  const wss = new WebSocketServer({ server, path: "/ws/vobiz-stream" });
   const PORT = parseInt(process.env.PORT || "3000", 10);
 
   app.use(express.json());
@@ -723,27 +724,6 @@ async function startServer() {
   // API routes
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
-  });
-
-  // WebSocket upgrade handler for Vobiz audio stream
-  server.on("upgrade", (request, socket, head) => {
-    const pathname = new URL(request.url || "", `http://${request.headers.host}`).pathname;
-
-    console.log(`[WS Upgrade] Incoming upgrade request`);
-    console.log(`[WS Upgrade] request.url=${request.url}`);
-    console.log(`[WS Upgrade] pathname=${pathname}`);
-    console.log(`[WS Upgrade] matches /ws/vobiz-stream=${pathname === "/ws/vobiz-stream"}`);
-
-    if (pathname === "/ws/vobiz-stream") {
-      console.log(`[WS Upgrade] Calling handleUpgrade...`);
-      wss.handleUpgrade(request, socket, head, (ws) => {
-        console.log(`[WS Upgrade] handleUpgrade succeeded, emitting connection`);
-        wss.emit("connection", ws, request);
-      });
-    } else {
-      console.log(`[WS Upgrade] No match — destroying socket`);
-      socket.destroy();
-    }
   });
 
   // Vobiz WebSocket connection handler — raw audio frames, not JSON
