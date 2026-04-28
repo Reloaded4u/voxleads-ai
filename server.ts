@@ -797,9 +797,27 @@ async function startServer() {
         }
 
         if (data.event === "start") {
+          // Read from top-level first (official spec), fall back to nested data.start
+          const streamId = data.streamId || data.start?.streamId || data.start?.stream_id;
+          const resolvedCallId = data.callId || data.start?.callId || data.start?.call_id;
           console.log(
-            `[Vobiz Stream] Start | callId=${data.start?.callId || data.start?.call_id} streamId=${data.start?.streamId || data.start?.stream_id} encoding=${data.start?.mediaFormat?.encoding} sampleRate=${data.start?.mediaFormat?.sampleRate}`
+            `[Vobiz Stream] Start | callId=${resolvedCallId} streamId=${streamId} encoding=${data.start?.mediaFormat?.encoding} sampleRate=${data.start?.mediaFormat?.sampleRate}`
           );
+
+          // Fix 3: Send a minimal silent playAudio frame to confirm bidirectional handshake
+          // Without this, Vobiz closes the stream early (WS code=1000 after ~9 packets)
+          const silentFrame = Buffer.alloc(160, 0xFF); // 20ms of mulaw silence (0xFF = silence byte)
+          const silentPayload = silentFrame.toString("base64");
+          const playAudioEvent = JSON.stringify({
+            event: "playAudio",
+            media: {
+              contentType: "audio/x-mulaw",
+              sampleRate: 8000,
+              payload: silentPayload,
+            },
+          });
+          ws.send(playAudioEvent);
+          console.log(`[Vobiz Stream] Sent silent playAudio to confirm bidirectional handshake`);
           return;
         }
 
