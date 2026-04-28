@@ -754,6 +754,27 @@ async function startServer() {
 
     console.log(`[WS OPEN] callId=${callId} ownerId=${ownerId}`);
 
+    // Send silent playAudio immediately on connection open
+    // Vobiz requires bidirectional response within ~1s or it closes the stream
+    const silentFrame = Buffer.alloc(160, 0xFF);
+    const silentPayload = silentFrame.toString("base64");
+    const playAudioEvent = JSON.stringify({
+      event: "playAudio",
+      media: {
+        contentType: "audio/x-mulaw",
+        sampleRate: 8000,
+        payload: silentPayload,
+      },
+    });
+    console.log(`[Vobiz SilentAudio] sending on open`);
+    ws.send(playAudioEvent, (err) => {
+      if (err) {
+        console.error(`[Vobiz SilentAudio] send error: ${err.message}`);
+      } else {
+        console.log(`[Vobiz SilentAudio] sent successfully on open`);
+      }
+    });
+
     // Per-call audio buffering state — persists for full call duration
     let mediaBuffers: Buffer[] = [];
 
