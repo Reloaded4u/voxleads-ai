@@ -797,15 +797,14 @@ async function startServer() {
         }
 
         if (data.event === "start") {
+          console.log(`[Vobiz Start RAW] ${JSON.stringify(data)}`);
+
           // Read from top-level first (official spec), fall back to nested data.start
           const streamId = data.streamId || data.start?.streamId || data.start?.stream_id;
           const resolvedCallId = data.callId || data.start?.callId || data.start?.call_id;
-          console.log(
-            `[Vobiz Stream] Start | callId=${resolvedCallId} streamId=${streamId} encoding=${data.start?.mediaFormat?.encoding} sampleRate=${data.start?.mediaFormat?.sampleRate}`
-          );
+          console.log(`[Vobiz Start Parsed] callId=${resolvedCallId} streamId=${streamId}`);
 
-          // Fix 3: Send a minimal silent playAudio frame to confirm bidirectional handshake
-          // Without this, Vobiz closes the stream early (WS code=1000 after ~9 packets)
+          // Send a minimal silent playAudio frame to confirm bidirectional handshake
           const silentFrame = Buffer.alloc(160, 0xFF); // 20ms of mulaw silence (0xFF = silence byte)
           const silentPayload = silentFrame.toString("base64");
           const playAudioEvent = JSON.stringify({
@@ -816,8 +815,14 @@ async function startServer() {
               payload: silentPayload,
             },
           });
-          ws.send(playAudioEvent);
-          console.log(`[Vobiz Stream] Sent silent playAudio to confirm bidirectional handshake`);
+          console.log(`[Vobiz SilentAudio] sending`);
+          ws.send(playAudioEvent, (err) => {
+            if (err) {
+              console.error(`[Vobiz SilentAudio] send error: ${err.message}`);
+            } else {
+              console.log(`[Vobiz SilentAudio] sent successfully`);
+            }
+          });
           return;
         }
 
@@ -1244,7 +1249,8 @@ async function startServer() {
   });
 
   app.post("/api/vobiz/stream-status", (req, res) => {
-    console.log("[Vobiz Stream Callback]", JSON.stringify(req.body));
+    console.log("[Vobiz Stream Callback] Event=" + req.body?.Event + " StreamID=" + req.body?.StreamID + " CallUUID=" + req.body?.CallUUID);
+    console.log("[Vobiz Stream Callback] Full body:", JSON.stringify(req.body));
     res.json({ ok: true });
   });
 
