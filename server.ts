@@ -714,8 +714,26 @@ function checkRateLimit(uid: string) {
 async function startServer() {
   const app = express();
   const server = createServer(app);
-  // Attach wss directly to server with path — works correctly behind Render's reverse proxy
-  const wss = new WebSocketServer({ server, path: "/ws/vobiz-stream" });
+
+  // Manual noServer init — gives full control over upgrade routing and logging
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on("upgrade", (request, socket, head) => {
+    const url = request.url || "";
+    console.log(`[WS Upgrade] Incoming upgrade request: ${url}`);
+
+    if (url.startsWith("/ws/vobiz-stream")) {
+      console.log(`[WS Upgrade] Routing to Vobiz stream handler`);
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        console.log(`[WS Upgrade] Upgrade complete — emitting connection`);
+        wss.emit("connection", ws, request);
+      });
+    } else {
+      console.log(`[WS Upgrade] No handler for path: ${url} — destroying socket`);
+      socket.destroy();
+    }
+  });
+
   const PORT = parseInt(process.env.PORT || "3000", 10);
 
   app.use(express.json());
@@ -726,34 +744,13 @@ async function startServer() {
     res.json({ status: "ok" });
   });
 
-  // Vobiz WebSocket connection handler — raw audio frames, not JSON
+  // Vobiz WebSocket connection handler
   wss.on("connection", (ws, request) => {
     const urlParams = new URLSearchParams(request.url?.split("?")[1] || "");
     const callId = urlParams.get("callId");
     const ownerId = urlParams.get("ownerId");
 
     console.log(`[WS OPEN] callId=${callId} ownerId=${ownerId}`);
-
-    // Send silent playAudio immediately on connection open
-    // Vobiz requires bidirectional response within ~1s or it closes the stream
-    const silentFrame = Buffer.alloc(160, 0xFF);
-    const silentPayload = silentFrame.toString("base64");
-    const playAudioEvent = JSON.stringify({
-      event: "playAudio",
-      media: {
-        contentType: "audio/x-mulaw",
-        sampleRate: 8000,
-        payload: silentPayload,
-      },
-    });
-    console.log(`[Vobiz SilentAudio] sending on open`);
-    ws.send(playAudioEvent, (err) => {
-      if (err) {
-        console.error(`[Vobiz SilentAudio] send error: ${err.message}`);
-      } else {
-        console.log(`[Vobiz SilentAudio] sent successfully on open`);
-      }
-    });
 
     // Per-call audio buffering state — persists for full call duration
     let mediaBuffers: Buffer[] = [];
@@ -800,30 +797,10 @@ async function startServer() {
         if (data.event === "start") {
           console.log(`[Vobiz Start RAW] ${JSON.stringify(data)}`);
 
-          // Read from top-level first (official spec), fall back to nested data.start
+          // Parse from top-level first (official Vobiz spec), fall back to nested start object
           const streamId = data.streamId || data.start?.streamId || data.start?.stream_id;
           const resolvedCallId = data.callId || data.start?.callId || data.start?.call_id;
           console.log(`[Vobiz Start Parsed] callId=${resolvedCallId} streamId=${streamId}`);
-
-          // Send a minimal silent playAudio frame to confirm bidirectional handshake
-          const silentFrame = Buffer.alloc(160, 0xFF); // 20ms of mulaw silence (0xFF = silence byte)
-          const silentPayload = silentFrame.toString("base64");
-          const playAudioEvent = JSON.stringify({
-            event: "playAudio",
-            media: {
-              contentType: "audio/x-mulaw",
-              sampleRate: 8000,
-              payload: silentPayload,
-            },
-          });
-          console.log(`[Vobiz SilentAudio] sending`);
-          ws.send(playAudioEvent, (err) => {
-            if (err) {
-              console.error(`[Vobiz SilentAudio] send error: ${err.message}`);
-            } else {
-              console.log(`[Vobiz SilentAudio] sent successfully`);
-            }
-          });
           return;
         }
 
@@ -861,6 +838,16 @@ async function startServer() {
             console.log("[DEBUG] Sending buffer to Deepgram bytes=", combined.length);
             transcribeBuffer(combined);
           }
+          return;
+        }
+
+        if (data.event === "playedStream") {
+          console.log(`[Vobiz Stream] playedStream | streamSid=${data.streamSid || data.stream_sid || "unknown"}`);
+          return;
+        }
+
+        if (data.event === "clearedAudio") {
+          console.log(`[Vobiz Stream] clearedAudio acknowledged`);
           return;
         }
 
@@ -1238,10 +1225,12 @@ async function startServer() {
   app.post("/api/voice/vobiz-streamxml", async (req, res) => {
     const { callId, ownerId } = req.query;
 
+    const wsUrl = APP_URL.replace(/^https?:\/\//, 'wss://');
+
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Stream bidirectional="true" audioTrack="inbound" streamTimeout="7200" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000" statusCallbackUrl="https://voxleads-ai.onrender.com/api/vobiz/stream-status" statusCallbackMethod="POST">
-    wss://voxleads-ai.onrender.com/ws/vobiz-stream?callId=${callId}&amp;ownerId=${ownerId}
+  <Stream bidirectional="true" audioTrack="inbound" streamTimeout="7200" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000" statusCallbackUrl="${APP_URL}/api/vobiz/stream-status" statusCallbackMethod="POST">
+    ${wsUrl}/ws/vobiz-stream?callId=${callId}&amp;ownerId=${ownerId}
   </Stream>
 </Response>`;
 
