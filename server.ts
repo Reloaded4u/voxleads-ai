@@ -1,6 +1,6 @@
 import express from "express";
 import { createServer } from "http";
-import { WebSocketServer } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -168,27 +168,56 @@ Reply naturally.`;
   }
 }
 
-/**
- * Wraps an audio buffer in a Vobiz playAudio JSON event and sends it over the WebSocket.
- * Must be called with mulaw 8kHz audio bytes.
- */
-function sendVobizAudio(ws: any, audioBuffer: Buffer): void {
-  const payload = audioBuffer.toString("base64");
-  console.log(`[Vobiz Outbound Audio] bytes=${audioBuffer.length}`);
-  ws.send(JSON.stringify({
-    event: "playAudio",
-    media: {
-      contentType: "audio/x-mulaw",
-      sampleRate: 8000,
-      payload
+// ── sendVobizAudio ──────────────────────────────────────────────────────────
+// Sends μ-law 8kHz audio to Vobiz in precise 20 ms / 160-byte chunks.
+// Vobiz requires framed delivery; sending the whole buffer at once causes
+// packet rejection and silence on the caller side.
+const VOBIZ_CHUNK_BYTES = 160;  // 8000 Hz × 1 byte/sample × 0.020 s = 160
+const VOBIZ_CHUNK_MS    = 20;
+
+async function sendVobizAudio(ws: any, audioBuffer: Buffer): Promise<void> {
+  if (!audioBuffer || audioBuffer.length === 0) return;
+
+  const totalChunks = Math.ceil(audioBuffer.length / VOBIZ_CHUNK_BYTES);
+  console.log(`[Vobiz Outbound Audio] totalBytes=${audioBuffer.length} chunks=${totalChunks}`);
+
+  for (let i = 0; i < totalChunks; i++) {
+    // Guard: abort if the socket has closed mid-playback
+    if (!ws || ws.readyState !== WebSocket.OPEN) { ${i}/${totalChunks}, aborting`);
+      break;
     }
-  }), (err?: Error) => {
-    if (err) {
-      console.error(`[Vobiz playAudio sent] error=${err.message}`);
-    } else {
-      console.log(`[Vobiz playAudio sent] bytes=${audioBuffer.length}`);
+
+    const start = i * VOBIZ_CHUNK_BYTES;
+    const end   = Math.min(start + VOBIZ_CHUNK_BYTES, audioBuffer.length);
+    let   frame = audioBuffer.slice(start, end);
+
+    // Pad the final (possibly short) frame to exactly 160 bytes with μ-law
+    // silence (0xFF = encoded silence in G.711 μ-law) so Vobiz never receives
+    // a partial frame.
+    if (frame.length < VOBIZ_CHUNK_BYTES) {
+      const padded = Buffer.alloc(VOBIZ_CHUNK_BYTES, 0xff);
+      frame.copy(padded);
+      frame = padded;
     }
-  });
+
+    ws.send(JSON.stringify({
+      event: "playAudio",
+      media: {
+        contentType: "audio/x-mulaw",
+        sampleRate:  8000,
+        payload:     frame.toString("base64"),
+      },
+    }), (err?: Error) => {
+      if (err) console.error(`[Vobiz playAudio chunk] index=${i} error=${err.message}`);
+    });
+
+    console.log(`[Vobiz playAudio chunk] index=${i} bytes=${frame.length}`);
+
+    // Pace delivery to match real-time playback — one frame every 20 ms
+    await new Promise<void>((r) => setTimeout(r, VOBIZ_CHUNK_MS));
+  }
+
+  console.log(`[Vobiz Outbound Audio] done sending`);
 }
 
 /**
@@ -876,20 +905,28 @@ async function startServer() {
     const transcribeBuffer = async (audioBuffer: Buffer) => {
       try {
         console.log("[DEBUG] Deepgram request started");
-        const response = await fetch(
-          "https://api.deepgram.com/v1/listen?model=nova-2&language=en-IN&encoding=mulaw&sample_rate=8000&channels=1&punctuate=true",
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`,
-              "Content-Type": "audio/raw",
-            },
-            body: audioBuffer,
-          }
-        );
+        const dgUrl = new URL("https://api.deepgram.com/v1/listen");
+        dgUrl.searchParams.set("model",        "nova-2");
+        dgUrl.searchParams.set("encoding",     "mulaw");      // ← CRITICAL FIX
+        dgUrl.searchParams.set("sample_rate",  "8000");       // ← CRITICAL FIX
+        dgUrl.searchParams.set("channels",     "1");
+        dgUrl.searchParams.set("language",     "en-IN");
+        dgUrl.searchParams.set("smart_format", "true");
+
+        console.log(`[Deepgram] Sending ${audioBuffer.length} bytes | URL: ${dgUrl.toString()}`);
+
+        const response = await fetch(dgUrl.toString(), {
+          method: "POST",
+          headers: {
+            Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`,
+            "Content-Type": "audio/mulaw",        // ← CRITICAL FIX
+          },
+          body: audioBuffer,
+        });
         const result = await response.json() as any;
         console.log("[DEBUG] Deepgram raw result:", JSON.stringify(result).slice(0, 1000));
         const transcript = result?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
+        console.log(`[Deepgram] transcript="${transcript}"`);
 
         if (!transcript) {
           console.log(`[Deepgram STT] Empty transcript`);
@@ -929,7 +966,7 @@ async function startServer() {
 
         // Send mulaw audio to Vobiz
         try {
-          sendVobizAudio(ws, mulawBuffer);
+          await sendVobizAudio(ws, mulawBuffer);
         } catch (convertErr) {
           console.error(`[Vobiz Audio Send error]`, convertErr);
         }
@@ -940,79 +977,188 @@ async function startServer() {
       // No ws.close() or terminate() — connection stays alive for next chunk
     };
 
-    ws.on("message", (message) => {
-      console.log(`[WS MESSAGE] callId=${callId} bytes=${Buffer.isBuffer(message) ? message.length : String(message).length}`);
+    // INSERT — AI greeting sent 800 ms after WS opens:
+    // This fires independently of STT so outbound audio can be verified
+    // even before the lead speaks a single word.
+    setTimeout(async () => {
       try {
-        const raw = message.toString();
-        const data = JSON.parse(raw);
+        // Guard: socket may have closed during the delay
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-        if (data.event === "connected") {
-          console.log(`[Vobiz Stream] Connected event | protocol=${data.protocol || "unknown"}`);
+        if (!ownerId) {
+          console.warn(`[Vobiz Greeting] No ownerId — skipping greeting`);
           return;
         }
 
-        if (data.event === "start") {
-          console.log(`[Vobiz Start RAW] ${JSON.stringify(data)}`);
+        // Pull greeting text from KB if available, otherwise use a safe default
+        let greetingText: string = `Hello, this is an AI assistant calling. May I speak with you for a moment?`;
 
-          // Parse from top-level first (official Vobiz spec), fall back to nested start object
-          const streamId = data.streamId || data.start?.streamId || data.start?.stream_id;
-          const resolvedCallId = data.callId || data.start?.callId || data.start?.call_id;
-          console.log(`[Vobiz Start Parsed] callId=${resolvedCallId} streamId=${streamId}`);
+        if (callId) {
+          try {
+            const callDoc = await db.collection("calls").doc(callId).get();
+            const callData = callDoc.data() || {};
+            const kb = callData.knowledgeBaseSnapshot || {};
+            greetingText = kb?.guidance?.greeting || greetingText;
+          } catch (e) {
+            console.warn(`[Vobiz Greeting] Could not fetch call context:`, e);
+          }
+        }
+
+        console.log(`[Vobiz Greeting] Generating TTS for callId=${callId}: "${greetingText}"`);
+
+        // Use the existing fetchTtsAudio() — ElevenLabs or Azure, per user config
+        const greetingMulaw = await fetchTtsAudio(greetingText, ownerId);
+        if (!greetingMulaw) {
+          console.warn(`[Vobiz Greeting] fetchTtsAudio returned null — check TTS provider config`);
           return;
         }
 
-        if (data.event === "media") {
-          const audioBuffer = Buffer.from(data.media?.payload || "", "base64");
+        console.log(`[Vobiz Greeting] Sending ${greetingMulaw.length} bytes of μ-law audio`);
+        await sendVobizAudio(ws, greetingMulaw);
+        console.log(`[Vobiz Greeting] Done for callId=${callId}`);
+
+      } catch (greetErr) {
+        console.error(`[Vobiz Greeting] Error for callId=${callId}:`, greetErr);
+      }
+    }, 800); // 800 ms head-start — lets Vobiz fully stabilise the stream before first audio
+
+    // ADD: frame counter for debug logging — persists across frames for the same call
+    let vobizFrameCount = 0;
+
+    ws.on("message", async (message: any) => {
+      console.log(`[WS MESSAGE] callId=${callId} bytes=${Buffer.isBuffer(message) ? message.length : String(message).length}`);
+
+      // ── Step 1: Robust Vobiz JSON / binary frame parsing ─────────────────────
+      // Vobiz always sends JSON text frames (not raw binary), structured as:
+      //   { event: "connected" | "start" | "media" | "dtmf" | "stop", ... }
+      // The audio lives in media.payload as a base64 string (μ-law 8kHz).
+
+      let decoded: Buffer | null = null;
+      let eventType = "(unknown)";
+
+      try {
+        // Normalise to string regardless of whether WS delivered Buffer or string
+        const raw = Buffer.isBuffer(message) ? message.toString("utf8") : String(message);
+
+        // ── DEBUG: log first 300 chars of every raw frame (first 5 frames only)
+        if (vobizFrameCount < 5) {
+          console.log(`[Vobiz raw frame #${vobizFrameCount}] ${raw.slice(0, 300)}`);
+        }
+
+        if (raw.trimStart().startsWith("{")) {
+          // ── JSON frame (the expected Vobiz format) ──────────────────────────
+          const json = JSON.parse(raw) as Record<string, any>;
+          eventType = json.event ?? "(no event)";
+
+          // Silently skip non-audio control events
+          if (eventType === "connected") {
+            console.log(`[Vobiz WS] control event="${eventType}" (skipping audio) | protocol=${json.protocol || "unknown"}`);
+            return;
+          }
+
+          if (eventType === "start") {
+            console.log(`[Vobiz Start RAW] ${JSON.stringify(json)}`);
+            const streamId = json.streamId || json.start?.streamId || json.start?.stream_id;
+            const resolvedCallId = json.callId || json.start?.callId || json.start?.call_id;
+            console.log(`[Vobiz Start Parsed] callId=${resolvedCallId} streamId=${streamId}`);
+            console.log(`[Vobiz WS] control event="${eventType}" (skipping audio)`);
+            return;
+          }
+
+          if (eventType === "stop") {
+            console.log(`[Vobiz WS] stop event received | streamId=${json.streamId || json.stream_id} reason=${json.reason || "unknown"}`);
+            // Flush remaining audio on stop
+            if (mediaBuffers.length > 0) {
+              const combined = Buffer.concat(mediaBuffers);
+              mediaBuffers = [];
+              console.log("[DEBUG] Sending buffer to Deepgram bytes=", combined.length);
+              transcribeBuffer(combined);
+            }
+            return;
+          }
+
+          if (eventType === "dtmf") {
+            console.log(`[Vobiz WS] dtmf digit=${json.dtmf?.digit ?? json.digit ?? "?"}`);
+            return;
+          }
+
+          if (eventType === "playedStream") {
+            console.log(`[Vobiz Stream] playedStream | streamSid=${json.streamSid || json.stream_sid || "unknown"}`);
+            return;
+          }
+
+          if (eventType === "clearedAudio") {
+            console.log(`[Vobiz Stream] clearedAudio acknowledged`);
+            return;
+          }
+
+          if (eventType !== "media") {
+            console.log(`[Vobiz Stream] Unknown event=${eventType}`);
+            return;
+          }
+
+          // Extract base64 audio — try all known Vobiz field shapes in order:
+          //   1. { event:"media", media:{ payload:"<b64>" } }   ← standard
+          //   2. { event:"media", payload:"<b64>" }             ← some firmware
+          //   3. { event:"audio", audio:"<b64>" }               ← legacy
+          let b64: string | null = null;
+          if (json.media?.payload && typeof json.media.payload === "string") {
+            b64 = json.media.payload;
+          } else if (typeof json.payload === "string") {
+            b64 = json.payload;
+          } else if (typeof json.audio === "string") {
+            b64 = json.audio;
+          }
+
+          if (!b64) {
+            console.warn(
+              `[Vobiz WS] event="${eventType}" — no base64 audio field found. ` +
+              `keys=${Object.keys(json).join(",")}`
+            );
+            return;
+          }
+
+          decoded = Buffer.from(b64, "base64");
           console.log(
-            `[Vobiz Stream] Media | bytes=${audioBuffer.length} contentType=${data.media?.contentType} sampleRate=${data.media?.sampleRate}`
+            `[Vobiz WS] event="${eventType}" b64Len=${b64.length} ` +
+            `decodedBytes=${decoded.length} contentType=${json.media?.contentType} sampleRate=${json.media?.sampleRate}`
           );
 
-          mediaBuffers.push(audioBuffer);
-          console.log("[DEBUG] bufferCount=", mediaBuffers.length);
-
-          if (mediaBuffers.length >= 20) {
-            const combined = Buffer.concat(mediaBuffers);
-            mediaBuffers = [];
-            console.log("[DEBUG] Sending buffer to Deepgram bytes=", combined.length);
-            transcribeBuffer(combined);
-            // Connection remains open — buffering continues after transcription
-          }
-          return;
+        } else {
+          // ── Raw binary fallback (rare, but handle gracefully) ──────────────
+          decoded = Buffer.isBuffer(message)
+            ? (message as Buffer)
+            : Buffer.from(message as ArrayBuffer);
+          console.log(`[Vobiz WS] raw binary frame bytes=${decoded.length}`);
         }
 
-        if (data.event === "dtmf") {
-          console.log(`[Vobiz Stream] DTMF | digit=${data.dtmf?.digit || data.digit}`);
-          return;
-        }
+      } catch (parseErr) {
+        console.error(`[Vobiz WS] message parse error:`, parseErr);
+        return;
+      }
 
-        if (data.event === "stop") {
-          console.log(`[Vobiz Stream] Stop | streamId=${data.streamId || data.stream_id} reason=${data.reason || "unknown"}`);
+      if (!decoded || decoded.length === 0) return;
 
-          // Flush remaining audio on Vobiz stop event
-          if (mediaBuffers.length > 0) {
-            const combined = Buffer.concat(mediaBuffers);
-            mediaBuffers = [];
-            console.log("[DEBUG] Sending buffer to Deepgram bytes=", combined.length);
-            transcribeBuffer(combined);
-          }
-          return;
-        }
-
-        if (data.event === "playedStream") {
-          console.log(`[Vobiz Stream] playedStream | streamSid=${data.streamSid || data.stream_sid || "unknown"}`);
-          return;
-        }
-
-        if (data.event === "clearedAudio") {
-          console.log(`[Vobiz Stream] clearedAudio acknowledged`);
-          return;
-        }
-
-        console.log(`[Vobiz Stream] Unknown event=${data.event}`);
-      } catch (error) {
+      // ── Step 2: Debug — log first 5 decoded frames ──────────────────────────
+      if (vobizFrameCount < 5) {
         console.log(
-          `[WS MESSAGE] Non-JSON | callId=${callId} bytes=${Buffer.isBuffer(message) ? message.length : String(message).length}`
+          `[Vobiz decoded frame #${vobizFrameCount}] ` +
+          `bytes=${decoded.length} ` +
+          `hex[0:20]=${decoded.slice(0, 20).toString("hex")}`
         );
+      }
+      vobizFrameCount++;
+
+      // ── Step 3: Accumulate μ-law audio for STT ───────────────────────────────
+      mediaBuffers.push(decoded);
+      console.log("[DEBUG] bufferCount=", mediaBuffers.length);
+
+      if (mediaBuffers.length >= 20) {
+        const combined = Buffer.concat(mediaBuffers);
+        mediaBuffers = [];
+        console.log("[DEBUG] Sending buffer to Deepgram bytes=", combined.length);
+        transcribeBuffer(combined);
+        // Connection remains open — buffering continues after transcription
       }
     });
 
