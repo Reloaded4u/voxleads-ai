@@ -14,6 +14,7 @@ import * as cheerio from "cheerio";
 import { formatInTimeZone, toZonedTime, fromZonedTime } from "date-fns-tz";
 import twilio from "twilio";
 import { google } from "googleapis";
+// import { spawn } from "child_process"; // removed — ffmpeg not available on Render
 
 const resolve4 = promisify(dns.resolve4);
 
@@ -164,6 +165,123 @@ Reply naturally.`;
   } catch (error) {
     console.error('[AI Response] Gemini error:', error);
     return "I'm sorry, I'm having trouble processing that. Can you please repeat?";
+  }
+}
+
+/**
+ * Wraps an audio buffer in a Vobiz playAudio JSON event and sends it over the WebSocket.
+ * Must be called with mulaw 8kHz audio bytes.
+ */
+function sendVobizAudio(ws: any, audioBuffer: Buffer): void {
+  const payload = audioBuffer.toString("base64");
+  console.log(`[Vobiz Outbound Audio] bytes=${audioBuffer.length}`);
+  ws.send(JSON.stringify({
+    event: "playAudio",
+    media: {
+      contentType: "audio/x-mulaw",
+      sampleRate: 8000,
+      payload
+    }
+  }), (err?: Error) => {
+    if (err) {
+      console.error(`[Vobiz playAudio sent] error=${err.message}`);
+    } else {
+      console.log(`[Vobiz playAudio sent] bytes=${audioBuffer.length}`);
+    }
+  });
+}
+
+/**
+ * Pure-JS G.711 µ-law encoder.
+ * Converts a 16-bit signed PCM sample to an 8-bit µ-law byte.
+ */
+function pcmSampleToMulaw(sample: number): number {
+  const MULAW_BIAS = 33;
+  const MULAW_MAX = 0x1FFF;
+  let sign = 0;
+  if (sample < 0) { sign = 0x80; sample = -sample; }
+  sample = Math.min(sample + MULAW_BIAS, 32767);
+  let exponent = 7;
+  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+  const mantissa = (sample >> (exponent + 3)) & 0x0F;
+  return ~(sign | (exponent << 4) | mantissa) & 0xFF;
+}
+
+/**
+ * Converts a raw 16-bit little-endian PCM buffer to 8-bit µ-law.
+ * No external dependencies — runs anywhere Node.js runs.
+ */
+function pcm16ToMulaw(pcmBuffer: Buffer): Buffer {
+  const numSamples = Math.floor(pcmBuffer.length / 2);
+  const mulawBuffer = Buffer.allocUnsafe(numSamples);
+  for (let i = 0; i < numSamples; i++) {
+    const sample = pcmBuffer.readInt16LE(i * 2);
+    mulawBuffer[i] = pcmSampleToMulaw(sample);
+  }
+  return mulawBuffer;
+}
+
+/**
+ * Fetches TTS audio for a given message + ownerId using the user's configured TTS provider.
+ * Returns raw mulaw 8kHz mono bytes ready for Vobiz, or null on failure.
+ * Requests mulaw/PCM directly from the provider — no ffmpeg needed.
+ */
+async function fetchTtsAudio(message: string, ownerId: string): Promise<Buffer | null> {
+  try {
+    const userDoc = await db.collection("users").doc(ownerId).get();
+    const integrations = userDoc.data()?.integrations || {};
+    const provider: string = integrations.ttsProvider || "polly";
+
+    if (provider === "elevenlabs") {
+      const apiKey = integrations.elevenLabsApiKey || process.env.ELEVENLABS_API_KEY;
+      const voiceId = integrations.elevenLabsVoiceId || "21m00Tcm4TlvDq8ikWAM";
+      if (!apiKey) throw new Error("ElevenLabs API Key missing");
+
+      // Request ulaw_8000 directly — ElevenLabs natively supports this output format
+      const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=ulaw_8000`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "xi-api-key": apiKey },
+        body: JSON.stringify({
+          text: message,
+          model_id: "eleven_multilingual_v2",
+          voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+        })
+      });
+      if (!res.ok) throw new Error(`ElevenLabs TTS error: ${res.status}`);
+      // Response is already 8kHz mulaw — send directly
+      return Buffer.from(await res.arrayBuffer());
+    }
+
+    if (provider === "azure") {
+      const key = integrations.azureApiKey;
+      const region = integrations.azureRegion;
+      const voice = integrations.azureVoiceName || "en-US-JennyNeural";
+      if (!key || !region) throw new Error("Azure credentials missing");
+
+      const ssml = `<speak version='1.0' xml:lang='en-US'><voice xml:lang='en-US' name='${voice}'>${escapeXml(message)}</voice></speak>`;
+      // Request raw 8kHz 8-bit mono mulaw directly from Azure — no transcoding needed
+      const res = await fetch(`https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`, {
+        method: "POST",
+        headers: {
+          "Ocp-Apim-Subscription-Key": key,
+          "Content-Type": "application/ssml+xml",
+          "X-Microsoft-OutputFormat": "raw-8khz-8bit-mono-mulaw",
+          "User-Agent": "VoxLeadsAI"
+        },
+        body: ssml
+      });
+      if (!res.ok) throw new Error(`Azure TTS error: ${res.status}`);
+      // Response is already 8kHz mulaw — send directly
+      return Buffer.from(await res.arrayBuffer());
+    }
+
+    // Polly / custom / other — not directly fetchable here, return null and let caller fallback
+    console.log(`[Vobiz TTS] Provider '${provider}' not directly supported for WS stream — skipping playback`);
+    return null;
+
+  } catch (err) {
+    console.error(`[Vobiz TTS error]`, err);
+    return null;
   }
 }
 
@@ -772,11 +890,50 @@ async function startServer() {
         const result = await response.json() as any;
         console.log("[DEBUG] Deepgram raw result:", JSON.stringify(result).slice(0, 1000));
         const transcript = result?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
-        if (transcript) {
-          console.log(`[Deepgram STT] Transcript: ${transcript}`);
-        } else {
+
+        if (!transcript) {
           console.log(`[Deepgram STT] Empty transcript`);
+          return;
         }
+
+        console.log(`[Deepgram STT] Transcript: ${transcript}`);
+
+        // Fetch call context for Gemini
+        let callData: any = {};
+        let kb: any = {};
+        if (callId) {
+          try {
+            const callDoc = await db.collection("calls").doc(callId).get();
+            callData = callDoc.data() || {};
+            kb = callData.knowledgeBaseSnapshot || {};
+          } catch (e) {
+            console.error(`[Vobiz WS] Failed to fetch call context:`, e);
+          }
+        }
+
+        // Generate AI reply via Gemini
+        const aiReply = await generateAiResponse(transcript, callData, kb);
+        console.log(`[Vobiz WS] Gemini reply: ${aiReply}`);
+
+        if (!ownerId) {
+          console.log(`[Vobiz WS] No ownerId — skipping TTS playback`);
+          return;
+        }
+
+        // Fetch TTS audio from user's configured provider (returned as 8kHz mulaw directly)
+        const mulawBuffer = await fetchTtsAudio(aiReply, ownerId);
+        if (!mulawBuffer) {
+          console.log(`[Vobiz WS] No TTS audio returned — skipping playback`);
+          return;
+        }
+
+        // Send mulaw audio to Vobiz
+        try {
+          sendVobizAudio(ws, mulawBuffer);
+        } catch (convertErr) {
+          console.error(`[Vobiz Audio Send error]`, convertErr);
+        }
+
       } catch (err) {
         console.error(`[Deepgram STT] Error:`, err);
       }
