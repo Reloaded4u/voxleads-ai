@@ -183,7 +183,8 @@ async function sendVobizAudio(ws: any, audioBuffer: Buffer): Promise<void> {
 
   for (let i = 0; i < totalChunks; i++) {
     // Guard: abort if the socket has closed mid-playback
-    if (!ws || ws.readyState !== WebSocket.OPEN) { ${i}/${totalChunks}, aborting`);
+    if (!ws || ws.readyState !== 1) {
+      console.warn(`[Vobiz playAudio] WS closed at chunk ${i}/${totalChunks}, aborting`);
       break;
     }
 
@@ -204,12 +205,10 @@ async function sendVobizAudio(ws: any, audioBuffer: Buffer): Promise<void> {
       event: "playAudio",
       media: {
         contentType: "audio/x-mulaw",
-        sampleRate:  8000,
-        payload:     frame.toString("base64"),
+        sampleRate: 8000,
+        payload: frame.toString("base64"),
       },
-    }), (err?: Error) => {
-      if (err) console.error(`[Vobiz playAudio chunk] index=${i} error=${err.message}`);
-    });
+    }));
 
     console.log(`[Vobiz playAudio chunk] index=${i} bytes=${frame.length}`);
 
