@@ -911,7 +911,7 @@ async function startServer() {
 
   // Vobiz WebSocket connection handler
   wss.on("connection", (ws, request) => {
-    console.log("[Vobiz Greeting DEBUG] active handler reached");
+    console.log("[VOBIZ ACTIVE HANDLER HIT]");
 
     const urlParams = new URLSearchParams(request.url?.split("?")[1] || "");
     const callId = urlParams.get("callId");
@@ -997,73 +997,27 @@ async function startServer() {
       // No ws.close() or terminate() — connection stays alive for next chunk
     };
 
-    console.log("[Vobiz Greeting DEBUG] scheduling greeting timer", { callId, ownerId });
+    console.log("[Vobiz Greeting DEBUG] scheduling greeting");
 
-    // AI greeting sent 800 ms after WS opens
+    // TTS-free outbound audio test — no Firestore, no ElevenLabs, no dependencies.
+    // Sends 10 frames of μ-law silence/noise to verify Vobiz accepts playAudio frames.
     setTimeout(async () => {
-      try {
-        console.log("[Vobiz Greeting DEBUG] timer fired", { callId, ownerId, readyState: ws.readyState });
-
-        // Guard: socket may have closed during the delay
-        if (!ws || ws.readyState !== 1) {
-          console.warn(`[Vobiz Greeting DEBUG] skipping — WS not open, readyState=${ws?.readyState}`);
-          return;
-        }
-
-        // Resolve ownerId from Firestore if missing from URL params
-        if (!ownerId) {
-          console.warn(`[Vobiz Greeting DEBUG] ownerId missing from URL params — attempting Firestore lookup via callId=${callId}`);
-          if (callId) {
-            try {
-              const callDoc = await db.collection("calls").doc(callId).get();
-              const resolved = callDoc.data()?.ownerId || callDoc.data()?.userId || null;
-              if (resolved) {
-                ownerId = resolved;
-                console.log("[Vobiz Greeting DEBUG] resolved ownerId from call doc", ownerId);
-              } else {
-                console.error(`[Vobiz Greeting DEBUG] skipping — ownerId not found in call doc either. callId=${callId}`);
-                return;
-              }
-            } catch (e) {
-              console.error(`[Vobiz Greeting DEBUG] skipping — Firestore lookup failed:`, e);
-              return;
-            }
-          } else {
-            console.error(`[Vobiz Greeting DEBUG] skipping — both ownerId and callId are null. Cannot resolve owner.`);
-            return;
+      console.log("[Vobiz Greeting DEBUG] timer fired");
+      const testAudio = Buffer.alloc(160 * 10, 255); // simple μ-law noise test
+      for (let i = 0; i < testAudio.length; i += 160) {
+        const chunk = testAudio.slice(i, i + 160);
+        ws.send(JSON.stringify({
+          event: "playAudio",
+          media: {
+            contentType: "audio/x-mulaw",
+            sampleRate: 8000,
+            payload: chunk.toString("base64")
           }
-        }
-
-        // Pull greeting text from KB if available, otherwise use a safe default
-        let greetingText: string = `Hello, this is an AI assistant calling. May I speak with you for a moment?`;
-
-        if (callId) {
-          try {
-            const callDoc = await db.collection("calls").doc(callId).get();
-            const callData = callDoc.data() || {};
-            const kb = callData.knowledgeBaseSnapshot || {};
-            greetingText = kb?.guidance?.greeting || greetingText;
-          } catch (e) {
-            console.warn(`[Vobiz Greeting DEBUG] Could not fetch KB greeting text — using default. error=`, e);
-          }
-        }
-
-        console.log(`[Vobiz Greeting] Generating TTS for callId=${callId} ownerId=${ownerId}: "${greetingText}"`);
-
-        const greetingMulaw = await fetchTtsAudio(greetingText, ownerId);
-        if (!greetingMulaw) {
-          console.error(`[Vobiz Greeting DEBUG] skipping — fetchTtsAudio returned null for ownerId=${ownerId}. Check TTS provider config.`);
-          return;
-        }
-
-        console.log(`[Vobiz Greeting] Sending ${greetingMulaw.length} bytes of μ-law audio`);
-        await sendVobizAudio(ws, greetingMulaw);
-        console.log(`[Vobiz Greeting] Done for callId=${callId}`);
-
-      } catch (greetErr) {
-        console.error(`[Vobiz Greeting DEBUG] uncaught error in timer:`, greetErr);
+        }));
+        console.log("[Vobiz TEST AUDIO chunk sent]");
+        await new Promise(r => setTimeout(r, 20));
       }
-    }, 800); // 800 ms — lets Vobiz stabilise the stream before first audio
+    }, 1000);
 
     // ADD: frame counter for debug logging — persists across frames for the same call
     let vobizFrameCount = 0;
