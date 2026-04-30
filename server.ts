@@ -1096,43 +1096,23 @@ async function startServer() {
 
           decoded = Buffer.from(b64, "base64");
           console.log("[PATCH CONFIRMED 2026-04-30] active vobiz media log reached");
+          console.log("[Vobiz Greeting CHECK] greetingSent=", greetingSent);
           if (!greetingSent) {
             greetingSent = true;
             console.log("[Vobiz Greeting] starting");
-            try {
-              // Resolve ownerId — from URL param or call document
-              let resolvedOwnerId = ownerId;
-              if (!resolvedOwnerId && callId) {
-                const callSnap = await db.collection("calls").doc(callId).get();
-                resolvedOwnerId = callSnap.data()?.ownerId || callSnap.data()?.userId || null;
+            const resolvedOwnerId = ownerId;
+            console.log("[Vobiz Greeting] ownerId resolved=", resolvedOwnerId);
+            if (!resolvedOwnerId) {
+              console.error("[Vobiz Greeting] ownerId missing");
+            } else {
+              const greetingText = "Hello, this is VoxLeads AI calling. May I speak with you for a moment?";
+              console.log("[Vobiz Greeting] text=", greetingText);
+              const audio = await fetchTtsAudio(greetingText, resolvedOwnerId);
+              console.log("[Vobiz Greeting] tts result=", audio ? audio.length : "NULL");
+              if (audio) {
+                await sendVobizAudio(ws, audio);
+                console.log("[Vobiz Greeting] sent");
               }
-              console.log(`[Vobiz Greeting] ownerId resolved=${resolvedOwnerId}`);
-              if (!resolvedOwnerId) {
-                console.error("[Vobiz Greeting] cannot send greeting — ownerId unresolvable");
-              } else {
-                // Fetch greeting text from KB snapshot
-                let greetingText = "Hello, this is VoxLeads AI calling. May I speak with you for a moment?";
-                if (callId) {
-                  try {
-                    const callSnap = await db.collection("calls").doc(callId).get();
-                    const kb = callSnap.data()?.knowledgeBaseSnapshot || {};
-                    greetingText = kb?.guidance?.greeting || greetingText;
-                  } catch (e) {
-                    console.warn("[Vobiz Greeting] could not fetch KB — using default greeting", e);
-                  }
-                }
-                console.log(`[Vobiz Greeting] text=${greetingText}`);
-                const greetingMulaw = await fetchTtsAudio(greetingText, resolvedOwnerId);
-                if (!greetingMulaw) {
-                  console.error("[Vobiz Greeting] fetchTtsAudio returned null — check TTS config");
-                } else {
-                  console.log(`[Vobiz Greeting] audio bytes=${greetingMulaw.length}`);
-                  await sendVobizAudio(ws, greetingMulaw);
-                  console.log("[Vobiz Greeting] sent");
-                }
-              }
-            } catch (greetErr) {
-              console.error("[Vobiz Greeting] error:", greetErr);
             }
           }
           console.log(
