@@ -941,6 +941,11 @@ async function startServer() {
     let currentTurnId = 0;              // increments each playback — used for log tracing
     let ignoreInboundUntil = 0;         // epoch ms — discard inbound frames until cooldown expires
 
+    // Echo/self-transcript blocking — tracks the last AI reply so Deepgram hearing
+    // the AI's own voice does not feed back into Gemini.
+    let lastAiReplyText = "";
+    let lastAiReplyAt = 0;
+
     // ── Single outbound playback lock ──────────────────────────────────────────
     // Ensures only one AI audio stream plays at a time (greeting or reply).
     // Any call while playback is already active is silently dropped.
@@ -962,7 +967,7 @@ async function startServer() {
         console.log(`[Vobiz Playback] completed "${label}" turn=${thisTurn}`);
       } finally {
         mediaBuffers = [];
-        ignoreInboundUntil = Date.now() + 3000;
+        ignoreInboundUntil = Date.now() + 6000;
         // Release lock after cooldown so inbound audio is not picked up while
         // the line is still ringing with echo/tail from the AI utterance.
         setTimeout(() => {
@@ -970,7 +975,7 @@ async function startServer() {
           isProcessingTurn = false;
           outboundPlaybackActive = false;
           console.log(`[Vobiz STT] cooldown done — listening for next user turn (turn=${thisTurn})`);
-        }, 3000);
+        }, 6000);
       }
     };
 
@@ -998,14 +1003,39 @@ async function startServer() {
         const result = await response.json() as any;
         console.log("[DEBUG] Deepgram raw result:", JSON.stringify(result).slice(0, 1000));
         const transcript = result?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
-        console.log(`[Deepgram] transcript="${transcript}"`);
 
-        if (!transcript || transcript.trim() === "") {
+        // ── Echo / self-transcript blocking ────────────────────────────────────
+        // If Deepgram heard the AI's own TTS output, do not send it to Gemini.
+        const normalizedTranscript = transcript.trim().toLowerCase();
+
+        if (!normalizedTranscript) {
           console.log(`[Deepgram STT] Empty transcript — skipping Gemini and TTS`);
           return;
         }
 
-        console.log(`[Deepgram STT] Transcript: ${transcript}`);
+        // Key-phrase exact-match guards (fast path for common AI phrases)
+        if (
+          (lastAiReplyText.includes("may i quickly share") && normalizedTranscript.includes("may i quickly share")) ||
+          normalizedTranscript.includes("yes i can hear you")
+        ) {
+          console.log(`[Vobiz Echo] skipped transcript because it matches last AI reply: "${normalizedTranscript}"`);
+          return;
+        }
+
+        // Heavy-overlap guard within 15 s of last AI reply
+        if (lastAiReplyText && Date.now() - lastAiReplyAt < 15000) {
+          // Compute word-level overlap ratio between transcript and AI reply
+          const transcriptWords = new Set(normalizedTranscript.split(/\s+/).filter(Boolean));
+          const replyWords    = lastAiReplyText.split(/\s+/).filter(Boolean);
+          const overlapCount  = replyWords.filter((w) => transcriptWords.has(w)).length;
+          const overlapRatio  = replyWords.length > 0 ? overlapCount / replyWords.length : 0;
+
+          if (overlapRatio >= 0.6) {
+            console.log(`[Vobiz Echo] skipped transcript because it matches last AI reply (overlap=${(overlapRatio * 100).toFixed(0)}%): "${normalizedTranscript}"`);
+            return;
+          }
+        }
+        // ── End echo blocking ──────────────────────────────────────────────────
 
         // Fetch call context for Gemini
         let callData: any = {};
@@ -1055,6 +1085,10 @@ async function startServer() {
           // Generate AI reply via Gemini
           const aiReply = await generateAiResponse(transcript, callData, kb);
           console.log(`[Vobiz WS] Gemini reply: ${aiReply}`);
+
+          // Record AI reply for echo/self-transcript blocking (before TTS plays)
+          lastAiReplyText = aiReply.trim().toLowerCase();
+          lastAiReplyAt = Date.now();
 
           if (!ownerId) {
             console.log(`[Vobiz WS] No ownerId — skipping TTS playback`);
@@ -1182,8 +1216,6 @@ async function startServer() {
           }
 
           decoded = Buffer.from(b64, "base64");
-          console.log("[PATCH CONFIRMED 2026-04-30] active vobiz media log reached");
-          console.log("[Vobiz Greeting CHECK] greetingSent=", greetingSent, "greetingAttempted=", greetingAttempted);
           if (!greetingSent && !greetingAttempted) {
             greetingAttempted = true;
             console.log("[Vobiz Greeting] entering block");
@@ -2395,5 +2427,4 @@ server.listen(PORT, "0.0.0.0", () => {
 });
 }
 
-console.log("[VOBIZ PATCH VERSION] greeting-debug-v2 loaded");
 startServer();
