@@ -952,8 +952,8 @@ async function startServer() {
         const transcript = result?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
         console.log(`[Deepgram] transcript="${transcript}"`);
 
-        if (!transcript) {
-          console.log(`[Deepgram STT] Empty transcript`);
+        if (!transcript || transcript.trim() === "") {
+          console.log(`[Deepgram STT] Empty transcript — skipping Gemini and TTS`);
           return;
         }
 
@@ -1134,7 +1134,9 @@ async function startServer() {
                 isSpeaking = true;
                 await sendVobizAudio(ws, audio);
                 isSpeaking = false;
+                mediaBuffers = []; // discard audio captured during AI speech
                 console.log("[Vobiz Greeting] sent");
+                console.log("[Vobiz STT] listening for user speech");
               }
             }
           }
@@ -1169,10 +1171,16 @@ async function startServer() {
       vobizFrameCount++;
 
       // ── Step 3: Accumulate μ-law audio for STT ───────────────────────────────
+      // Skip inbound frames while AI is playing back audio
+      if (isSpeaking) {
+        console.log("[Vobiz STT] skipping inbound frame while AI speaking");
+        return;
+      }
+
       mediaBuffers.push(decoded);
       console.log("[DEBUG] bufferCount=", mediaBuffers.length);
 
-      if (mediaBuffers.length >= 20) {
+      if (mediaBuffers.length >= 75) {
         const combined = Buffer.concat(mediaBuffers);
         mediaBuffers = [];
         console.log("[DEBUG] Sending buffer to Deepgram bytes=", combined.length);
