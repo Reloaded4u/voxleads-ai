@@ -937,9 +937,15 @@ async function startServer() {
     let isProcessingTurn = false;    // true from Gemini call until audio finishes + 500 ms cooldown
     let lastTranscript = "";         // normalised text of last processed utterance
     let lastTranscriptAt = 0;        // epoch ms when lastTranscript was processed
+    let ignoreInboundUntil = 0;      // epoch ms — discard inbound frames until this time (echo/tail cooldown)
 
     const transcribeBuffer = async (audioBuffer: Buffer) => {
       try {
+        // Patch 7: Do not run STT if the call has ended
+        if (!callActive) {
+          console.log("[Vobiz STT] transcribeBuffer skipped — call no longer active");
+          return;
+        }
         console.log("[DEBUG] Deepgram request started");
         const dgUrl = new URL("https://api.deepgram.com/v1/listen");
         dgUrl.searchParams.set("model",        "nova-2");
@@ -1013,6 +1019,8 @@ async function startServer() {
         // Acquire turn lock
         isProcessingTurn = true;
         isSpeaking = true;
+        if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+        mediaBuffers = [];
         lastTranscript = normalized;
         lastTranscriptAt = Date.now();
 
@@ -1040,15 +1048,17 @@ async function startServer() {
             console.error(`[Vobiz Audio Send error]`, convertErr);
           }
 
-          // Post-playback: discard any audio captured during AI speech, then wait
-          // 500 ms before marking the turn complete so the silence timer cannot
-          // fire mid-reset and re-trigger the same utterance.
+          // Post-playback: clear any echo/tail audio, start cooldown window, then release turn lock.
           mediaBuffers = [];
+          ignoreInboundUntil = Date.now() + 2500; // ignore echo/tail audio after AI playback
+          isSpeaking = false;
+          isProcessingTurn = false;
+          console.log("[Vobiz STT] cooldown started after AI playback");
           await new Promise<void>((r) => setTimeout(r, 500));
           console.log("[Vobiz STT] listening for next user turn");
 
         } finally {
-          // Always release the turn lock, even on error
+          // Always release the turn lock on error paths (normal path releases inline above)
           isSpeaking = false;
           isProcessingTurn = false;
         }
@@ -1176,9 +1186,15 @@ async function startServer() {
               } else {
                 greetingSent = true;
                 isSpeaking = true;
+                isProcessingTurn = true;
+                if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+                mediaBuffers = [];
                 await sendVobizAudio(ws, audio);
+                mediaBuffers = [];
+                ignoreInboundUntil = Date.now() + 2500; // ignore echo/tail audio after greeting
                 isSpeaking = false;
-                mediaBuffers = []; // discard audio captured during AI speech
+                isProcessingTurn = false;
+                console.log("[Vobiz STT] cooldown started after AI playback (greeting)");
                 console.log("[Vobiz Greeting] sent");
                 console.log("[Vobiz STT] listening for user speech");
               }
@@ -1215,20 +1231,24 @@ async function startServer() {
       vobizFrameCount++;
 
       // ── Step 3: Accumulate μ-law audio for STT ───────────────────────────────
-      // Skip inbound frames while AI is playing back audio or still processing
-      if (isSpeaking || isProcessingTurn) {
-        console.log("[Vobiz STT] skipping inbound frame while AI speaking/processing");
+      // Skip inbound frames while AI is playing back audio, still processing, or within cooldown window
+      if (isSpeaking || isProcessingTurn || Date.now() < ignoreInboundUntil) {
+        console.log("[Vobiz STT] skipping inbound frame during playback/cooldown");
+        return;
+      }
+
+      // Guard: do not accumulate audio if the call is no longer active
+      if (!callActive) {
+        console.log("[Vobiz STT] skipping inbound frame — call inactive");
         return;
       }
 
       mediaBuffers.push(decoded);
       console.log("[DEBUG] bufferCount=", mediaBuffers.length);
 
-      // Silence-based VAD — reset 1200 ms timer on every inbound frame.
-      // When the timer fires (user stopped speaking), flush the buffer and transcribe
-      // immediately while the call is still open — no need to wait for hangup.
-      // Do not arm timer while a turn is being processed.
-      if (greetingSent && !isSpeaking && !isProcessingTurn) {
+      // Silence-based VAD — reset timer on every accepted inbound frame.
+      // Frame is only accepted here if callActive=true and not in playback/cooldown.
+      if (greetingSent) {
         if (silenceTimer) clearTimeout(silenceTimer);
         silenceTimer = setTimeout(() => {
           silenceTimer = null;
