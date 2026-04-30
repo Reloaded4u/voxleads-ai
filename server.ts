@@ -1119,7 +1119,10 @@ async function startServer() {
           console.log("[PATCH CONFIRMED 2026-04-30] active vobiz media log reached");
           console.log("[VOBIZ TEST AUDIO] attempting send");
           try {
-            const testFrame = Buffer.alloc(160, 0xff);
+            const testFrame = Buffer.alloc(160);
+            for (let i = 0; i < 160; i++) {
+              testFrame[i] = i % 2 === 0 ? 0x7f : 0xff;
+            }
             ws.send(JSON.stringify({
               event: "playAudio",
               media: {
