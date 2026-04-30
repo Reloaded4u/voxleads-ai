@@ -1098,22 +1098,23 @@ async function startServer() {
           console.log("[PATCH CONFIRMED 2026-04-30] active vobiz media log reached");
           console.log("[Vobiz Greeting CHECK] greetingSent=", greetingSent);
           if (!greetingSent) {
-            greetingSent = true;
-            console.log("[Vobiz Greeting] starting");
+            console.log("[Vobiz Greeting] entering block");
             const resolvedOwnerId = ownerId;
             console.log("[Vobiz Greeting] ownerId resolved=", resolvedOwnerId);
             if (!resolvedOwnerId) {
-              console.error("[Vobiz Greeting] ownerId missing");
-            } else {
-              const greetingText = "Hello, this is VoxLeads AI calling. May I speak with you for a moment?";
-              console.log("[Vobiz Greeting] text=", greetingText);
-              const audio = await fetchTtsAudio(greetingText, resolvedOwnerId);
-              console.log("[Vobiz Greeting] tts result=", audio ? audio.length : "NULL");
-              if (audio) {
-                await sendVobizAudio(ws, audio);
-                console.log("[Vobiz Greeting] sent");
-              }
+              console.error("[Vobiz Greeting] ownerId missing; will retry next media frame");
+              return;
             }
+            const greetingText = "Hello, this is VoxLeads AI calling. May I speak with you for a moment?";
+            const audio = await fetchTtsAudio(greetingText, resolvedOwnerId);
+            console.log("[Vobiz Greeting] tts result=", audio ? audio.length : "NULL");
+            if (!audio) {
+              console.error("[Vobiz Greeting] TTS failed; will retry next media frame");
+              return;
+            }
+            greetingSent = true;
+            await sendVobizAudio(ws, audio);
+            console.log("[Vobiz Greeting] sent");
           }
           console.log(
             `[Vobiz WS] event="${eventType}" b64Len=${b64.length} ` +
