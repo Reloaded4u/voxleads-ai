@@ -998,29 +998,7 @@ async function startServer() {
       // No ws.close() or terminate() — connection stays alive for next chunk
     };
 
-    console.log("[Vobiz Greeting DEBUG] scheduling greeting");
-
-    // TTS-free outbound audio test — no Firestore, no ElevenLabs, no dependencies.
-    // Sends 10 frames of μ-law silence/noise to verify Vobiz accepts playAudio frames.
-    setTimeout(async () => {
-      console.log("[Vobiz Greeting DEBUG] timer fired");
-      const testAudio = Buffer.alloc(160 * 10, 255); // simple μ-law noise test
-      for (let i = 0; i < testAudio.length; i += 160) {
-        const chunk = testAudio.slice(i, i + 160);
-        ws.send(JSON.stringify({
-          event: "playAudio",
-          media: {
-            contentType: "audio/x-mulaw",
-            sampleRate: 8000,
-            payload: chunk.toString("base64")
-          }
-        }));
-        console.log("[Vobiz TEST AUDIO chunk sent]");
-        await new Promise(r => setTimeout(r, 20));
-      }
-    }, 1000);
-
-    // ADD: frame counter for debug logging — persists across frames for the same call
+    // Frame counter for debug logging — persists across frames for the same call
     let vobizFrameCount = 0;
 
     ws.on("message", async (message: any) => {
