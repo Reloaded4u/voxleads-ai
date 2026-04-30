@@ -921,7 +921,7 @@ async function startServer() {
 
     // Per-call audio buffering state — persists for full call duration
     let mediaBuffers: Buffer[] = [];
-    let testAudioSent = false;
+    let greetingSent = false;
 
     const transcribeBuffer = async (audioBuffer: Buffer) => {
       try {
@@ -1118,27 +1118,44 @@ async function startServer() {
 
           decoded = Buffer.from(b64, "base64");
           console.log("[PATCH CONFIRMED 2026-04-30] active vobiz media log reached");
-          if (!testAudioSent) {
-            testAudioSent = true;
-            console.log("[VOBIZ TEST TONE] sending 2 seconds");
-            const totalFrames = 100; // 2 sec / 20ms
-            for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
-              const frame = Buffer.alloc(160);
-              for (let i = 0; i < 160; i++) {
-                frame[i] = i % 16 < 8 ? 0x10 : 0x90; // louder μ-law square tone
+          if (!greetingSent) {
+            greetingSent = true;
+            console.log("[Vobiz Greeting] starting");
+            try {
+              // Resolve ownerId — from URL param or call document
+              let resolvedOwnerId = ownerId;
+              if (!resolvedOwnerId && callId) {
+                const callSnap = await db.collection("calls").doc(callId).get();
+                resolvedOwnerId = callSnap.data()?.ownerId || callSnap.data()?.userId || null;
               }
-              ws.send(JSON.stringify({
-                event: "playAudio",
-                media: {
-                  contentType: "audio/x-mulaw",
-                  sampleRate: 8000,
-                  payload: frame.toString("base64")
+              console.log(`[Vobiz Greeting] ownerId resolved=${resolvedOwnerId}`);
+              if (!resolvedOwnerId) {
+                console.error("[Vobiz Greeting] cannot send greeting — ownerId unresolvable");
+              } else {
+                // Fetch greeting text from KB snapshot
+                let greetingText = "Hello, this is VoxLeads AI calling. May I speak with you for a moment?";
+                if (callId) {
+                  try {
+                    const callSnap = await db.collection("calls").doc(callId).get();
+                    const kb = callSnap.data()?.knowledgeBaseSnapshot || {};
+                    greetingText = kb?.guidance?.greeting || greetingText;
+                  } catch (e) {
+                    console.warn("[Vobiz Greeting] could not fetch KB — using default greeting", e);
+                  }
                 }
-              }));
-              console.log("[VOBIZ TEST TONE] frame sent", frameIndex);
-              await new Promise(r => setTimeout(r, 20));
+                console.log(`[Vobiz Greeting] text=${greetingText}`);
+                const greetingMulaw = await fetchTtsAudio(greetingText, resolvedOwnerId);
+                if (!greetingMulaw) {
+                  console.error("[Vobiz Greeting] fetchTtsAudio returned null — check TTS config");
+                } else {
+                  console.log(`[Vobiz Greeting] audio bytes=${greetingMulaw.length}`);
+                  await sendVobizAudio(ws, greetingMulaw);
+                  console.log("[Vobiz Greeting] sent");
+                }
+              }
+            } catch (greetErr) {
+              console.error("[Vobiz Greeting] error:", greetErr);
             }
-            console.log("[VOBIZ TEST TONE] done");
           }
           console.log(
             `[Vobiz WS] event="${eventType}" b64Len=${b64.length} ` +
