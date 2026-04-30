@@ -1116,6 +1116,7 @@ async function startServer() {
           }
 
           decoded = Buffer.from(b64, "base64");
+          console.log("[PATCH CONFIRMED 2026-04-30] active vobiz media log reached");
           console.log(
             `[Vobiz WS] event="${eventType}" b64Len=${b64.length} ` +
             `decodedBytes=${decoded.length} contentType=${json.media?.contentType} sampleRate=${json.media?.sampleRate}`
