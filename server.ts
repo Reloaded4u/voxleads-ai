@@ -922,6 +922,9 @@ async function startServer() {
     // Per-call audio buffering state — persists for full call duration
     let mediaBuffers: Buffer[] = [];
     let greetingSent = false;
+    let greetingAttempted = false;
+    let isSpeaking = false;
+    let ttsFailed = false;
 
     const transcribeBuffer = async (audioBuffer: Buffer) => {
       try {
@@ -969,6 +972,16 @@ async function startServer() {
           }
         }
 
+        // Skip AI reply if currently speaking or TTS has already failed this call
+        if (isSpeaking) {
+          console.log(`[Vobiz WS] Skipping Gemini reply — isSpeaking=true`);
+          return;
+        }
+        if (ttsFailed) {
+          console.log(`[Vobiz WS] Skipping TTS — ttsFailed=true for this call`);
+          return;
+        }
+
         // Generate AI reply via Gemini
         const aiReply = await generateAiResponse(transcript, callData, kb);
         console.log(`[Vobiz WS] Gemini reply: ${aiReply}`);
@@ -979,9 +992,11 @@ async function startServer() {
         }
 
         // Fetch TTS audio from user's configured provider (returned as 8kHz mulaw directly)
+        isSpeaking = true;
         const mulawBuffer = await fetchTtsAudio(aiReply, ownerId);
         if (!mulawBuffer) {
           console.log(`[Vobiz WS] No TTS audio returned — skipping playback`);
+          isSpeaking = false;
           return;
         }
 
@@ -990,6 +1005,8 @@ async function startServer() {
           await sendVobizAudio(ws, mulawBuffer);
         } catch (convertErr) {
           console.error(`[Vobiz Audio Send error]`, convertErr);
+        } finally {
+          isSpeaking = false;
         }
 
       } catch (err) {
@@ -1096,25 +1113,30 @@ async function startServer() {
 
           decoded = Buffer.from(b64, "base64");
           console.log("[PATCH CONFIRMED 2026-04-30] active vobiz media log reached");
-          console.log("[Vobiz Greeting CHECK] greetingSent=", greetingSent);
-          if (!greetingSent) {
+          console.log("[Vobiz Greeting CHECK] greetingSent=", greetingSent, "greetingAttempted=", greetingAttempted);
+          if (!greetingSent && !greetingAttempted) {
+            greetingAttempted = true;
             console.log("[Vobiz Greeting] entering block");
             const resolvedOwnerId = ownerId;
             console.log("[Vobiz Greeting] ownerId resolved=", resolvedOwnerId);
             if (!resolvedOwnerId) {
-              console.error("[Vobiz Greeting] ownerId missing; will retry next media frame");
-              return;
+              console.error("[Vobiz Greeting] ownerId missing — will not retry");
+              ttsFailed = true;
+            } else {
+              const greetingText = "Hello, this is VoxLeads AI calling. May I speak with you for a moment?";
+              const audio = await fetchTtsAudio(greetingText, resolvedOwnerId);
+              console.log("[Vobiz Greeting] tts result=", audio ? audio.length : "NULL");
+              if (!audio) {
+                console.error("[Vobiz Greeting] TTS failed — will not retry this call");
+                ttsFailed = true;
+              } else {
+                greetingSent = true;
+                isSpeaking = true;
+                await sendVobizAudio(ws, audio);
+                isSpeaking = false;
+                console.log("[Vobiz Greeting] sent");
+              }
             }
-            const greetingText = "Hello, this is VoxLeads AI calling. May I speak with you for a moment?";
-            const audio = await fetchTtsAudio(greetingText, resolvedOwnerId);
-            console.log("[Vobiz Greeting] tts result=", audio ? audio.length : "NULL");
-            if (!audio) {
-              console.error("[Vobiz Greeting] TTS failed; will retry next media frame");
-              return;
-            }
-            greetingSent = true;
-            await sendVobizAudio(ws, audio);
-            console.log("[Vobiz Greeting] sent");
           }
           console.log(
             `[Vobiz WS] event="${eventType}" b64Len=${b64.length} ` +
