@@ -142,6 +142,8 @@ Rules:
 - Speak naturally like a sales assistant.
 - Do not use markdown.
 - If unsure, offer a human callback.
+- NEVER say "I missed that" or ask the caller to repeat if their speech is non-empty.
+- If the caller is checking whether you can hear them (e.g. "Can you hear?", "Hello?", "Are you there?"), confirm clearly and transition to your pitch.
 
 Conversation so far:
 ${callData.transcript || 'No previous history.'}
@@ -160,11 +162,17 @@ Reply naturally.`;
     });
 
     const data = await response.json();
-    const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "I'm sorry, I missed that. Could you please repeat?";
-    return reply.trim();
+    // Patch 3: Only fall back to canned reply when transcript was genuinely empty.
+    // Since we already gate on non-empty transcript before calling this function,
+    // a missing Gemini response should never produce "I missed that".
+    const rawReply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const reply = rawReply.trim() ||
+      "Yes, I can hear you. Thanks for confirming. May I quickly share the details?";
+    return reply;
   } catch (error) {
     console.error('[AI Response] Gemini error:', error);
-    return "I'm sorry, I'm having trouble processing that. Can you please repeat?";
+    // Patch 3: natural fallback — never claim we "missed" non-empty speech
+    return "Yes, I can hear you clearly. Let me quickly share why I called.";
   }
 }
 
@@ -925,6 +933,8 @@ async function startServer() {
     let greetingAttempted = false;
     let isSpeaking = false;
     let ttsFailed = false;
+    let callActive = true;          // set to false on ws.close — guards replay after hangup
+    let silenceTimer: ReturnType<typeof setTimeout> | null = null;  // Patch 2: silence-based VAD timer
 
     const transcribeBuffer = async (audioBuffer: Buffer) => {
       try {
@@ -970,6 +980,12 @@ async function startServer() {
           } catch (e) {
             console.error(`[Vobiz WS] Failed to fetch call context:`, e);
           }
+        }
+
+        // Patch 1: abort if call already closed
+        if (!callActive || ws.readyState !== 1) {
+          console.log("[Vobiz Reply] call already closed, skipping reply playback");
+          return;
         }
 
         // Skip AI reply if currently speaking or TTS has already failed this call
@@ -1180,10 +1196,28 @@ async function startServer() {
       mediaBuffers.push(decoded);
       console.log("[DEBUG] bufferCount=", mediaBuffers.length);
 
+      // Patch 2: Silence-based VAD — reset 1200 ms timer on every inbound frame.
+      // When the timer fires (user stopped speaking), flush the buffer and transcribe
+      // immediately while the call is still open — no need to wait for hangup.
+      if (greetingSent && !isSpeaking) {
+        if (silenceTimer) clearTimeout(silenceTimer);
+        silenceTimer = setTimeout(() => {
+          silenceTimer = null;
+          if (mediaBuffers.length > 0 && callActive) {
+            const combined = Buffer.concat(mediaBuffers);
+            mediaBuffers = [];
+            console.log("[Vobiz VAD] Silence detected — sending buffer to Deepgram bytes=", combined.length);
+            transcribeBuffer(combined);
+          }
+        }, 1200);
+      }
+
+      // Legacy batch trigger kept as safety net for very long utterances
       if (mediaBuffers.length >= 75) {
+        if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
         const combined = Buffer.concat(mediaBuffers);
         mediaBuffers = [];
-        console.log("[DEBUG] Sending buffer to Deepgram bytes=", combined.length);
+        console.log("[DEBUG] Batch limit hit — sending buffer to Deepgram bytes=", combined.length);
         transcribeBuffer(combined);
         // Connection remains open — buffering continues after transcription
       }
@@ -1195,14 +1229,13 @@ async function startServer() {
 
     ws.on("close", (code, reason) => {
       console.log(`[WS CLOSE] callId=${callId} code=${code} reason=${reason?.toString() || "none"}`);
+      callActive = false;  // Patch 1: mark call as dead — transcribeBuffer will bail early
 
-      // Flush any remaining buffered audio on disconnect
-      if (mediaBuffers.length > 0) {
-        const combined = Buffer.concat(mediaBuffers);
-        mediaBuffers = [];
-        console.log("[DEBUG] Sending buffer to Deepgram bytes=", combined.length);
-        transcribeBuffer(combined);
-      }
+      // Clear any pending silence timer
+      if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+
+      // Do NOT flush remaining audio after close — WS is gone, reply would abort anyway
+      mediaBuffers = [];
     });
   });
 
