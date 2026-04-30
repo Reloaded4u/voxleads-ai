@@ -264,9 +264,10 @@ async function fetchTtsAudio(message: string, ownerId: string): Promise<Buffer |
     console.log(`[Vobiz TTS] ownerId=${ownerId} provider=${provider}`);
 
     if (provider === "elevenlabs") {
-      const apiKey = integrations.elevenLabsApiKey || process.env.ELEVENLABS_API_KEY;
+      const apiKey = String(integrations.elevenLabsApiKey || process.env.ELEVENLABS_API_KEY || "").trim();
       const voiceId = integrations.elevenLabsVoiceId || "21m00Tcm4TlvDq8ikWAM";
-      console.log(`[Vobiz TTS] elevenlabs key found=${!!apiKey} voiceId=${voiceId}`);
+      const keySource = integrations.elevenLabsApiKey ? "user" : process.env.ELEVENLABS_API_KEY ? "env" : "missing";
+      console.log(`[Vobiz TTS] ElevenLabs keySource=${keySource} keyLen=${apiKey.length} keyPrefix=${apiKey.slice(0, 6)} voiceId=${voiceId}`);
       if (!apiKey) throw new Error("ElevenLabs API Key missing");
 
       // Request ulaw_8000 directly — ElevenLabs natively supports this output format
@@ -279,7 +280,11 @@ async function fetchTtsAudio(message: string, ownerId: string): Promise<Buffer |
           voice_settings: { stability: 0.5, similarity_boost: 0.75 }
         })
       });
-      if (!res.ok) throw new Error(`ElevenLabs TTS error: ${res.status}`);
+      if (!res.ok) {
+        const errText = await res.text();
+        console.error(`[Vobiz TTS] ElevenLabs failed status=${res.status} body=${errText}`);
+        throw new Error(`ElevenLabs TTS error: ${res.status}`);
+      }
       // Response is already 8kHz mulaw — send directly
       const buf = Buffer.from(await res.arrayBuffer());
       console.log(`[Vobiz TTS] returned bytes=${buf.length}`);
