@@ -1117,9 +1117,8 @@ async function startServer() {
 
           decoded = Buffer.from(b64, "base64");
           console.log("[PATCH CONFIRMED 2026-04-30] active vobiz media log reached");
-          if (!(globalThis as any).__vobizTestAudioSent) {
-            (globalThis as any).__vobizTestAudioSent = true;
-            console.log("[VOBIZ TEST AUDIO] sending one 20ms mulaw silence frame from active media block");
+          console.log("[VOBIZ TEST AUDIO] attempting send");
+          try {
             const testFrame = Buffer.alloc(160, 0xff);
             ws.send(JSON.stringify({
               event: "playAudio",
@@ -1129,7 +1128,9 @@ async function startServer() {
                 payload: testFrame.toString("base64")
               }
             }));
-            console.log("[VOBIZ TEST AUDIO] sent one frame from active media block");
+            console.log("[VOBIZ TEST AUDIO] sent successfully");
+          } catch (err) {
+            console.error("[VOBIZ TEST AUDIO] send failed", err);
           }
           console.log(
             `[Vobiz WS] event="${eventType}" b64Len=${b64.length} ` +
