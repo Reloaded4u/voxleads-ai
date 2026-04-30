@@ -138,19 +138,18 @@ Main Pitch: ${kb?.guidance?.mainPitch || 'How can I help you?'}
 Objection Handling: ${kb?.guidance?.objectionHandling || 'Address concerns professionally.'}
 
 Rules:
-- Keep response under 2 short sentences.
-- Speak naturally like a sales assistant.
-- Do not use markdown.
+- Reply in exactly 1 short, natural sentence. Never more.
+- Do not use markdown or filler phrases.
+- Do not say "I missed that" or ask the caller to repeat when their speech is non-empty.
+- If the caller is checking whether you can hear them, confirm briefly and move to your pitch in one sentence (e.g. "Yes I can hear you — [pitch]").
 - If unsure, offer a human callback.
-- NEVER say "I missed that" or ask the caller to repeat if their speech is non-empty.
-- If the caller is checking whether you can hear them (e.g. "Can you hear?", "Hello?", "Are you there?"), confirm clearly and transition to your pitch.
 
 Conversation so far:
 ${callData.transcript || 'No previous history.'}
 
 Caller said: "${userSpeech}"
 
-Reply naturally.`;
+Reply in 1 sentence.`;
 
   try {
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
@@ -167,12 +166,12 @@ Reply naturally.`;
     // a missing Gemini response should never produce "I missed that".
     const rawReply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
     const reply = rawReply.trim() ||
-      "Yes, I can hear you. Thanks for confirming. May I quickly share the details?";
+      "Yes I can hear you — may I quickly share why I'm calling?";
     return reply;
   } catch (error) {
     console.error('[AI Response] Gemini error:', error);
-    // Patch 3: natural fallback — never claim we "missed" non-empty speech
-    return "Yes, I can hear you clearly. Let me quickly share why I called.";
+    // natural fallback — never claim we "missed" non-empty speech
+    return "Yes I can hear you — let me quickly share why I called.";
   }
 }
 
@@ -933,8 +932,11 @@ async function startServer() {
     let greetingAttempted = false;
     let isSpeaking = false;
     let ttsFailed = false;
-    let callActive = true;          // set to false on ws.close — guards replay after hangup
-    let silenceTimer: ReturnType<typeof setTimeout> | null = null;  // Patch 2: silence-based VAD timer
+    let callActive = true;           // set to false on ws.close — guards replay after hangup
+    let silenceTimer: ReturnType<typeof setTimeout> | null = null;  // silence-based VAD timer
+    let isProcessingTurn = false;    // true from Gemini call until audio finishes + 500 ms cooldown
+    let lastTranscript = "";         // normalised text of last processed utterance
+    let lastTranscriptAt = 0;        // epoch ms when lastTranscript was processed
 
     const transcribeBuffer = async (audioBuffer: Buffer) => {
       try {
@@ -982,47 +984,73 @@ async function startServer() {
           }
         }
 
-        // Patch 1: abort if call already closed
+        // ── Turn guards ────────────────────────────────────────────────────────
+
+        // Guard: abort if call already closed
         if (!callActive || ws.readyState !== 1) {
           console.log("[Vobiz Reply] call already closed, skipping reply playback");
           return;
         }
 
-        // Skip AI reply if currently speaking or TTS has already failed this call
-        if (isSpeaking) {
-          console.log(`[Vobiz WS] Skipping Gemini reply — isSpeaking=true`);
+        // Guard: one turn at a time — block while AI is generating or playing
+        if (isProcessingTurn) {
+          console.log("[Vobiz Turn] already processing a turn — skipping");
           return;
         }
+
         if (ttsFailed) {
           console.log(`[Vobiz WS] Skipping TTS — ttsFailed=true for this call`);
           return;
         }
 
-        // Generate AI reply via Gemini
-        const aiReply = await generateAiResponse(transcript, callData, kb);
-        console.log(`[Vobiz WS] Gemini reply: ${aiReply}`);
-
-        if (!ownerId) {
-          console.log(`[Vobiz WS] No ownerId — skipping TTS playback`);
+        // Guard: deduplicate — same phrase within 10 s gets one reply only
+        const normalized = transcript.trim().toLowerCase();
+        if (normalized === lastTranscript && Date.now() - lastTranscriptAt < 10000) {
+          console.log(`[Vobiz Turn] duplicate transcript skipped: "${normalized}"`);
           return;
         }
 
-        // Fetch TTS audio from user's configured provider (returned as 8kHz mulaw directly)
+        // Acquire turn lock
+        isProcessingTurn = true;
         isSpeaking = true;
-        const mulawBuffer = await fetchTtsAudio(aiReply, ownerId);
-        if (!mulawBuffer) {
-          console.log(`[Vobiz WS] No TTS audio returned — skipping playback`);
-          isSpeaking = false;
-          return;
-        }
+        lastTranscript = normalized;
+        lastTranscriptAt = Date.now();
 
-        // Send mulaw audio to Vobiz
         try {
-          await sendVobizAudio(ws, mulawBuffer);
-        } catch (convertErr) {
-          console.error(`[Vobiz Audio Send error]`, convertErr);
+          // Generate AI reply via Gemini
+          const aiReply = await generateAiResponse(transcript, callData, kb);
+          console.log(`[Vobiz WS] Gemini reply: ${aiReply}`);
+
+          if (!ownerId) {
+            console.log(`[Vobiz WS] No ownerId — skipping TTS playback`);
+            return;
+          }
+
+          // Fetch TTS audio from user's configured provider (returned as 8kHz mulaw directly)
+          const mulawBuffer = await fetchTtsAudio(aiReply, ownerId);
+          if (!mulawBuffer) {
+            console.log(`[Vobiz WS] No TTS audio returned — skipping playback`);
+            return;
+          }
+
+          // Send mulaw audio to Vobiz
+          try {
+            await sendVobizAudio(ws, mulawBuffer);
+          } catch (convertErr) {
+            console.error(`[Vobiz Audio Send error]`, convertErr);
+          }
+
+          // Post-playback: discard any audio captured during AI speech, then wait
+          // 500 ms before marking the turn complete so the silence timer cannot
+          // fire mid-reset and re-trigger the same utterance.
+          mediaBuffers = [];
+          await new Promise<void>((r) => setTimeout(r, 500));
+          console.log("[Vobiz STT] listening for next user turn");
+
         } finally {
+          // Always release the turn lock, even on error
           isSpeaking = false;
+          isProcessingTurn = false;
         }
 
       } catch (err) {
@@ -1187,23 +1215,24 @@ async function startServer() {
       vobizFrameCount++;
 
       // ── Step 3: Accumulate μ-law audio for STT ───────────────────────────────
-      // Skip inbound frames while AI is playing back audio
-      if (isSpeaking) {
-        console.log("[Vobiz STT] skipping inbound frame while AI speaking");
+      // Skip inbound frames while AI is playing back audio or still processing
+      if (isSpeaking || isProcessingTurn) {
+        console.log("[Vobiz STT] skipping inbound frame while AI speaking/processing");
         return;
       }
 
       mediaBuffers.push(decoded);
       console.log("[DEBUG] bufferCount=", mediaBuffers.length);
 
-      // Patch 2: Silence-based VAD — reset 1200 ms timer on every inbound frame.
+      // Silence-based VAD — reset 1200 ms timer on every inbound frame.
       // When the timer fires (user stopped speaking), flush the buffer and transcribe
       // immediately while the call is still open — no need to wait for hangup.
-      if (greetingSent && !isSpeaking) {
+      // Do not arm timer while a turn is being processed.
+      if (greetingSent && !isSpeaking && !isProcessingTurn) {
         if (silenceTimer) clearTimeout(silenceTimer);
         silenceTimer = setTimeout(() => {
           silenceTimer = null;
-          if (mediaBuffers.length > 0 && callActive) {
+          if (mediaBuffers.length > 0 && callActive && !isProcessingTurn) {
             const combined = Buffer.concat(mediaBuffers);
             mediaBuffers = [];
             console.log("[Vobiz VAD] Silence detected — sending buffer to Deepgram bytes=", combined.length);
