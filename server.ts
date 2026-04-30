@@ -921,6 +921,7 @@ async function startServer() {
 
     // Per-call audio buffering state — persists for full call duration
     let mediaBuffers: Buffer[] = [];
+    let testAudioSent = false;
 
     const transcribeBuffer = async (audioBuffer: Buffer) => {
       try {
@@ -1117,23 +1118,27 @@ async function startServer() {
 
           decoded = Buffer.from(b64, "base64");
           console.log("[PATCH CONFIRMED 2026-04-30] active vobiz media log reached");
-          console.log("[VOBIZ TEST AUDIO] attempting send");
-          try {
-            const testFrame = Buffer.alloc(160);
-            for (let i = 0; i < 160; i++) {
-              testFrame[i] = i % 2 === 0 ? 0x7f : 0xff;
-            }
-            ws.send(JSON.stringify({
-              event: "playAudio",
-              media: {
-                contentType: "audio/x-mulaw",
-                sampleRate: 8000,
-                payload: testFrame.toString("base64")
+          if (!testAudioSent) {
+            testAudioSent = true;
+            console.log("[VOBIZ TEST TONE] sending 2 seconds");
+            const totalFrames = 100; // 2 sec / 20ms
+            for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
+              const frame = Buffer.alloc(160);
+              for (let i = 0; i < 160; i++) {
+                frame[i] = i % 16 < 8 ? 0x10 : 0x90; // louder μ-law square tone
               }
-            }));
-            console.log("[VOBIZ TEST AUDIO] sent successfully");
-          } catch (err) {
-            console.error("[VOBIZ TEST AUDIO] send failed", err);
+              ws.send(JSON.stringify({
+                event: "playAudio",
+                media: {
+                  contentType: "audio/x-mulaw",
+                  sampleRate: 8000,
+                  payload: frame.toString("base64")
+                }
+              }));
+              console.log("[VOBIZ TEST TONE] frame sent", frameIndex);
+              await new Promise(r => setTimeout(r, 20));
+            }
+            console.log("[VOBIZ TEST TONE] done");
           }
           console.log(
             `[Vobiz WS] event="${eventType}" b64Len=${b64.length} ` +
