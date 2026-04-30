@@ -911,7 +911,7 @@ async function startServer() {
 
   // Vobiz WebSocket connection handler
   wss.on("connection", (ws, request) => {
-    console.log("[Vobiz Greeting DEBUG] connection handler reached");
+    console.log("[Vobiz Greeting DEBUG] active handler reached");
 
     const urlParams = new URLSearchParams(request.url?.split("?")[1] || "");
     const callId = urlParams.get("callId");
@@ -2323,4 +2323,5 @@ server.listen(PORT, "0.0.0.0", () => {
 });
 }
 
+console.log("[VOBIZ PATCH VERSION] greeting-debug-v2 loaded");
 startServer();
