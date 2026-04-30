@@ -258,11 +258,15 @@ async function fetchTtsAudio(message: string, ownerId: string): Promise<Buffer |
   try {
     const userDoc = await db.collection("users").doc(ownerId).get();
     const integrations = userDoc.data()?.integrations || {};
-    const provider: string = integrations.ttsProvider || "polly";
+    // Default changed from "polly" to "elevenlabs" — Polly is not supported for Vobiz direct stream
+    const provider: string = integrations.ttsProvider || "elevenlabs";
+
+    console.log(`[Vobiz TTS] ownerId=${ownerId} provider=${provider}`);
 
     if (provider === "elevenlabs") {
       const apiKey = integrations.elevenLabsApiKey || process.env.ELEVENLABS_API_KEY;
       const voiceId = integrations.elevenLabsVoiceId || "21m00Tcm4TlvDq8ikWAM";
+      console.log(`[Vobiz TTS] elevenlabs key found=${!!apiKey} voiceId=${voiceId}`);
       if (!apiKey) throw new Error("ElevenLabs API Key missing");
 
       // Request ulaw_8000 directly — ElevenLabs natively supports this output format
@@ -277,13 +281,16 @@ async function fetchTtsAudio(message: string, ownerId: string): Promise<Buffer |
       });
       if (!res.ok) throw new Error(`ElevenLabs TTS error: ${res.status}`);
       // Response is already 8kHz mulaw — send directly
-      return Buffer.from(await res.arrayBuffer());
+      const buf = Buffer.from(await res.arrayBuffer());
+      console.log(`[Vobiz TTS] returned bytes=${buf.length}`);
+      return buf;
     }
 
     if (provider === "azure") {
       const key = integrations.azureApiKey;
       const region = integrations.azureRegion;
       const voice = integrations.azureVoiceName || "en-US-JennyNeural";
+      console.log(`[Vobiz TTS] azure key found=${!!key} region=${region} voice=${voice}`);
       if (!key || !region) throw new Error("Azure credentials missing");
 
       const ssml = `<speak version='1.0' xml:lang='en-US'><voice xml:lang='en-US' name='${voice}'>${escapeXml(message)}</voice></speak>`;
@@ -300,11 +307,18 @@ async function fetchTtsAudio(message: string, ownerId: string): Promise<Buffer |
       });
       if (!res.ok) throw new Error(`Azure TTS error: ${res.status}`);
       // Response is already 8kHz mulaw — send directly
-      return Buffer.from(await res.arrayBuffer());
+      const buf = Buffer.from(await res.arrayBuffer());
+      console.log(`[Vobiz TTS] returned bytes=${buf.length}`);
+      return buf;
     }
 
-    // Polly / custom / other — not directly fetchable here, return null and let caller fallback
-    console.log(`[Vobiz TTS] Provider '${provider}' not directly supported for WS stream — skipping playback`);
+    if (provider === "polly") {
+      console.error(`[Vobiz TTS] Polly not supported for Vobiz direct stream. Set ttsProvider to elevenlabs or azure in user integrations.`);
+      return null;
+    }
+
+    // Unknown provider
+    console.error(`[Vobiz TTS] Unknown provider='${provider}' — not supported for Vobiz direct stream. Set ttsProvider to elevenlabs or azure.`);
     return null;
 
   } catch (err) {
@@ -976,16 +990,23 @@ async function startServer() {
       // No ws.close() or terminate() — connection stays alive for next chunk
     };
 
+    console.log(`[Vobiz Greeting Timer Scheduled] callId=${callId} ownerId=${ownerId}`);
+
     // INSERT — AI greeting sent 800 ms after WS opens:
     // This fires independently of STT so outbound audio can be verified
     // even before the lead speaks a single word.
     setTimeout(async () => {
       try {
+        console.log(`[Vobiz Greeting Timer Fired] callId=${callId} ownerId=${ownerId} readyState=${ws?.readyState}`);
+
         // Guard: socket may have closed during the delay
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (!ws || ws.readyState !== 1) {
+          console.warn(`[Vobiz Greeting] WS not open — readyState=${ws?.readyState}, aborting`);
+          return;
+        }
 
         if (!ownerId) {
-          console.warn(`[Vobiz Greeting] No ownerId — skipping greeting`);
+          console.error(`[Vobiz Greeting] CRITICAL — ownerId is null/empty. Cannot call fetchTtsAudio. Check WS URL params.`);
           return;
         }
 
@@ -1008,7 +1029,7 @@ async function startServer() {
         // Use the existing fetchTtsAudio() — ElevenLabs or Azure, per user config
         const greetingMulaw = await fetchTtsAudio(greetingText, ownerId);
         if (!greetingMulaw) {
-          console.warn(`[Vobiz Greeting] fetchTtsAudio returned null — check TTS provider config`);
+          console.error(`[Vobiz Greeting] No TTS audio returned, cannot send greeting. Check provider config for ownerId=${ownerId}`);
           return;
         }
 
