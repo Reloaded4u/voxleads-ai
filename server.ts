@@ -911,9 +911,11 @@ async function startServer() {
 
   // Vobiz WebSocket connection handler
   wss.on("connection", (ws, request) => {
+    console.log("[Vobiz Greeting DEBUG] connection handler reached");
+
     const urlParams = new URLSearchParams(request.url?.split("?")[1] || "");
     const callId = urlParams.get("callId");
-    const ownerId = urlParams.get("ownerId");
+    let ownerId = urlParams.get("ownerId");
 
     console.log(`[WS OPEN] callId=${callId} ownerId=${ownerId}`);
 
@@ -995,24 +997,41 @@ async function startServer() {
       // No ws.close() or terminate() — connection stays alive for next chunk
     };
 
-    console.log(`[Vobiz Greeting Timer Scheduled] callId=${callId} ownerId=${ownerId}`);
+    console.log("[Vobiz Greeting DEBUG] scheduling greeting timer", { callId, ownerId });
 
-    // INSERT — AI greeting sent 800 ms after WS opens:
-    // This fires independently of STT so outbound audio can be verified
-    // even before the lead speaks a single word.
+    // AI greeting sent 800 ms after WS opens
     setTimeout(async () => {
       try {
-        console.log(`[Vobiz Greeting Timer Fired] callId=${callId} ownerId=${ownerId} readyState=${ws?.readyState}`);
+        console.log("[Vobiz Greeting DEBUG] timer fired", { callId, ownerId, readyState: ws.readyState });
 
         // Guard: socket may have closed during the delay
         if (!ws || ws.readyState !== 1) {
-          console.warn(`[Vobiz Greeting] WS not open — readyState=${ws?.readyState}, aborting`);
+          console.warn(`[Vobiz Greeting DEBUG] skipping — WS not open, readyState=${ws?.readyState}`);
           return;
         }
 
+        // Resolve ownerId from Firestore if missing from URL params
         if (!ownerId) {
-          console.error(`[Vobiz Greeting] CRITICAL — ownerId is null/empty. Cannot call fetchTtsAudio. Check WS URL params.`);
-          return;
+          console.warn(`[Vobiz Greeting DEBUG] ownerId missing from URL params — attempting Firestore lookup via callId=${callId}`);
+          if (callId) {
+            try {
+              const callDoc = await db.collection("calls").doc(callId).get();
+              const resolved = callDoc.data()?.ownerId || callDoc.data()?.userId || null;
+              if (resolved) {
+                ownerId = resolved;
+                console.log("[Vobiz Greeting DEBUG] resolved ownerId from call doc", ownerId);
+              } else {
+                console.error(`[Vobiz Greeting DEBUG] skipping — ownerId not found in call doc either. callId=${callId}`);
+                return;
+              }
+            } catch (e) {
+              console.error(`[Vobiz Greeting DEBUG] skipping — Firestore lookup failed:`, e);
+              return;
+            }
+          } else {
+            console.error(`[Vobiz Greeting DEBUG] skipping — both ownerId and callId are null. Cannot resolve owner.`);
+            return;
+          }
         }
 
         // Pull greeting text from KB if available, otherwise use a safe default
@@ -1025,16 +1044,15 @@ async function startServer() {
             const kb = callData.knowledgeBaseSnapshot || {};
             greetingText = kb?.guidance?.greeting || greetingText;
           } catch (e) {
-            console.warn(`[Vobiz Greeting] Could not fetch call context:`, e);
+            console.warn(`[Vobiz Greeting DEBUG] Could not fetch KB greeting text — using default. error=`, e);
           }
         }
 
-        console.log(`[Vobiz Greeting] Generating TTS for callId=${callId}: "${greetingText}"`);
+        console.log(`[Vobiz Greeting] Generating TTS for callId=${callId} ownerId=${ownerId}: "${greetingText}"`);
 
-        // Use the existing fetchTtsAudio() — ElevenLabs or Azure, per user config
         const greetingMulaw = await fetchTtsAudio(greetingText, ownerId);
         if (!greetingMulaw) {
-          console.error(`[Vobiz Greeting] No TTS audio returned, cannot send greeting. Check provider config for ownerId=${ownerId}`);
+          console.error(`[Vobiz Greeting DEBUG] skipping — fetchTtsAudio returned null for ownerId=${ownerId}. Check TTS provider config.`);
           return;
         }
 
@@ -1043,9 +1061,9 @@ async function startServer() {
         console.log(`[Vobiz Greeting] Done for callId=${callId}`);
 
       } catch (greetErr) {
-        console.error(`[Vobiz Greeting] Error for callId=${callId}:`, greetErr);
+        console.error(`[Vobiz Greeting DEBUG] uncaught error in timer:`, greetErr);
       }
-    }, 800); // 800 ms head-start — lets Vobiz fully stabilise the stream before first audio
+    }, 800); // 800 ms — lets Vobiz stabilise the stream before first audio
 
     // ADD: frame counter for debug logging — persists across frames for the same call
     let vobizFrameCount = 0;
