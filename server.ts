@@ -946,6 +946,15 @@ async function startServer() {
         .replace(/[^\p{L}\p{N}\s]/gu, "")
         .replace(/\s+/g, " ");
 
+    function hasSpeech(audioBuffer: Buffer) {
+      let sum = 0;
+      for (let i = 0; i < audioBuffer.length; i++) {
+        sum += Math.abs(audioBuffer[i] - 128);
+      }
+      const avg = sum / audioBuffer.length;
+      return avg > 5;
+    }
+
     const resemblesLastAiReply = (transcript: string) => {
       const normalizedTranscript = normalizeTurnText(transcript);
       const normalizedReply = normalizeTurnText(lastAiReply);
@@ -1048,6 +1057,12 @@ async function startServer() {
     const processListeningAudio = async (audioBuffer: Buffer) => {
       if (state !== "LISTENING" || isEnded()) return;
 
+      if (!hasSpeech(audioBuffer)) {
+        console.log("[Vobiz VAD] silence detected, skipping STT");
+        return;
+      }
+
+      console.log("[Vobiz VAD] speech detected -> processing");
       state = "PROCESSING";
       console.log("[Vobiz State] PROCESSING");
 
