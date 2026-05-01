@@ -932,6 +932,7 @@ async function startServer() {
     let mediaBuffers: Buffer[] = [];
     let lastTranscript = "";
     let lastAiReply = "";
+    let turnInProgress = false;
     const STT_WINDOW_FRAMES = 50; // 1 second at 20ms/frame
 
     console.log("[Vobiz State] GREETING");
@@ -952,6 +953,14 @@ async function startServer() {
         sum += Math.abs(audioBuffer[i] - 128);
       }
       return sum / audioBuffer.length;
+    }
+
+    function isValidTranscript(text: string) {
+      if (!text) return false;
+      const t = text.trim().toLowerCase();
+      if (t.length < 4) return false;
+      if (t === lastTranscript) return false;
+      return true;
     }
 
     const resemblesLastAiReply = (transcript: string) => {
@@ -1056,47 +1065,57 @@ async function startServer() {
     const processListeningAudio = async (audioBuffer: Buffer) => {
       if (state !== "LISTENING" || isEnded()) return;
 
-      console.log("[Vobiz VAD] score=", getVadScore(audioBuffer));
-
-      const transcript = await transcribeBuffer(audioBuffer);
-      console.log("[Deepgram STT] transcript=", transcript);
-      if (state !== "LISTENING" || isEnded()) return;
-
-      if (!transcript || transcript.trim().length < 4) {
-        console.log("[Vobiz STT] ignored empty/short transcript");
-        state = "LISTENING";
+      if (turnInProgress) {
+        console.log("[TURN BLOCKED] already in progress");
         return;
       }
 
-      const normalizedTranscript = normalizeTurnText(transcript);
-      if (!normalizedTranscript || normalizedTranscript.length < 4) {
-        console.log("[Vobiz STT] ignored empty/short transcript");
-        state = "LISTENING";
-        return;
-      }
+      turnInProgress = true;
 
-      if (normalizedTranscript === lastTranscript) {
-        returnToListening();
-        return;
-      }
+      try {
+        console.log("[Vobiz VAD] score=", getVadScore(audioBuffer));
 
-      if (resemblesLastAiReply(transcript)) {
-        returnToListening();
-        return;
-      }
+        const transcript = await transcribeBuffer(audioBuffer);
+        console.log("[Deepgram STT] transcript=", transcript);
+        if (state !== "LISTENING" || isEnded()) return;
 
-      console.log("[TURN] transcript accepted =", transcript);
-      state = "PROCESSING";
-      console.log("[Vobiz State] PROCESSING");
+        if (!isValidTranscript(transcript)) {
+          console.log("[TURN BLOCKED] invalid transcript:", transcript);
+          state = "LISTENING";
+          return;
+        }
 
-      const { callData, kb } = await loadCallContext();
-      if (isEnded()) return;
+        const normalizedTranscript = normalizeTurnText(transcript);
+        if (!normalizedTranscript || normalizedTranscript.length < 4) {
+          console.log("[TURN BLOCKED] invalid transcript:", transcript);
+          state = "LISTENING";
+          return;
+        }
 
-      const aiReply = await generateAiResponse(transcript, callData, kb);
-      if (isEnded()) return;
+        if (resemblesLastAiReply(transcript)) {
+          returnToListening();
+          return;
+        }
 
-      lastTranscript = normalizedTranscript;
-      lastAiReply = aiReply.trim();
+        console.log("[TURN ACCEPTED]", transcript);
+        console.log("[SAFEGUARD] Gemini should not run without transcript");
+        state = "PROCESSING";
+        console.log("[Vobiz State] PROCESSING");
+
+        const { callData, kb } = await loadCallContext();
+        if (isEnded()) return;
+
+        if (!isValidTranscript(transcript)) {
+          console.log("[TURN BLOCKED] invalid transcript:", transcript);
+          state = "LISTENING";
+          return;
+        }
+
+        const aiReply = await generateAiResponse(transcript, callData, kb);
+        if (isEnded()) return;
+
+        lastTranscript = transcript.trim().toLowerCase();
+        lastAiReply = aiReply.trim();
 
       if (!ownerId) {
         console.error("[Vobiz Reply] ownerId missing");
@@ -1113,17 +1132,25 @@ async function startServer() {
         return;
       }
 
-      state = "SPEAKING";
-      console.log("[Vobiz State] SPEAKING reply");
-      await sendVobizAudio(ws, replyAudio);
-      mediaBuffers = [];
-      await enterCooldownThenListen();
+        state = "SPEAKING";
+        console.log("[Vobiz State] SPEAKING reply");
+        await sendVobizAudio(ws, replyAudio);
+        turnInProgress = false;
+        mediaBuffers = [];
+        await enterCooldownThenListen();
+      } catch (err) {
+        console.error("[Vobiz Turn] Error:", err);
+        if (!isEnded()) state = "LISTENING";
+      } finally {
+        if (turnInProgress) turnInProgress = false;
+      }
     };
 
     const endCall = () => {
       if (isEnded()) return;
       state = "ENDED";
       console.log("[Vobiz State] ENDED");
+      turnInProgress = false;
       mediaBuffers = [];
     };
 
@@ -1506,8 +1533,8 @@ async function startServer() {
     const { SpeechResult } = req.body;
     const response = new twilio.twiml.VoiceResponse();
 
-    if (!SpeechResult) {
-      response.say("I'm sorry, I didn't catch that. Could you please repeat?");
+    if (!SpeechResult || SpeechResult.trim().length < 4) {
+      console.log("[TURN BLOCKED] invalid transcript:", SpeechResult || "");
       response.gather({
         input: ['speech'],
         action: `${APP_URL}/api/voice/respond?callId=${callId}&ownerId=${ownerId}`,
@@ -1531,6 +1558,14 @@ async function startServer() {
       const currentTranscript = callData?.transcript || "";
       const newTranscript = currentTranscript + `\nLead: ${SpeechResult}`;
 
+      if (!SpeechResult || SpeechResult.trim().length < 4) {
+        console.log("[TURN BLOCKED] invalid transcript:", SpeechResult || "");
+        res.type('text/xml');
+        return res.send(response.toString());
+      }
+
+      console.log("[TURN ACCEPTED]", SpeechResult);
+      console.log("[SAFEGUARD] Gemini should not run without transcript");
       const aiReply = await generateAiResponse(
         SpeechResult,
         { ...callData, transcript: newTranscript },
@@ -1637,7 +1672,7 @@ async function startServer() {
 
     console.log(`[Vobiz Respond] callId=${callId} Speech="${userSpeech}"`);
 
-    let aiReply = "I'm sorry, I didn't catch that. Could you repeat please?";
+    let aiReply = "";
 
     try {
       const callRef = db.collection("calls").doc(callId as string);
@@ -1647,9 +1682,11 @@ async function startServer() {
         const callData = callDoc.data();
         const transcript = callData?.transcript || "";
 
-        if (userSpeech) {
+        if (userSpeech && userSpeech.trim().length >= 4) {
           const newTranscript = `${transcript}\nLead: ${userSpeech}`;
 
+          console.log("[TURN ACCEPTED]", userSpeech);
+          console.log("[SAFEGUARD] Gemini should not run without transcript");
           aiReply = await generateAiResponse(
             userSpeech,
             { ...callData, transcript: newTranscript },
@@ -1660,18 +1697,20 @@ async function startServer() {
             transcript: `${newTranscript}\nAI: ${aiReply}`,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
           });
+        } else {
+          console.log("[TURN BLOCKED] invalid transcript:", userSpeech || "");
         }
       }
     } catch (err) {
       console.error("[Vobiz Respond] Error:", err);
-      aiReply = "Sorry, something went wrong.";
+      aiReply = "";
     }
 
+    const speakXml = aiReply ? `    <Speak>${escapeXml(aiReply)}</Speak>\n` : "";
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather inputType="speech" action="${APP_URL}/api/voice/vobizxml/respond?callId=${callId}&amp;ownerId=${ownerId}">
-    <Speak>${escapeXml(aiReply)}</Speak>
-  </Gather>
+${speakXml}  </Gather>
 </Response>`;
 
     res.type("text/xml");
