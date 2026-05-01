@@ -933,6 +933,7 @@ async function startServer() {
     let silenceTimer: NodeJS.Timeout | null = null;
     let lastTranscript = "";
     let lastAiReply = "";
+    const MIN_AUDIO_BYTES = 160 * 10;
 
     console.log("[Vobiz State] GREETING");
 
@@ -1047,14 +1048,18 @@ async function startServer() {
     };
 
     const processListeningTurn = async () => {
+      console.log("[Vobiz Processing] called state=", state, "bufferCount=", mediaBuffers.length);
       if (state !== "LISTENING") return;
 
-      if (mediaBuffers.length < 25) {
+      const combined = Buffer.concat(mediaBuffers);
+      console.log("[Vobiz Processing] combinedBytes=", combined.length);
+
+      if (combined.length < MIN_AUDIO_BYTES) {
+        console.log("[Vobiz Processing] too short, returning to listening");
         mediaBuffers = [];
         return;
       }
 
-      const combined = Buffer.concat(mediaBuffers);
       mediaBuffers = [];
       state = "PROCESSING";
       console.log("[Vobiz State] PROCESSING");
@@ -1110,8 +1115,10 @@ async function startServer() {
     };
 
     const resetSilenceTimer = () => {
+      console.log("[Vobiz Listening] silence timer reset");
       if (silenceTimer) clearTimeout(silenceTimer);
       silenceTimer = setTimeout(() => {
+        console.log("[Vobiz Listening] silence timer fired bufferCount=", mediaBuffers.length);
         silenceTimer = null;
         void processListeningTurn();
       }, 1200);
@@ -1198,6 +1205,7 @@ async function startServer() {
         return;
       }
 
+      console.log("[Vobiz Listening] accepting frame bytes=", decoded.length, "bufferCountBefore=", mediaBuffers.length);
       mediaBuffers.push(decoded);
       resetSilenceTimer();
     });
