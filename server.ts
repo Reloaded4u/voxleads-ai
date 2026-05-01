@@ -926,251 +926,227 @@ async function startServer() {
 
     console.log(`[WS OPEN] callId=${callId} ownerId=${ownerId}`);
 
-    // Per-call audio buffering state — persists for full call duration
+    type CallState = "GREETING" | "SPEAKING" | "COOLDOWN" | "LISTENING" | "PROCESSING" | "ENDED";
+
+    let state: CallState = "GREETING";
     let mediaBuffers: Buffer[] = [];
-    let greetingSent = false;
-    let greetingAttempted = false;
-    let isSpeaking = false;
-    let ttsFailed = false;
-    let callActive = true;           // set to false on ws.close — guards replay after hangup
-    let silenceTimer: ReturnType<typeof setTimeout> | null = null;  // silence-based VAD timer
-    let isProcessingTurn = false;    // true from Gemini call until audio finishes + 500 ms cooldown
-    let lastTranscript = "";         // normalised text of last processed utterance
-    let lastTranscriptAt = 0;        // epoch ms when lastTranscript was processed
-    let outboundPlaybackActive = false; // true while any AI audio is streaming to Vobiz
-    let currentTurnId = 0;              // increments each playback — used for log tracing
-    let ignoreInboundUntil = 0;         // epoch ms — discard inbound frames until cooldown expires
+    let silenceTimer: NodeJS.Timeout | null = null;
+    let lastTranscript = "";
+    let lastAiReply = "";
 
-    // Echo/self-transcript blocking — tracks the last AI reply so Deepgram hearing
-    // the AI's own voice does not feed back into Gemini.
-    let lastAiReplyText = "";
-    let lastAiReplyAt = 0;
+    console.log("[Vobiz State] GREETING");
 
-    // ── Single outbound playback lock ──────────────────────────────────────────
-    // Ensures only one AI audio stream plays at a time (greeting or reply).
-    // Any call while playback is already active is silently dropped.
-    const playAiAudioOnce = async (audio: Buffer, label: string): Promise<void> => {
-      if (outboundPlaybackActive) {
-        console.log(`[Vobiz Playback] already active — skipping "${label}"`);
+    const isEnded = () => state === "ENDED";
+    const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+    const normalizeTurnText = (value: string) =>
+      value
+        .trim()
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}\s]/gu, "")
+        .replace(/\s+/g, " ");
+
+    const resemblesLastAiReply = (transcript: string) => {
+      const normalizedTranscript = normalizeTurnText(transcript);
+      const normalizedReply = normalizeTurnText(lastAiReply);
+      if (!normalizedTranscript || !normalizedReply) return false;
+      if (normalizedTranscript.includes(normalizedReply) || normalizedReply.includes(normalizedTranscript)) return true;
+
+      const transcriptWords = new Set(normalizedTranscript.split(" ").filter(Boolean));
+      const replyWords = normalizedReply.split(" ").filter(Boolean);
+      if (replyWords.length === 0) return false;
+
+      const overlapCount = replyWords.filter((word) => transcriptWords.has(word)).length;
+      return overlapCount / replyWords.length >= 0.6;
+    };
+
+    const enterCooldownThenListen = async () => {
+      if (isEnded()) return;
+      console.log("[Vobiz State] COOLDOWN");
+      state = "COOLDOWN";
+      mediaBuffers = [];
+      if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+      await wait(800);
+      if (isEnded()) return;
+      state = "LISTENING";
+      console.log("[Vobiz State] LISTENING");
+    };
+
+    const returnToListening = () => {
+      if (isEnded()) return;
+      state = "LISTENING";
+      console.log("[Vobiz State] LISTENING");
+    };
+
+    const loadCallContext = async () => {
+      let callData: any = {};
+      let kb: any = {};
+      if (!callId) return { callData, kb };
+
+      try {
+        const callDoc = await db.collection("calls").doc(callId).get();
+        callData = callDoc.data() || {};
+        kb = callData.knowledgeBaseSnapshot || {};
+      } catch (e) {
+        console.error(`[Vobiz WS] Failed to fetch call context:`, e);
+      }
+
+      return { callData, kb };
+    };
+
+    const handleGreeting = async () => {
+      if (state !== "GREETING") return;
+
+      state = "SPEAKING";
+      console.log("[Vobiz State] SPEAKING greeting");
+
+      if (!ownerId) {
+        console.error("[Vobiz Greeting] ownerId missing");
+        await enterCooldownThenListen();
         return;
       }
-      outboundPlaybackActive = true;
-      isSpeaking = true;
-      isProcessingTurn = true;
-      currentTurnId++;
-      const thisTurn = currentTurnId;
-      if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
-      mediaBuffers = [];
-      try {
-        console.log(`[Vobiz Playback] starting "${label}" turn=${thisTurn}`);
-        await sendVobizAudio(ws, audio);
-        console.log(`[Vobiz Playback] completed "${label}" turn=${thisTurn}`);
-      } finally {
-        mediaBuffers = [];
-        ignoreInboundUntil = Date.now() + 6000;
-        // Release lock after cooldown so inbound audio is not picked up while
-        // the line is still ringing with echo/tail from the AI utterance.
-        setTimeout(() => {
-          isSpeaking = false;
-          isProcessingTurn = false;
-          outboundPlaybackActive = false;
-          console.log(`[Vobiz STT] cooldown done — listening for next user turn (turn=${thisTurn})`);
-        }, 6000);
+
+      const greetingText = "Hello, this is VoxLeads AI calling. May I speak with you for a moment?";
+      const greetingAudio = await fetchTtsAudio(greetingText, ownerId);
+      if (isEnded()) return;
+
+      if (greetingAudio) {
+        await sendVobizAudio(ws, greetingAudio);
+      } else {
+        console.error("[Vobiz Greeting] TTS failed");
       }
+
+      mediaBuffers = [];
+      await enterCooldownThenListen();
     };
 
     const transcribeBuffer = async (audioBuffer: Buffer) => {
       try {
-        console.log("[DEBUG] Deepgram request started");
         const dgUrl = new URL("https://api.deepgram.com/v1/listen");
         dgUrl.searchParams.set("model",        "nova-2");
-        dgUrl.searchParams.set("encoding",     "mulaw");      // ← CRITICAL FIX
-        dgUrl.searchParams.set("sample_rate",  "8000");       // ← CRITICAL FIX
+        dgUrl.searchParams.set("encoding",     "mulaw");
+        dgUrl.searchParams.set("sample_rate",  "8000");
         dgUrl.searchParams.set("channels",     "1");
         dgUrl.searchParams.set("language",     "en-IN");
         dgUrl.searchParams.set("smart_format", "true");
-
-        console.log(`[Deepgram] Sending ${audioBuffer.length} bytes | URL: ${dgUrl.toString()}`);
 
         const response = await fetch(dgUrl.toString(), {
           method: "POST",
           headers: {
             Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`,
-            "Content-Type": "audio/mulaw",        // ← CRITICAL FIX
+            "Content-Type": "audio/mulaw",
           },
           body: audioBuffer,
         });
         const result = await response.json() as any;
-        console.log("[DEBUG] Deepgram raw result:", JSON.stringify(result).slice(0, 1000));
-        const transcript = result?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
-
-        // ── Echo / self-transcript blocking ────────────────────────────────────
-        // If Deepgram heard the AI's own TTS output, do not send it to Gemini.
-        const normalizedTranscript = transcript.trim().toLowerCase();
-
-        if (!normalizedTranscript) {
-          console.log(`[Deepgram STT] Empty transcript — skipping Gemini and TTS`);
-          return;
-        }
-
-        // Key-phrase exact-match guards (fast path for common AI phrases)
-        if (
-          (lastAiReplyText.includes("may i quickly share") && normalizedTranscript.includes("may i quickly share")) ||
-          normalizedTranscript.includes("yes i can hear you")
-        ) {
-          console.log(`[Vobiz Echo] skipped transcript because it matches last AI reply: "${normalizedTranscript}"`);
-          return;
-        }
-
-        // Heavy-overlap guard within 15 s of last AI reply
-        if (lastAiReplyText && Date.now() - lastAiReplyAt < 15000) {
-          // Compute word-level overlap ratio between transcript and AI reply
-          const transcriptWords = new Set(normalizedTranscript.split(/\s+/).filter(Boolean));
-          const replyWords    = lastAiReplyText.split(/\s+/).filter(Boolean);
-          const overlapCount  = replyWords.filter((w) => transcriptWords.has(w)).length;
-          const overlapRatio  = replyWords.length > 0 ? overlapCount / replyWords.length : 0;
-
-          if (overlapRatio >= 0.6) {
-            console.log(`[Vobiz Echo] skipped transcript because it matches last AI reply (overlap=${(overlapRatio * 100).toFixed(0)}%): "${normalizedTranscript}"`);
-            return;
-          }
-        }
-        // ── End echo blocking ──────────────────────────────────────────────────
-
-        // Fetch call context for Gemini
-        let callData: any = {};
-        let kb: any = {};
-        if (callId) {
-          try {
-            const callDoc = await db.collection("calls").doc(callId).get();
-            callData = callDoc.data() || {};
-            kb = callData.knowledgeBaseSnapshot || {};
-          } catch (e) {
-            console.error(`[Vobiz WS] Failed to fetch call context:`, e);
-          }
-        }
-
-        // ── Turn guards ────────────────────────────────────────────────────────
-
-        // Guard: abort if call already closed
-        if (!callActive || ws.readyState !== 1) {
-          console.log("[Vobiz Reply] call already closed, skipping reply playback");
-          return;
-        }
-
-        // Guard: one turn at a time — block while AI is generating, playing, or in cooldown
-        if (outboundPlaybackActive || isSpeaking || isProcessingTurn) {
-          console.log("[Vobiz Turn] playback/processing active — skipping new reply");
-          return;
-        }
-
-        if (ttsFailed) {
-          console.log(`[Vobiz WS] Skipping TTS — ttsFailed=true for this call`);
-          return;
-        }
-
-        // Guard: deduplicate — same phrase within 10 s gets one reply only
-        const normalized = transcript.trim().toLowerCase();
-        if (normalized === lastTranscript && Date.now() - lastTranscriptAt < 10000) {
-          console.log(`[Vobiz Turn] duplicate transcript skipped: "${normalized}"`);
-          return;
-        }
-
-        // Record transcript immediately and clear media buffer so no echo re-triggers STT
-        lastTranscript = normalized;
-        lastTranscriptAt = Date.now();
-        mediaBuffers = [];
-
-        try {
-          // Generate AI reply via Gemini
-          const aiReply = await generateAiResponse(transcript, callData, kb);
-          console.log(`[Vobiz WS] Gemini reply: ${aiReply}`);
-
-          // Record AI reply for echo/self-transcript blocking (before TTS plays)
-          lastAiReplyText = aiReply.trim().toLowerCase();
-          lastAiReplyAt = Date.now();
-
-          if (!ownerId) {
-            console.log(`[Vobiz WS] No ownerId — skipping TTS playback`);
-            return;
-          }
-
-          // Fetch TTS audio from user's configured provider (returned as 8kHz mulaw directly)
-          const mulawBuffer = await fetchTtsAudio(aiReply, ownerId);
-          if (!mulawBuffer) {
-            console.log(`[Vobiz WS] No TTS audio returned — skipping playback`);
-            return;
-          }
-
-          // Play through the single-playback lock — drops call if already playing
-          await playAiAudioOnce(mulawBuffer, "reply");
-
-        } catch (replyErr) {
-          console.error(`[Vobiz WS] Error generating or playing reply:`, replyErr);
-          // Ensure lock is released if playAiAudioOnce was never reached
-          isSpeaking = false;
-          isProcessingTurn = false;
-          outboundPlaybackActive = false;
-        }
-
+        return (result?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "").trim();
       } catch (err) {
         console.error(`[Deepgram STT] Error:`, err);
+        return "";
       }
-      // No ws.close() or terminate() — connection stays alive for next chunk
     };
 
-    // Frame counter for debug logging — persists across frames for the same call
-    let vobizFrameCount = 0;
+    const processListeningTurn = async () => {
+      if (state !== "LISTENING") return;
+
+      if (mediaBuffers.length < 25) {
+        mediaBuffers = [];
+        return;
+      }
+
+      const combined = Buffer.concat(mediaBuffers);
+      mediaBuffers = [];
+      state = "PROCESSING";
+      console.log("[Vobiz State] PROCESSING");
+
+      const transcript = await transcribeBuffer(combined);
+      if (isEnded()) return;
+
+      const normalizedTranscript = normalizeTurnText(transcript);
+      if (!normalizedTranscript) {
+        returnToListening();
+        return;
+      }
+
+      if (normalizedTranscript === lastTranscript) {
+        returnToListening();
+        return;
+      }
+
+      if (resemblesLastAiReply(transcript)) {
+        returnToListening();
+        return;
+      }
+
+      const { callData, kb } = await loadCallContext();
+      if (isEnded()) return;
+
+      const aiReply = await generateAiResponse(transcript, callData, kb);
+      if (isEnded()) return;
+
+      lastTranscript = normalizedTranscript;
+      lastAiReply = aiReply.trim();
+
+      if (!ownerId) {
+        console.error("[Vobiz Reply] ownerId missing");
+        returnToListening();
+        return;
+      }
+
+      const replyAudio = await fetchTtsAudio(aiReply, ownerId);
+      if (isEnded()) return;
+
+      if (!replyAudio) {
+        console.error("[Vobiz Reply] TTS failed");
+        returnToListening();
+        return;
+      }
+
+      state = "SPEAKING";
+      console.log("[Vobiz State] SPEAKING reply");
+      await sendVobizAudio(ws, replyAudio);
+      mediaBuffers = [];
+      await enterCooldownThenListen();
+    };
+
+    const resetSilenceTimer = () => {
+      if (silenceTimer) clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(() => {
+        silenceTimer = null;
+        void processListeningTurn();
+      }, 1200);
+    };
+
+    const endCall = () => {
+      if (isEnded()) return;
+      state = "ENDED";
+      console.log("[Vobiz State] ENDED");
+      if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+      mediaBuffers = [];
+    };
 
     ws.on("message", async (message: any) => {
-      console.log(`[WS MESSAGE] callId=${callId} bytes=${Buffer.isBuffer(message) ? message.length : String(message).length}`);
-
-      // ── Step 1: Robust Vobiz JSON / binary frame parsing ─────────────────────
-      // Vobiz always sends JSON text frames (not raw binary), structured as:
-      //   { event: "connected" | "start" | "media" | "dtmf" | "stop", ... }
-      // The audio lives in media.payload as a base64 string (μ-law 8kHz).
-
       let decoded: Buffer | null = null;
       let eventType = "(unknown)";
 
       try {
-        // Normalise to string regardless of whether WS delivered Buffer or string
         const raw = Buffer.isBuffer(message) ? message.toString("utf8") : String(message);
 
-        // ── DEBUG: log first 300 chars of every raw frame (first 5 frames only)
-        if (vobizFrameCount < 5) {
-          console.log(`[Vobiz raw frame #${vobizFrameCount}] ${raw.slice(0, 300)}`);
-        }
-
         if (raw.trimStart().startsWith("{")) {
-          // ── JSON frame (the expected Vobiz format) ──────────────────────────
           const json = JSON.parse(raw) as Record<string, any>;
           eventType = json.event ?? "(no event)";
 
-          // Silently skip non-audio control events
-          if (eventType === "connected") {
-            console.log(`[Vobiz WS] control event="${eventType}" (skipping audio) | protocol=${json.protocol || "unknown"}`);
-            return;
-          }
+          if (eventType === "connected") return;
 
           if (eventType === "start") {
-            console.log(`[Vobiz Start RAW] ${JSON.stringify(json)}`);
             const streamId = json.streamId || json.start?.streamId || json.start?.stream_id;
             const resolvedCallId = json.callId || json.start?.callId || json.start?.call_id;
-            console.log(`[Vobiz Start Parsed] callId=${resolvedCallId} streamId=${streamId}`);
-            console.log(`[Vobiz WS] control event="${eventType}" (skipping audio)`);
+            console.log(`[Vobiz Start] callId=${resolvedCallId} streamId=${streamId}`);
             return;
           }
 
           if (eventType === "stop") {
-            console.log(`[Vobiz WS] stop event received | streamId=${json.streamId || json.stream_id} reason=${json.reason || "unknown"}`);
-            // Flush remaining audio on stop
-            if (mediaBuffers.length > 0) {
-              const combined = Buffer.concat(mediaBuffers);
-              mediaBuffers = [];
-              console.log("[DEBUG] Sending buffer to Deepgram bytes=", combined.length);
-              transcribeBuffer(combined);
-            }
+            endCall();
             return;
           }
 
@@ -1179,25 +1155,13 @@ async function startServer() {
             return;
           }
 
-          if (eventType === "playedStream") {
-            console.log(`[Vobiz Stream] playedStream | streamSid=${json.streamSid || json.stream_sid || "unknown"}`);
-            return;
-          }
-
-          if (eventType === "clearedAudio") {
-            console.log(`[Vobiz Stream] clearedAudio acknowledged`);
-            return;
-          }
+          if (eventType === "playedStream" || eventType === "clearedAudio") return;
 
           if (eventType !== "media") {
             console.log(`[Vobiz Stream] Unknown event=${eventType}`);
             return;
           }
 
-          // Extract base64 audio — try all known Vobiz field shapes in order:
-          //   1. { event:"media", media:{ payload:"<b64>" } }   ← standard
-          //   2. { event:"media", payload:"<b64>" }             ← some firmware
-          //   3. { event:"audio", audio:"<b64>" }               ← legacy
           let b64: string | null = null;
           if (json.media?.payload && typeof json.media.payload === "string") {
             b64 = json.media.payload;
@@ -1208,49 +1172,16 @@ async function startServer() {
           }
 
           if (!b64) {
-            console.warn(
-              `[Vobiz WS] event="${eventType}" — no base64 audio field found. ` +
-              `keys=${Object.keys(json).join(",")}`
-            );
+            console.warn(`[Vobiz WS] event="${eventType}" has no base64 audio field`);
             return;
           }
 
           decoded = Buffer.from(b64, "base64");
-          if (!greetingSent && !greetingAttempted) {
-            greetingAttempted = true;
-            console.log("[Vobiz Greeting] entering block");
-            const resolvedOwnerId = ownerId;
-            console.log("[Vobiz Greeting] ownerId resolved=", resolvedOwnerId);
-            if (!resolvedOwnerId) {
-              console.error("[Vobiz Greeting] ownerId missing — will not retry");
-              ttsFailed = true;
-            } else {
-              const greetingText = "Hello, this is VoxLeads AI calling. May I speak with you for a moment?";
-              const audio = await fetchTtsAudio(greetingText, resolvedOwnerId);
-              console.log("[Vobiz Greeting] tts result=", audio ? audio.length : "NULL");
-              if (!audio) {
-                console.error("[Vobiz Greeting] TTS failed — will not retry this call");
-                ttsFailed = true;
-              } else {
-                greetingSent = true;
-                await playAiAudioOnce(audio, "greeting");
-                console.log("[Vobiz Greeting] sent");
-              }
-            }
-          }
-          console.log(
-            `[Vobiz WS] event="${eventType}" b64Len=${b64.length} ` +
-            `decodedBytes=${decoded.length} contentType=${json.media?.contentType} sampleRate=${json.media?.sampleRate}`
-          );
-
         } else {
-          // ── Raw binary fallback (rare, but handle gracefully) ──────────────
           decoded = Buffer.isBuffer(message)
             ? (message as Buffer)
             : Buffer.from(message as ArrayBuffer);
-          console.log(`[Vobiz WS] raw binary frame bytes=${decoded.length}`);
         }
-
       } catch (parseErr) {
         console.error(`[Vobiz WS] message parse error:`, parseErr);
         return;
@@ -1258,51 +1189,17 @@ async function startServer() {
 
       if (!decoded || decoded.length === 0) return;
 
-      // ── Step 2: Debug — log first 5 decoded frames ──────────────────────────
-      if (vobizFrameCount < 5) {
-        console.log(
-          `[Vobiz decoded frame #${vobizFrameCount}] ` +
-          `bytes=${decoded.length} ` +
-          `hex[0:20]=${decoded.slice(0, 20).toString("hex")}`
-        );
+      if (state === "GREETING") {
+        await handleGreeting();
+        return;
       }
-      vobizFrameCount++;
 
-      // ── Step 3: Accumulate μ-law audio for STT ───────────────────────────────
-      // Drop frames while AI is playing, processing, or within the post-playback cooldown.
-      // Also drop if the call is no longer active.
-      if (!callActive) return;
-      if (outboundPlaybackActive || isSpeaking || isProcessingTurn || Date.now() < ignoreInboundUntil) {
-        console.log("[Vobiz STT] skipping inbound frame during playback/cooldown");
+      if (state === "SPEAKING" || state === "PROCESSING" || state === "COOLDOWN" || isEnded()) {
         return;
       }
 
       mediaBuffers.push(decoded);
-      console.log("[DEBUG] bufferCount=", mediaBuffers.length);
-
-      // Silence-based VAD — arm timer only on accepted frames (not during playback/cooldown).
-      if (greetingSent) {
-        if (silenceTimer) clearTimeout(silenceTimer);
-        silenceTimer = setTimeout(() => {
-          silenceTimer = null;
-          if (mediaBuffers.length > 0 && callActive && !outboundPlaybackActive && !isProcessingTurn) {
-            const combined = Buffer.concat(mediaBuffers);
-            mediaBuffers = [];
-            console.log("[Vobiz VAD] Silence detected — sending buffer to Deepgram bytes=", combined.length);
-            transcribeBuffer(combined);
-          }
-        }, 1200);
-      }
-
-      // Legacy batch trigger kept as safety net for very long utterances
-      if (mediaBuffers.length >= 75) {
-        if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
-        const combined = Buffer.concat(mediaBuffers);
-        mediaBuffers = [];
-        console.log("[DEBUG] Batch limit hit — sending buffer to Deepgram bytes=", combined.length);
-        transcribeBuffer(combined);
-        // Connection remains open — buffering continues after transcription
-      }
+      resetSilenceTimer();
     });
 
     ws.on("error", (err) => {
@@ -1311,18 +1208,7 @@ async function startServer() {
 
     ws.on("close", (code, reason) => {
       console.log(`[WS CLOSE] callId=${callId} code=${code} reason=${reason?.toString() || "none"}`);
-      callActive = false;
-
-      // Release all playback/processing locks so no zombie timers fire after close
-      outboundPlaybackActive = false;
-      isSpeaking = false;
-      isProcessingTurn = false;
-
-      // Clear any pending silence timer
-      if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
-
-      // Do NOT flush remaining audio after close — WS is gone, reply would abort anyway
-      mediaBuffers = [];
+      endCall();
     });
   });
 
