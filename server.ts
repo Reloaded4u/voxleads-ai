@@ -946,13 +946,18 @@ async function startServer() {
         .replace(/[^\p{L}\p{N}\s]/gu, "")
         .replace(/\s+/g, " ");
 
-    function hasSpeech(audioBuffer: Buffer) {
+    function getVadScore(audioBuffer: Buffer) {
       let sum = 0;
       for (let i = 0; i < audioBuffer.length; i++) {
         sum += Math.abs(audioBuffer[i] - 128);
       }
-      const avg = sum / audioBuffer.length;
-      return avg > 5;
+      return sum / audioBuffer.length;
+    }
+
+    function hasSpeech(audioBuffer: Buffer) {
+      const score = getVadScore(audioBuffer);
+      console.log("[Vobiz VAD] score=", score);
+      return score > 18;
     }
 
     const resemblesLastAiReply = (transcript: string) => {
@@ -1067,11 +1072,23 @@ async function startServer() {
       console.log("[Vobiz State] PROCESSING");
 
       const transcript = await transcribeBuffer(audioBuffer);
+      console.log("[Deepgram STT] transcript=", transcript);
       if (isEnded()) return;
+
+      if (!transcript) {
+        state = "LISTENING";
+        return;
+      }
+
+      if (transcript.trim().length < 4) {
+        console.log("[Vobiz STT] transcript too short, ignoring");
+        state = "LISTENING";
+        return;
+      }
 
       const normalizedTranscript = normalizeTurnText(transcript);
       if (!normalizedTranscript) {
-        returnToListening();
+        state = "LISTENING";
         return;
       }
 
@@ -1088,6 +1105,7 @@ async function startServer() {
       const { callData, kb } = await loadCallContext();
       if (isEnded()) return;
 
+      console.log("[Vobiz Turn] accepted user transcript=", transcript);
       const aiReply = await generateAiResponse(transcript, callData, kb);
       if (isEnded()) return;
 
