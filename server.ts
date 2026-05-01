@@ -932,7 +932,7 @@ async function startServer() {
     let mediaBuffers: Buffer[] = [];
     let lastTranscript = "";
     let lastAiReply = "";
-    const STT_WINDOW_FRAMES = 100; // 2 seconds at 20ms/frame
+    const STT_WINDOW_FRAMES = 50; // 1 second at 20ms/frame
 
     console.log("[Vobiz State] GREETING");
 
@@ -952,12 +952,6 @@ async function startServer() {
         sum += Math.abs(audioBuffer[i] - 128);
       }
       return sum / audioBuffer.length;
-    }
-
-    function hasSpeech(audioBuffer: Buffer) {
-      const score = getVadScore(audioBuffer);
-      console.log("[Vobiz VAD] score=", score);
-      return score > 18;
     }
 
     const resemblesLastAiReply = (transcript: string) => {
@@ -1062,32 +1056,21 @@ async function startServer() {
     const processListeningAudio = async (audioBuffer: Buffer) => {
       if (state !== "LISTENING" || isEnded()) return;
 
-      if (!hasSpeech(audioBuffer)) {
-        console.log("[Vobiz VAD] silence detected, skipping STT");
-        return;
-      }
-
-      console.log("[Vobiz VAD] speech detected -> processing");
-      state = "PROCESSING";
-      console.log("[Vobiz State] PROCESSING");
+      console.log("[Vobiz VAD] score=", getVadScore(audioBuffer));
 
       const transcript = await transcribeBuffer(audioBuffer);
       console.log("[Deepgram STT] transcript=", transcript);
-      if (isEnded()) return;
+      if (state !== "LISTENING" || isEnded()) return;
 
-      if (!transcript) {
-        state = "LISTENING";
-        return;
-      }
-
-      if (transcript.trim().length < 4) {
-        console.log("[Vobiz STT] transcript too short, ignoring");
+      if (!transcript || transcript.trim().length < 4) {
+        console.log("[Vobiz STT] ignored empty/short transcript");
         state = "LISTENING";
         return;
       }
 
       const normalizedTranscript = normalizeTurnText(transcript);
-      if (!normalizedTranscript) {
+      if (!normalizedTranscript || normalizedTranscript.length < 4) {
+        console.log("[Vobiz STT] ignored empty/short transcript");
         state = "LISTENING";
         return;
       }
@@ -1102,10 +1085,13 @@ async function startServer() {
         return;
       }
 
+      console.log("[TURN] transcript accepted =", transcript);
+      state = "PROCESSING";
+      console.log("[Vobiz State] PROCESSING");
+
       const { callData, kb } = await loadCallContext();
       if (isEnded()) return;
 
-      console.log("[Vobiz Turn] accepted user transcript=", transcript);
       const aiReply = await generateAiResponse(transcript, callData, kb);
       if (isEnded()) return;
 
