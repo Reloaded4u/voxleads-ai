@@ -930,10 +930,9 @@ async function startServer() {
 
     let state: CallState = "GREETING";
     let mediaBuffers: Buffer[] = [];
-    let silenceTimer: NodeJS.Timeout | null = null;
     let lastTranscript = "";
     let lastAiReply = "";
-    const MIN_AUDIO_BYTES = 160 * 10;
+    const STT_WINDOW_FRAMES = 100; // 2 seconds at 20ms/frame
 
     console.log("[Vobiz State] GREETING");
 
@@ -966,7 +965,6 @@ async function startServer() {
       console.log("[Vobiz State] COOLDOWN");
       state = "COOLDOWN";
       mediaBuffers = [];
-      if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
       await wait(800);
       if (isEnded()) return;
       state = "LISTENING";
@@ -1047,24 +1045,13 @@ async function startServer() {
       }
     };
 
-    const processListeningTurn = async () => {
-      console.log("[Vobiz Processing] called state=", state, "bufferCount=", mediaBuffers.length);
-      if (state !== "LISTENING") return;
+    const processListeningAudio = async (audioBuffer: Buffer) => {
+      if (state !== "LISTENING" || isEnded()) return;
 
-      const combined = Buffer.concat(mediaBuffers);
-      console.log("[Vobiz Processing] combinedBytes=", combined.length);
-
-      if (combined.length < MIN_AUDIO_BYTES) {
-        console.log("[Vobiz Processing] too short, returning to listening");
-        mediaBuffers = [];
-        return;
-      }
-
-      mediaBuffers = [];
       state = "PROCESSING";
       console.log("[Vobiz State] PROCESSING");
 
-      const transcript = await transcribeBuffer(combined);
+      const transcript = await transcribeBuffer(audioBuffer);
       if (isEnded()) return;
 
       const normalizedTranscript = normalizeTurnText(transcript);
@@ -1114,21 +1101,10 @@ async function startServer() {
       await enterCooldownThenListen();
     };
 
-    const resetSilenceTimer = () => {
-      console.log("[Vobiz Listening] silence timer reset");
-      if (silenceTimer) clearTimeout(silenceTimer);
-      silenceTimer = setTimeout(() => {
-        console.log("[Vobiz Listening] silence timer fired bufferCount=", mediaBuffers.length);
-        silenceTimer = null;
-        void processListeningTurn();
-      }, 1200);
-    };
-
     const endCall = () => {
       if (isEnded()) return;
       state = "ENDED";
       console.log("[Vobiz State] ENDED");
-      if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
       mediaBuffers = [];
     };
 
@@ -1205,9 +1181,13 @@ async function startServer() {
         return;
       }
 
-      console.log("[Vobiz Listening] accepting frame bytes=", decoded.length, "bufferCountBefore=", mediaBuffers.length);
       mediaBuffers.push(decoded);
-      resetSilenceTimer();
+
+      if (mediaBuffers.length >= STT_WINDOW_FRAMES) {
+        const combined = Buffer.concat(mediaBuffers);
+        mediaBuffers = [];
+        void processListeningAudio(combined);
+      }
     });
 
     ws.on("error", (err) => {
