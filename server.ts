@@ -122,10 +122,22 @@ function normalizePhoneNumber(phone: string) {
 
 async function generateAiResponse(userSpeech: string, callData: any, kb: any) {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return "Sorry, could you repeat that?";
 
   const businessName = kb?.profile?.name || "our company";
   const mission = kb?.profile?.mission || "assisting customers";
+  const t = userSpeech.toLowerCase();
+
+  if (
+    t.includes("we can talk") ||
+    t.includes("go ahead") ||
+    t.includes("tell me") ||
+    t.includes("give me more") ||
+    t.includes("you hear me")
+  ) {
+    return `${businessName} is calling to share ${kb?.guidance?.mainPitch || "the details"}`;
+  }
+
+  if (!apiKey) return "";
 
   const context = `You are a professional AI sales assistant for ${businessName}.
 Mission: ${mission}.
@@ -161,12 +173,13 @@ Reply in 1 sentence.`;
     });
 
     const data = await response.json();
+    console.log("[GEMINI RAW]", JSON.stringify(data));
     const rawReply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
     const reply = rawReply.trim();
-    return reply || "Sorry, could you repeat that?";
+    return reply;
   } catch (error) {
     console.error('[AI Response] Gemini error:', error);
-    return "Sorry, could you repeat that?";
+    return "";
   }
 }
 
@@ -1037,7 +1050,7 @@ async function startServer() {
     let lastTranscript = "";
     let lastAiReply = "";
     let turnInProgress = false;
-    const STT_WINDOW_FRAMES = 50; // 1 second at 20ms/frame
+    const STT_WINDOW_FRAMES = 100; // 2 seconds at 20ms/frame
     const NON_ACTIONABLE_UTTERANCES = new Set([
       "yeah", "ok", "okay", "hello", "hi", "hmm", "uh", "um"
     ]);
