@@ -1152,10 +1152,15 @@ async function startServer() {
           body: audioBuffer,
         });
         const result = await response.json() as any;
-        return (result?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "").trim();
+        const alternative = result?.results?.channels?.[0]?.alternatives?.[0] || {};
+        return {
+          transcript: (alternative.transcript || "").trim(),
+          confidence: alternative.confidence,
+          words: alternative.words || [],
+        };
       } catch (err) {
         console.error(`[Deepgram STT] Error:`, err);
-        return "";
+        return { transcript: "", confidence: undefined, words: [] };
       }
     };
 
@@ -1172,69 +1177,16 @@ async function startServer() {
       try {
         console.log("[Vobiz VAD] score=", getVadScore(audioBuffer));
 
-        const transcript = await transcribeBuffer(audioBuffer);
+        const stt = await transcribeBuffer(audioBuffer);
+        const transcript = stt.transcript;
         console.log("[Deepgram STT] transcript=", transcript);
-        if (state !== "LISTENING" || isEnded()) return;
+        console.log("[Deepgram STT] confidence=", stt.confidence);
+        console.log("[Deepgram STT] words=", stt.words);
+        console.log("[Deepgram STT] audioBufferLength=", audioBuffer.length);
 
-        if (!isValidTranscript(transcript)) {
-          console.log("[TURN BLOCKED] invalid transcript:", transcript);
-          state = "LISTENING";
-          return;
-        }
-
-        const normalizedTranscript = normalizeTurnText(transcript);
-        if (!normalizedTranscript || normalizedTranscript.length < 4) {
-          console.log("[TURN BLOCKED] invalid transcript:", transcript);
-          state = "LISTENING";
-          return;
-        }
-
-        if (resemblesLastAiReply(transcript)) {
-          returnToListening();
-          return;
-        }
-
-        console.log("[TURN ACCEPTED]", transcript);
-        console.log("[SAFEGUARD] Gemini should not run without transcript");
-        state = "PROCESSING";
-        console.log("[Vobiz State] PROCESSING");
-
-        const { callData, kb } = await loadCallContext();
-        if (isEnded()) return;
-
-        if (!isValidTranscript(transcript)) {
-          console.log("[TURN BLOCKED] invalid transcript:", transcript);
-          state = "LISTENING";
-          return;
-        }
-
-        const aiReply = await generateAiResponse(transcript, callData, kb);
-        if (isEnded()) return;
-
-        lastTranscript = transcript.trim().toLowerCase();
-        lastAiReply = aiReply.trim();
-
-      if (!ownerId) {
-        console.error("[Vobiz Reply] ownerId missing");
-        returnToListening();
+        // Diagnostic mode: replies are disabled. Greeting still plays, but user turns only log STT.
+        state = "LISTENING";
         return;
-      }
-
-      const replyAudio = await fetchTtsAudio(aiReply, ownerId);
-      if (isEnded()) return;
-
-      if (!replyAudio) {
-        console.error("[Vobiz Reply] TTS failed");
-        returnToListening();
-        return;
-      }
-
-        state = "SPEAKING";
-        console.log("[Vobiz State] SPEAKING reply");
-        await sendVobizAudio(ws, replyAudio);
-        turnInProgress = false;
-        mediaBuffers = [];
-        await enterCooldownThenListen();
       } catch (err) {
         console.error("[Vobiz Turn] Error:", err);
         if (!isEnded()) state = "LISTENING";
@@ -1731,10 +1683,14 @@ async function startServer() {
     }
 
     try {
+      console.log("[Vobiz Recording Webhook] Full body:", JSON.stringify(body));
+      const recordingUrl = body.RecordUrl || body.RecordFile || body.RecordingURL || body.recording_url || body.record_url || body.url;
+      const recordingSid = body.RecordingID || body.recording_id;
+
       await db.collection("calls").doc(callId as string).update(sanitizeForFirestore({
-        recordingUrl: body.record_url || body.recording_url || body.url,
-        recordingSid: body.recording_id,
-        recordingStatus: "completed",
+        recordingUrl,
+        recordingSid,
+        recordingStatus: recordingUrl ? "completed" : "processing",
         recordingDuration: body.recording_duration ? parseInt(String(body.recording_duration), 10) : undefined,
         recordingDurationMs: body.recording_duration_ms ? parseInt(String(body.recording_duration_ms), 10) : undefined,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
