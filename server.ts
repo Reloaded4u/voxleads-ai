@@ -1031,6 +1031,9 @@ async function startServer() {
     let lastAiReply = "";
     let turnInProgress = false;
     const STT_WINDOW_FRAMES = 50; // 1 second at 20ms/frame
+    const NON_ACTIONABLE_UTTERANCES = new Set([
+      "yeah", "yes", "ok", "okay", "hello", "hi", "hmm", "uh", "um", "can talk"
+    ]);
 
     console.log("[Vobiz State] GREETING");
 
@@ -1190,14 +1193,15 @@ async function startServer() {
           return;
         }
 
-        if (typeof stt.confidence === "number" && stt.confidence < 0.75) {
-          console.log("[TURN BLOCKED] low confidence:", stt.confidence);
-          state = "LISTENING";
-          return;
-        }
+        const normalizedTranscript = normalizeTurnText(transcript);
+        const wordCount = normalizedTranscript.split(" ").filter(Boolean).length;
 
-        if (!Array.isArray(stt.words) || stt.words.length < 1) {
-          console.log("[TURN BLOCKED] no words");
+        if (
+          NON_ACTIONABLE_UTTERANCES.has(normalizedTranscript) ||
+          wordCount < 3 ||
+          (typeof stt.confidence === "number" && stt.confidence < 0.85)
+        ) {
+          console.log("[TURN BLOCKED] non-actionable/low-confidence transcript:", transcript);
           state = "LISTENING";
           return;
         }
@@ -1208,7 +1212,6 @@ async function startServer() {
           return;
         }
 
-        const normalizedTranscript = normalizeTurnText(transcript);
         if (!normalizedTranscript || normalizedTranscript.length < 4) {
           console.log("[TURN BLOCKED] invalid transcript:", transcript);
           state = "LISTENING";
