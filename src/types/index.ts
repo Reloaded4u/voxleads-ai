@@ -36,6 +36,9 @@ export interface CallRecord {
   recordingUrl?: string;
   recordingSid?: string;
   recordingStatus?: 'requested' | 'processing' | 'completed' | 'failed';
+  recordingProvider?: 'twilio' | 'vobiz';
+  recordingDuration?: number;
+  recordingDurationMs?: number;
   outcome: LeadStatus;
   sentiment?: 'positive' | 'neutral' | 'negative';
   keyPoints?: string[];

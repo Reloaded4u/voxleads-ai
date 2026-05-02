@@ -517,6 +517,102 @@ async function getTwilioConfig(uid: string) {
   return null;
 }
 
+type VobizConfig = {
+  authId: string;
+  authToken: string;
+  phoneNumber: string;
+};
+
+async function startVobizRecording(callId: string, ownerId: string, callUuid: string, vobizConfig: VobizConfig) {
+  const callbackUrl = `${APP_URL}/api/webhooks/vobiz/recording?callId=${encodeURIComponent(callId)}`;
+  const response = await fetch(`https://api.vobiz.ai/api/v1/Account/${vobizConfig.authId}/Call/${callUuid}/Record/`, {
+    method: "POST",
+    headers: {
+      "X-Auth-ID": vobizConfig.authId,
+      "X-Auth-Token": vobizConfig.authToken,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      time_limit: 7200,
+      file_format: "mp3",
+      callback_url: callbackUrl,
+      callback_method: "POST",
+      record_channel_type: "mono",
+    }),
+  });
+
+  const data = response.status === 204 ? {} : await response.json().catch(() => ({}));
+  if (!response.ok && response.status !== 202) {
+    throw new Error(data?.message || `Vobiz recording failed with status ${response.status}`);
+  }
+
+  await db.collection("calls").doc(callId).update(sanitizeForFirestore({
+    recordingStatus: "processing",
+    recordingSid: data?.recording_id,
+    recordingUrl: data?.url,
+    recordingProvider: "vobiz",
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }));
+
+  console.log(`[Vobiz Recording] started callId=${callId} callUuid=${callUuid} recordingId=${data?.recording_id || "pending"}`);
+  return data;
+}
+
+async function stopVobizRecording(callId: string, callUuid: string, vobizConfig: VobizConfig, recordingUrl?: string) {
+  const response = await fetch(`https://api.vobiz.ai/api/v1/Account/${vobizConfig.authId}/Call/${callUuid}/Record/`, {
+    method: "DELETE",
+    headers: {
+      "X-Auth-ID": vobizConfig.authId,
+      "X-Auth-Token": vobizConfig.authToken,
+      "Content-Type": "application/json",
+    },
+    body: recordingUrl ? JSON.stringify({ URL: recordingUrl }) : undefined,
+  });
+
+  if (!response.ok && response.status !== 204) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data?.message || `Vobiz stop recording failed with status ${response.status}`);
+  }
+
+  await db.collection("calls").doc(callId).update(sanitizeForFirestore({
+    recordingStatus: null,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }));
+
+  console.log(`[Vobiz Recording] stopped callId=${callId} callUuid=${callUuid}`);
+}
+
+async function ensureVobizRecordingStarted(callId?: string | null, ownerId?: string | null) {
+  if (!callId || !ownerId) return;
+
+  try {
+    const callRef = db.collection("calls").doc(callId);
+    const callSnap = await callRef.get();
+    const callData = callSnap.data() || {};
+
+    if (callData.provider !== "vobiz") return;
+    if (callData.recordingStatus !== "requested") return;
+    if (!callData.callSid) {
+      console.warn(`[Vobiz Recording] callSid missing for callId=${callId}`);
+      return;
+    }
+
+    const vobizConfig = await getVobizConfig(ownerId);
+    if (!vobizConfig) {
+      console.warn(`[Vobiz Recording] config missing for ownerId=${ownerId}`);
+      return;
+    }
+
+    await startVobizRecording(callId, ownerId, callData.callSid, vobizConfig);
+  } catch (error) {
+    console.error("[Vobiz Recording] start failed:", error);
+    await db.collection("calls").doc(callId).update(sanitizeForFirestore({
+      recordingStatus: "failed",
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    })).catch((updateError) => console.error("[Vobiz Recording] failed status update error:", updateError));
+  }
+}
+
 async function getVobizConfig(userId?: string) {
   let authId = process.env.VOBIZ_AUTH_ID;
   let authToken = process.env.VOBIZ_AUTH_TOKEN;
@@ -925,6 +1021,7 @@ async function startServer() {
     let ownerId = urlParams.get("ownerId");
 
     console.log(`[WS OPEN] callId=${callId} ownerId=${ownerId}`);
+    void ensureVobizRecordingStarted(callId, ownerId);
 
     type CallState = "GREETING" | "SPEAKING" | "COOLDOWN" | "LISTENING" | "PROCESSING" | "ENDED";
 
@@ -1365,12 +1462,13 @@ async function startServer() {
 
           const vobizCallId = vobizData.call_id || vobizData.id || vobizData.uuid || `vobiz-${Date.now()}`;
 
-          await db.collection('calls').doc(callId).update({
+          await db.collection('calls').doc(callId).update(sanitizeForFirestore({
             callSid: vobizCallId,
             provider: 'vobiz',
             status: 'initiated',
+            recordingStatus: recordingEnabled ? 'requested' : null,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
-          });
+          }));
 
           return res.json({
             success: true,
@@ -1619,6 +1717,32 @@ async function startServer() {
   app.post("/api/vobiz/stream-status", (req, res) => {
     console.log("[Vobiz Stream Callback] Event=" + req.body?.Event + " StreamID=" + req.body?.StreamID + " CallUUID=" + req.body?.CallUUID);
     console.log("[Vobiz Stream Callback] Full body:", JSON.stringify(req.body));
+    res.json({ ok: true });
+  });
+
+  app.post("/api/webhooks/vobiz/recording", async (req, res) => {
+    const { callId } = req.query;
+    const body = req.body || {};
+
+    console.log(`[Vobiz Recording Webhook] callId=${callId} body=${JSON.stringify(body)}`);
+
+    if (!callId) {
+      return res.status(400).json({ success: false, message: "Missing callId" });
+    }
+
+    try {
+      await db.collection("calls").doc(callId as string).update(sanitizeForFirestore({
+        recordingUrl: body.record_url || body.recording_url || body.url,
+        recordingSid: body.recording_id,
+        recordingStatus: "completed",
+        recordingDuration: body.recording_duration ? parseInt(String(body.recording_duration), 10) : undefined,
+        recordingDurationMs: body.recording_duration_ms ? parseInt(String(body.recording_duration_ms), 10) : undefined,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }));
+    } catch (error) {
+      console.error("[Vobiz Recording Webhook] Update failed:", error);
+    }
+
     res.json({ ok: true });
   });
 
@@ -2021,6 +2145,38 @@ ${speakXml}  </Gather>
       const uid = decodedToken.uid;
 
       console.log(`[Backend] User ${uid} ${enabled ? 'enabling' : 'disabling'} recording for call ${callId}`);
+
+      const callRef = db.collection("calls").doc(callId);
+      const callSnap = await callRef.get();
+      const callData = callSnap.data() || {};
+
+      if (callData.ownerId && callData.ownerId !== uid) {
+        return res.status(403).json({ success: false, message: "Not allowed" });
+      }
+
+      if (enabled) {
+        await callRef.update(sanitizeForFirestore({
+          recordingStatus: "requested",
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }));
+
+        if (callData.provider === "vobiz" && callData.callSid) {
+          const vobizConfig = await getVobizConfig(uid);
+          if (!vobizConfig) throw new Error("Vobiz config missing");
+          await startVobizRecording(callId, uid, callData.callSid, vobizConfig);
+        }
+      } else {
+        if (callData.provider === "vobiz" && callData.callSid) {
+          const vobizConfig = await getVobizConfig(uid);
+          if (!vobizConfig) throw new Error("Vobiz config missing");
+          await stopVobizRecording(callId, callData.callSid, vobizConfig, callData.recordingUrl);
+        } else {
+          await callRef.update(sanitizeForFirestore({
+            recordingStatus: null,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }));
+        }
+      }
 
       res.json({ success: true });
     } catch (error) {
