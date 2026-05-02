@@ -122,7 +122,7 @@ function normalizePhoneNumber(phone: string) {
 
 async function generateAiResponse(userSpeech: string, callData: any, kb: any) {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return "I'm sorry, I cannot process your request right now.";
+  if (!apiKey) return "Sorry, could you repeat that?";
 
   const businessName = kb?.profile?.name || "our company";
   const mission = kb?.profile?.mission || "assisting customers";
@@ -140,8 +140,8 @@ Objection Handling: ${kb?.guidance?.objectionHandling || 'Address concerns profe
 Rules:
 - Reply in exactly 1 short, natural sentence. Never more.
 - Do not use markdown or filler phrases.
-- Do not say "I missed that" or ask the caller to repeat when their speech is non-empty.
-- If the caller is checking whether you can hear them, confirm briefly and move to your pitch in one sentence (e.g. "Yes I can hear you — [pitch]").
+- Do not ask the caller to repeat when their speech is non-empty.
+- Answer from the knowledge base and current conversation context.
 - If unsure, offer a human callback.
 
 Conversation so far:
@@ -161,18 +161,25 @@ Reply in 1 sentence.`;
     });
 
     const data = await response.json();
-    // Patch 3: Only fall back to canned reply when transcript was genuinely empty.
-    // Since we already gate on non-empty transcript before calling this function,
-    // a missing Gemini response should never produce "I missed that".
     const rawReply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    const reply = rawReply.trim() ||
-      "Yes I can hear you — may I quickly share why I'm calling?";
-    return reply;
+    const reply = rawReply.trim();
+    return reply || "Sorry, could you repeat that?";
   } catch (error) {
     console.error('[AI Response] Gemini error:', error);
-    // natural fallback — never claim we "missed" non-empty speech
-    return "Yes I can hear you — let me quickly share why I called.";
+    return "Sorry, could you repeat that?";
   }
+}
+
+async function generateGeminiReply({
+  transcript,
+  knowledgeBase,
+  callContext,
+}: {
+  transcript: string;
+  knowledgeBase: any;
+  callContext: any;
+}) {
+  return generateAiResponse(transcript, callContext, knowledgeBase);
 }
 
 // ── sendVobizAudio ──────────────────────────────────────────────────────────
@@ -1250,7 +1257,11 @@ async function startServer() {
         if (!hasActionableIntent) {
           console.log("[TURN ACCEPTED]", transcript);
         }
-        console.log("[SAFEGUARD] Gemini should not run without transcript");
+        if (!transcript || transcript.trim().length === 0) {
+          console.log("[SAFEGUARD BLOCKED] Empty transcript");
+          state = "LISTENING";
+          return;
+        }
         state = "PROCESSING";
         console.log("[Vobiz State] PROCESSING");
 
@@ -1259,9 +1270,20 @@ async function startServer() {
 
         const currentTranscript = callData?.transcript || "";
         const transcriptWithLead = `${currentTranscript}\nLead: ${transcript}`;
-        const aiReply = await generateAiResponse(transcript, { ...callData, transcript: transcriptWithLead }, kb);
+        const callContext = { ...callData, transcript: transcriptWithLead };
+        console.log("[GEMINI INPUT]", transcript);
+        let reply = await generateGeminiReply({
+          transcript,
+          knowledgeBase: kb,
+          callContext,
+        });
+        if (!reply || reply.trim().length === 0) {
+          reply = "Sorry, could you repeat that?";
+        }
+        console.log("[GEMINI OUTPUT]", reply);
         if (isEnded()) return;
 
+        const aiReply = reply;
         lastTranscript = transcript.trim().toLowerCase();
         lastAiReply = aiReply.trim();
 
@@ -1721,12 +1743,18 @@ async function startServer() {
       }
 
       console.log("[TURN ACCEPTED]", SpeechResult);
-      console.log("[SAFEGUARD] Gemini should not run without transcript");
-      const aiReply = await generateAiResponse(
-        SpeechResult,
-        { ...callData, transcript: newTranscript },
-        callData?.knowledgeBaseSnapshot
-      );
+      if (!SpeechResult || SpeechResult.trim().length === 0) {
+        console.log("[SAFEGUARD BLOCKED] Empty transcript");
+        res.type('text/xml');
+        return res.send(response.toString());
+      }
+      console.log("[GEMINI INPUT]", SpeechResult);
+      const aiReply = await generateGeminiReply({
+        transcript: SpeechResult,
+        knowledgeBase: callData?.knowledgeBaseSnapshot,
+        callContext: { ...callData, transcript: newTranscript },
+      });
+      console.log("[GEMINI OUTPUT]", aiReply);
 
       await callRef.update({
         transcript: newTranscript + `\nAI: ${aiReply}`,
@@ -1872,12 +1900,17 @@ async function startServer() {
           const newTranscript = `${transcript}\nLead: ${userSpeech}`;
 
           console.log("[TURN ACCEPTED]", userSpeech);
-          console.log("[SAFEGUARD] Gemini should not run without transcript");
-          aiReply = await generateAiResponse(
-            userSpeech,
-            { ...callData, transcript: newTranscript },
-            callData?.knowledgeBaseSnapshot
-          );
+          if (!userSpeech || userSpeech.trim().length === 0) {
+            console.log("[SAFEGUARD BLOCKED] Empty transcript");
+            return;
+          }
+          console.log("[GEMINI INPUT]", userSpeech);
+          aiReply = await generateGeminiReply({
+            transcript: userSpeech,
+            knowledgeBase: callData?.knowledgeBaseSnapshot,
+            callContext: { ...callData, transcript: newTranscript },
+          });
+          console.log("[GEMINI OUTPUT]", aiReply);
 
           await callRef.update({
             transcript: `${newTranscript}\nAI: ${aiReply}`,
