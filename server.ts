@@ -1032,7 +1032,20 @@ async function startServer() {
     let turnInProgress = false;
     const STT_WINDOW_FRAMES = 50; // 1 second at 20ms/frame
     const NON_ACTIONABLE_UTTERANCES = new Set([
-      "yeah", "yes", "ok", "okay", "hello", "hi", "hmm", "uh", "um", "can talk"
+      "yeah", "ok", "okay", "hello", "hi", "hmm", "uh", "um"
+    ]);
+    const ACTIONABLE_UTTERANCES = new Set([
+      "please go ahead",
+      "go ahead",
+      "please share",
+      "share now",
+      "tell me",
+      "tell me more",
+      "continue",
+      "yes please",
+      "interested",
+      "price",
+      "details",
     ]);
 
     console.log("[Vobiz State] GREETING");
@@ -1195,12 +1208,23 @@ async function startServer() {
 
         const normalizedTranscript = normalizeTurnText(transcript);
         const wordCount = normalizedTranscript.split(" ").filter(Boolean).length;
+        const confidence = typeof stt.confidence === "number" ? stt.confidence : 0;
+        const hasActionableIntent = ACTIONABLE_UTTERANCES.has(normalizedTranscript);
 
-        if (
-          NON_ACTIONABLE_UTTERANCES.has(normalizedTranscript) ||
-          wordCount < 3 ||
-          (typeof stt.confidence === "number" && stt.confidence < 0.85)
-        ) {
+        if (NON_ACTIONABLE_UTTERANCES.has(normalizedTranscript)) {
+          console.log("[TURN BLOCKED] non-actionable/low-confidence transcript:", transcript);
+          state = "LISTENING";
+          return;
+        }
+
+        if (hasActionableIntent) {
+          if (confidence < 0.70) {
+            console.log("[TURN BLOCKED] non-actionable/low-confidence transcript:", transcript);
+            state = "LISTENING";
+            return;
+          }
+          console.log("[TURN ACCEPTED] actionable intent:", transcript);
+        } else if (wordCount < 3 || confidence < 0.85) {
           console.log("[TURN BLOCKED] non-actionable/low-confidence transcript:", transcript);
           state = "LISTENING";
           return;
@@ -1223,7 +1247,9 @@ async function startServer() {
           return;
         }
 
-        console.log("[TURN ACCEPTED]", transcript);
+        if (!hasActionableIntent) {
+          console.log("[TURN ACCEPTED]", transcript);
+        }
         console.log("[SAFEGUARD] Gemini should not run without transcript");
         state = "PROCESSING";
         console.log("[Vobiz State] PROCESSING");
