@@ -120,48 +120,48 @@ function normalizePhoneNumber(phone: string) {
   return cleaned;
 }
 
-async function generateAiResponse(userSpeech: string, callData: any, kb: any, conversationHistory: string[] = []) {
+async function generateAiResponse(userSpeech: string, callData: any, kb: any) {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return "I'm sorry, I cannot process your request right now.";
 
   const businessName = kb?.profile?.name || "our company";
+  const mission = kb?.profile?.mission || "assisting customers";
+  const t = userSpeech.toLowerCase();
 
-  // KB fields treated as background knowledge — capped to prevent prompt flooding
-  const pitchSnippet   = (kb?.guidance?.mainPitch      || "").slice(0, 200);
-  const closingSnippet = (kb?.guidance?.closingLine     || "").slice(0, 100);
-  const objections     = (kb?.guidance?.objectionHandling || "Address concerns professionally.").slice(0, 150);
-  const faqs           = Array.isArray(kb?.faqs)
-    ? kb.faqs.slice(0, 3).map((f: any) => `Q: ${f.question} A: ${f.answer}`).join("\n")
-    : "";
+  if (
+    t.includes("we can talk") ||
+    t.includes("go ahead") ||
+    t.includes("tell me") ||
+    t.includes("give me more") ||
+    t.includes("you hear me")
+  ) {
+    return `${businessName} is calling to share ${kb?.guidance?.mainPitch || "the details"}`;
+  }
 
-  const historyBlock = conversationHistory.length > 0
-    ? conversationHistory.slice(-6).join("\n")
-    : "No previous turns.";
+  if (!apiKey) return "";
 
-  const context = `RULES (follow strictly):
-- Reply in exactly 1 natural spoken sentence. Never more than 22 words total.
-- Do NOT read out KB text verbatim. Use it only as background knowledge.
-- Do NOT use markdown, bullet points, lists, symbols, or labels.
-- Do NOT produce words like "Menu", "KB:", "Guidance:", or any UI label.
-- If the caller is testing the line ("can you hear me", "hello"), confirm hearing them and briefly introduce the purpose of the call.
-- If caller asks pricing or details, give ONE specific helpful sentence from KB context.
-- Never ask the caller to repeat themselves when they have clearly spoken.
-- If truly unsure, offer to connect to a human agent.
+  const context = `You are a professional AI sales assistant for ${businessName}.
+Mission: ${mission}.
+Caller: ${callData.leadName || 'unknown'}.
+Phone: ${callData.leadPhone || 'unknown'}.
 
-BACKGROUND KNOWLEDGE (do not read aloud — use to inform your reply only):
-Business: ${businessName}
-Pitch context: ${pitchSnippet}
-Objection handling: ${objections}
-Closing: ${closingSnippet}
-FAQs:
-${faqs}
+Knowledge Base:
+Greeting: ${kb?.guidance?.greeting || 'Hello'}
+Main Pitch: ${kb?.guidance?.mainPitch || 'How can I help you?'}
+Objection Handling: ${kb?.guidance?.objectionHandling || 'Address concerns professionally.'}
 
-CONVERSATION HISTORY:
-${historyBlock}
+Rules:
+- Reply in exactly 1 short, natural sentence. Never more.
+- Do not use markdown or filler phrases.
+- Do not ask the caller to repeat when their speech is non-empty.
+- Answer from the knowledge base and current conversation context.
+- If unsure, offer a human callback.
+
+Conversation so far:
+${callData.transcript || 'No previous history.'}
 
 Caller said: "${userSpeech}"
 
-Reply (1 sentence, max 22 words, plain spoken English):`;
+Reply in 1 sentence.`;
 
   try {
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
@@ -172,41 +172,14 @@ Reply (1 sentence, max 22 words, plain spoken English):`;
       })
     });
 
-    const data = await response.json() as any;
-    console.log("[GEMINI RAW]", JSON.stringify(data).slice(0, 500));
+    const data = await response.json();
+    console.log("[GEMINI RAW]", JSON.stringify(data));
     const rawReply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-
-    // ── Post-processing safety layer ──────────────────────────────────────────
-    let reply = rawReply.trim();
-
-    // Strip known UI/KB label artifacts that Gemini occasionally echoes
-    const artifactPattern = /\b(Menu|KB:|Guidance:|Knowledge Base:|FAQs?:|Rules?:|Background:|Context:)\b/gi;
-    reply = reply.replace(artifactPattern, "").trim();
-
-    // Collapse any double spaces left by stripping
-    reply = reply.replace(/\s{2,}/g, " ").trim();
-
-    // Enforce 22-word hard cap — truncate at last complete word
-    const words = reply.split(/\s+/);
-    if (words.length > 22) {
-      reply = words.slice(0, 22).join(" ");
-      // End cleanly on a sentence boundary if possible
-      if (!reply.endsWith(".") && !reply.endsWith("?") && !reply.endsWith("!")) {
-        reply = reply + ".";
-      }
-    }
-
-    // Final fallback if post-processing left us with nothing
-    if (!reply) {
-      reply = "Yes, I can hear you — let me share a quick detail about our offering.";
-    }
-
-    console.log(`[GEMINI FINAL REPLY] "${reply}"`);
+    const reply = rawReply.trim();
     return reply;
-
   } catch (error) {
     console.error('[AI Response] Gemini error:', error);
-    return "Yes, I can hear you — please give me just a moment.";
+    return "";
   }
 }
 
@@ -1077,7 +1050,6 @@ async function startServer() {
     let lastTranscript = "";
     let lastAiReply = "";
     let turnInProgress = false;
-    const conversationHistory: string[] = [];  // in-memory turn log for this WS session
     const STT_WINDOW_FRAMES = 100; // 2 seconds at 20ms/frame
     const NON_ACTIONABLE_UTTERANCES = new Set([
       "yeah", "ok", "okay", "hello", "hi", "hmm", "uh", "um"
@@ -1313,19 +1285,16 @@ async function startServer() {
         const transcriptWithLead = `${currentTranscript}\nLead: ${transcript}`;
         const callContext = { ...callData, transcript: transcriptWithLead };
         console.log("[GEMINI INPUT]", transcript);
-
-        // Append user turn to in-session history before calling Gemini
-        conversationHistory.push(`Caller: ${transcript}`);
-
-        let reply = await generateAiResponse(transcript, callContext, kb, conversationHistory);
+        let reply = await generateGeminiReply({
+          transcript,
+          knowledgeBase: kb,
+          callContext,
+        });
         if (!reply || reply.trim().length === 0) {
-          reply = "Let me connect you with our team for more details.";
+          reply = "Sorry, could you repeat that?";
         }
         console.log("[GEMINI OUTPUT]", reply);
         if (isEnded()) return;
-
-        // Append AI turn to history for next round
-        conversationHistory.push(`Assistant: ${reply}`);
 
         const aiReply = reply;
         lastTranscript = transcript.trim().toLowerCase();
