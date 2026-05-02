@@ -124,46 +124,43 @@ async function generateAiResponse(userSpeech: string, callData: any, kb: any) {
   const apiKey = process.env.GEMINI_API_KEY;
 
   const businessName = kb?.profile?.name || "our company";
-  const mission = kb?.profile?.mission || "assisting customers";
   const t = userSpeech.toLowerCase();
+  const PERMISSION_INTENTS = [
+    "please go ahead",
+    "go ahead",
+    "please share",
+    "share now",
+    "continue",
+    "yes please",
+  ];
 
-  if (
-    t.includes("we can talk") ||
-    t.includes("go ahead") ||
-    t.includes("tell me") ||
-    t.includes("give me more") ||
-    t.includes("you hear me")
-  ) {
-    return `${businessName} is calling to share ${kb?.guidance?.mainPitch || "the details"}`;
+  if (PERMISSION_INTENTS.some((p) => t.includes(p))) {
+    console.log("[GEMINI ROUTE] deterministic permission intent");
+    return `${businessName} offers ${kb?.guidance?.mainPitch?.slice(0, 120) || "premium properties"}`;
   }
 
   if (!apiKey) return "";
 
-  const context = `You are a professional AI sales assistant for ${businessName}.
-Mission: ${mission}.
-Caller: ${callData.leadName || 'unknown'}.
-Phone: ${callData.leadPhone || 'unknown'}.
-
-Knowledge Base:
-Greeting: ${kb?.guidance?.greeting || 'Hello'}
-Main Pitch: ${kb?.guidance?.mainPitch || 'How can I help you?'}
-Objection Handling: ${kb?.guidance?.objectionHandling || 'Address concerns professionally.'}
+  const truncatedKB = (kb?.guidance?.mainPitch || "").slice(0, 200);
+  const context = `You are a real estate calling assistant.
 
 Rules:
-- Reply in exactly 1 short, natural sentence. Never more.
-- Do not use markdown or filler phrases.
-- Do not ask the caller to repeat when their speech is non-empty.
-- Answer from the knowledge base and current conversation context.
-- If unsure, offer a human callback.
+- Answer the caller's exact question first
+- Keep reply under 18 words
+- Do NOT read KB text directly
+- KB is background knowledge only
+- Be conversational, not like a brochure
 
-Conversation so far:
-${callData.transcript || 'No previous history.'}
+Knowledge Base (reference only):
+${truncatedKB}
 
-Caller said: "${userSpeech}"
+User said:
+${userSpeech}
 
-Reply in 1 sentence.`;
+Reply:`;
 
   try {
+    console.log("[GEMINI ROUTE] Gemini question handling", userSpeech);
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -175,7 +172,13 @@ Reply in 1 sentence.`;
     const data = await response.json();
     console.log("[GEMINI RAW]", JSON.stringify(data));
     const rawReply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    const reply = rawReply.trim();
+    let reply = rawReply.trim();
+
+    if (reply.split(/\s+/).filter(Boolean).length > 22) {
+      reply = reply.split(/\s+/).slice(0, 22).join(" ") + ".";
+    }
+
+    console.log("[GEMINI FINAL REPLY]", reply);
     return reply;
   } catch (error) {
     console.error('[AI Response] Gemini error:', error);
