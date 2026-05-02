@@ -1184,9 +1184,86 @@ async function startServer() {
         console.log("[Deepgram STT] words=", stt.words);
         console.log("[Deepgram STT] audioBufferLength=", audioBuffer.length);
 
-        // Diagnostic mode: replies are disabled. Greeting still plays, but user turns only log STT.
-        state = "LISTENING";
-        return;
+        if (!transcript) {
+          console.log("[TURN BLOCKED] empty transcript");
+          state = "LISTENING";
+          return;
+        }
+
+        if (typeof stt.confidence === "number" && stt.confidence < 0.75) {
+          console.log("[TURN BLOCKED] low confidence:", stt.confidence);
+          state = "LISTENING";
+          return;
+        }
+
+        if (!Array.isArray(stt.words) || stt.words.length < 1) {
+          console.log("[TURN BLOCKED] no words");
+          state = "LISTENING";
+          return;
+        }
+
+        if (!isValidTranscript(transcript)) {
+          console.log("[TURN BLOCKED] invalid transcript:", transcript);
+          state = "LISTENING";
+          return;
+        }
+
+        const normalizedTranscript = normalizeTurnText(transcript);
+        if (!normalizedTranscript || normalizedTranscript.length < 4) {
+          console.log("[TURN BLOCKED] invalid transcript:", transcript);
+          state = "LISTENING";
+          return;
+        }
+
+        if (resemblesLastAiReply(transcript)) {
+          returnToListening();
+          return;
+        }
+
+        console.log("[TURN ACCEPTED]", transcript);
+        console.log("[SAFEGUARD] Gemini should not run without transcript");
+        state = "PROCESSING";
+        console.log("[Vobiz State] PROCESSING");
+
+        const { callData, kb } = await loadCallContext();
+        if (isEnded()) return;
+
+        const currentTranscript = callData?.transcript || "";
+        const transcriptWithLead = `${currentTranscript}\nLead: ${transcript}`;
+        const aiReply = await generateAiResponse(transcript, { ...callData, transcript: transcriptWithLead }, kb);
+        if (isEnded()) return;
+
+        lastTranscript = transcript.trim().toLowerCase();
+        lastAiReply = aiReply.trim();
+
+        if (callId) {
+          await db.collection("calls").doc(callId).update(sanitizeForFirestore({
+            transcript: `${transcriptWithLead}\nAI: ${aiReply}`,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }));
+        }
+
+        if (!ownerId) {
+          console.error("[Vobiz Reply] ownerId missing");
+          returnToListening();
+          return;
+        }
+
+        const replyAudio = await fetchTtsAudio(aiReply, ownerId);
+        if (isEnded()) return;
+
+        if (!replyAudio) {
+          console.error("[Vobiz Reply] TTS failed");
+          returnToListening();
+          return;
+        }
+
+        state = "SPEAKING";
+        console.log("[Vobiz State] SPEAKING reply");
+        await sendVobizAudio(ws, replyAudio);
+        turnInProgress = false;
+        mediaBuffers = [];
+        await enterCooldownThenListen();
       } catch (err) {
         console.error("[Vobiz Turn] Error:", err);
         if (!isEnded()) state = "LISTENING";
