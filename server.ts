@@ -128,22 +128,17 @@ async function generateAiResponse(
     conversationStage?: string;
     conversationHistory?: Array<{ role: string; text: string }>;
     detectedIntent?: string;
+    maxWords?: number;
   } = {}
 ) {
   const apiKey = process.env.GEMINI_API_KEY;
-
   const t = userSpeech.toLowerCase();
-  const pricingFallback = "Pricing depends on the unit type/configuration. Would you like a callback with exact details?";
-  const isPricingQuestion = t.includes("price") || t.includes("pricing") || t.includes("cost") || t.includes("rate");
+  const pricingFallback = "Pricing depends on unit type. Want exact details?";
+  const isPricingQuestion = /(price|pricing|cost|rate)/.test(t);
 
   if (!apiKey) return isPricingQuestion ? pricingFallback : "";
 
-  const kbText = JSON.stringify({
-    profile: kb?.profile || {},
-    guidance: kb?.guidance || {},
-    faqs: kb?.faqs || [],
-    objections: kb?.objections || [],
-  }).slice(0, 1200);
+  const truncatedKB = (kb?.guidance?.mainPitch || "").slice(0, 200);
   const historyText = (options.conversationHistory || [])
     .slice(-8)
     .map((item) => `${item.role}: ${item.text}`)
@@ -152,27 +147,20 @@ async function generateAiResponse(
   const context = `You are a real estate calling assistant.
 
 Rules:
-- Answer the caller's latest question directly.
-- Do NOT repeat the opening pitch once it has already been given.
-- Keep reply under 18 words.
-- Do NOT read KB text directly.
-- KB is background knowledge only.
-- Be conversational, not like a brochure.
-- Ask one follow-up question when appropriate.
-- If info is not in KB, say: "I don't have that exact detail, but I can arrange a callback."
-- If caller asks price/pricing/cost and exact price is unavailable, say pricing depends on unit type/configuration and ask about callback.
+- Answer the caller's latest question directly
+- Keep replies short and natural
+- Never read KB text directly
+- KB is background knowledge only
+- Max words depend on conversation stage
+- Ask one follow-up question when needed
+- Do not repeat the opening pitch
+- If info is missing, say: 'I can arrange a callback for exact details'
 
-Conversation Stage:
-${options.conversationStage || "opening"}
-
-Detected Intent:
-${options.detectedIntent || "general"}
-
-Conversation History:
+Conversation so far:
 ${historyText || "No previous turns."}
 
 Knowledge Base (reference only):
-${kbText}
+${truncatedKB || "No KB pitch available."}
 
 User said:
 ${userSpeech}
@@ -195,11 +183,13 @@ Reply:`;
       console.error("[GEMINI ERROR]", JSON.stringify(data?.error || data));
       return isPricingQuestion ? pricingFallback : "";
     }
-    const rawReply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    let reply = rawReply.trim() || (isPricingQuestion ? pricingFallback : "");
 
-    if (reply.split(/\s+/).filter(Boolean).length > 22) {
-      reply = reply.split(/\s+/).slice(0, 22).join(" ") + ".";
+    let reply = (data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+    if (!reply && isPricingQuestion) reply = pricingFallback;
+
+    const maxWords = options.maxWords || 12;
+    if (reply.split(/\s+/).filter(Boolean).length > maxWords) {
+      reply = reply.split(/\s+/).slice(0, maxWords).join(" ") + ".";
     }
 
     console.log("[GEMINI FINAL REPLY]", reply);
@@ -217,6 +207,7 @@ async function generateGeminiReply({
   conversationStage,
   conversationHistory,
   detectedIntent,
+  maxWords,
 }: {
   transcript: string;
   knowledgeBase: any;
@@ -224,19 +215,20 @@ async function generateGeminiReply({
   conversationStage?: string;
   conversationHistory?: Array<{ role: string; text: string }>;
   detectedIntent?: string;
+  maxWords?: number;
 }) {
   return generateAiResponse(transcript, callContext, knowledgeBase, {
     conversationStage,
     conversationHistory,
     detectedIntent,
+    maxWords,
   });
 }
 
-// ── sendVobizAudio ──────────────────────────────────────────────────────────
-// Sends μ-law 8kHz audio to Vobiz in precise 20 ms / 160-byte chunks.
+// Sends mu-law 8kHz audio to Vobiz in precise 20 ms / 160-byte chunks.
 // Vobiz requires framed delivery; sending the whole buffer at once causes
 // packet rejection and silence on the caller side.
-const VOBIZ_CHUNK_BYTES = 160;  // 8000 Hz × 1 byte/sample × 0.020 s = 160
+const VOBIZ_CHUNK_BYTES = 160;  // 8000 Hz * 1 byte/sample * 0.020 s = 160
 const VOBIZ_CHUNK_MS    = 20;
 
 async function sendVobizAudio(ws: any, audioBuffer: Buffer): Promise<void> {
@@ -1116,9 +1108,9 @@ async function startServer() {
     let lastTranscript = "";
     let lastAiReply = "";
     let turnInProgress = false;
-    let conversationStage = "opening";
+    let conversationStage: "opening" | "pitch_given" | "pricing_discussed" | "scheduling" | "completed" = "opening";
     const conversationHistory: Array<{ role: string; text: string }> = [];
-    const STT_WINDOW_FRAMES = 100; // 2 seconds at 20ms/frame
+    const STT_WINDOW_FRAMES = 60; // 1.2 seconds at 20ms/frame
     const NON_ACTIONABLE_UTTERANCES = new Set([
       "yeah", "ok", "okay", "hello", "hi", "hmm", "uh", "um"
     ]);
@@ -1127,8 +1119,6 @@ async function startServer() {
       "go ahead",
       "please share",
       "share now",
-      "tell me",
-      "tell me more",
       "continue",
       "yes please",
       "interested",
@@ -1136,19 +1126,75 @@ async function startServer() {
       "details",
     ]);
 
+    const PERMISSION_INTENTS = [
+      "please go ahead",
+      "go ahead",
+      "please share",
+      "share now",
+      "continue",
+      "yes please",
+    ];
+
+    let savedCallbackTime = "";
+
+    const normalizeTimeTranscript = (value: string) =>
+      value
+        .toLowerCase()
+        .replace(/five\s+b\s*m/g, "5 PM")
+        .replace(/five\s+p\s*m/g, "5 PM")
+        .replace(/5\s+p\s*m/g, "5 PM")
+        .replace(/\bfive\b/g, "5")
+        .replace(/\bsix\b/g, "6")
+        .replace(/\bseven\b/g, "7")
+        .replace(/\beight\b/g, "8")
+        .replace(/\bnine\b/g, "9")
+        .replace(/\bten\b/g, "10")
+        .replace(/\beleven\b/g, "11")
+        .replace(/\btwelve\b/g, "12")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    const extractCallbackTime = (value: string) => {
+      const normalized = normalizeTimeTranscript(value);
+      const match = normalized.match(/\b(\d{1,2})(?::\d{2})?\s*(am|pm|a m|p m)?\b/i);
+      if (!match) {
+        if (/\b(morning|afternoon|evening|tomorrow|today)\b/i.test(normalized)) return normalized;
+        return "";
+      }
+
+      const hour = match[1];
+      const suffix = (match[2] || "").replace(/\s+/g, "").toUpperCase();
+      return suffix ? `${hour} ${suffix}` : hour;
+    };
+
+    const getMaxWordsForStage = () => {
+      if (conversationStage === "opening") return 15;
+      if (conversationStage === "pitch_given") return 12;
+      if (conversationStage === "pricing_discussed") return 12;
+      if (conversationStage === "scheduling") return 8;
+      if (conversationStage === "completed") return 6;
+      return 12;
+    };
+
+    const trimReplyForStage = (reply: string) => {
+      const maxWords = getMaxWordsForStage();
+      const words = reply.split(/\s+/).filter(Boolean);
+      return words.length > maxWords ? words.slice(0, maxWords).join(" ") + "." : reply;
+    };
+
     const detectIntent = (text: string) => {
+      if (conversationStage === "scheduling" && extractCallbackTime(text)) return "time_given";
       if (/(price|pricing|cost|rate)/.test(text)) return "pricing";
       if (/\b(yes|yeah|ok|okay|sure)\b/.test(text) && conversationStage === "scheduling") return "scheduling_yes";
-      if (/\b(\d{1,2}(:\d{2})?\s?(am|pm)?|morning|afternoon|evening|tomorrow|today)\b/.test(text) && conversationStage === "scheduling") return "time_given";
-      if (["please go ahead", "go ahead", "please share", "share now", "continue", "yes please"].some((p) => text.includes(p))) return "permission";
+      if (PERMISSION_INTENTS.some((p) => text.includes(p))) return "permission";
       if (/(call me|callback|meeting|schedule|appointment)/.test(text)) return "scheduling";
       return "general";
     };
 
     const buildShortPitch = (kb: any) => {
       const businessName = kb?.profile?.name || "We";
-      const pitch = kb?.guidance?.mainPitch || "premium real estate options";
-      return `${businessName} can help with ${pitch}`.split(/\s+/).slice(0, 18).join(" ") + ".";
+      const pitch = (kb?.guidance?.mainPitch || "premium real estate options").slice(0, 120);
+      return trimReplyForStage(`${businessName} offers ${pitch}`);
     };
 
     console.log("[Vobiz State] GREETING");
@@ -1315,8 +1361,9 @@ async function startServer() {
         const hasActionableIntent = ACTIONABLE_UTTERANCES.has(normalizedTranscript);
         const detectedIntent = detectIntent(normalizedTranscript);
         const hasConversationIntent = ["scheduling_yes", "time_given", "scheduling", "pricing"].includes(detectedIntent);
+        const minimumConfidence = conversationStage === "scheduling" ? 0.35 : 0.85;
         console.log("[CONVERSATION STAGE]", conversationStage);
-        console.log("[INTENT DETECTED]", detectedIntent);
+        console.log("[INTENT DETECTED]", transcript);
 
         if (NON_ACTIONABLE_UTTERANCES.has(normalizedTranscript)) {
           console.log("[TURN BLOCKED] non-actionable/low-confidence transcript:", transcript);
@@ -1325,25 +1372,26 @@ async function startServer() {
         }
 
         if (hasActionableIntent || hasConversationIntent) {
-          if (confidence < 0.70) {
+          const requiredConfidence = conversationStage === "scheduling" ? 0.35 : 0.70;
+          if (confidence < requiredConfidence) {
             console.log("[TURN BLOCKED] non-actionable/low-confidence transcript:", transcript);
             state = "LISTENING";
             return;
           }
           console.log("[TURN ACCEPTED] actionable intent:", transcript);
-        } else if (wordCount < 3 || confidence < 0.85) {
+        } else if (wordCount < 3 || confidence < minimumConfidence) {
           console.log("[TURN BLOCKED] non-actionable/low-confidence transcript:", transcript);
           state = "LISTENING";
           return;
         }
 
-        if (!isValidTranscript(transcript)) {
+        if (detectedIntent !== "time_given" && !isValidTranscript(transcript)) {
           console.log("[TURN BLOCKED] invalid transcript:", transcript);
           state = "LISTENING";
           return;
         }
 
-        if (!normalizedTranscript || normalizedTranscript.length < 4) {
+        if (detectedIntent !== "time_given" && (!normalizedTranscript || normalizedTranscript.length < 4)) {
           console.log("[TURN BLOCKED] invalid transcript:", transcript);
           state = "LISTENING";
           return;
@@ -1372,17 +1420,26 @@ async function startServer() {
         const transcriptWithLead = `${currentTranscript}\nLead: ${transcript}`;
         const callContext = { ...callData, transcript: transcriptWithLead };
         let reply = "";
+        let shouldTrimReply = true;
 
-        if (detectedIntent === "permission" && conversationStage === "opening") {
+        if (conversationStage === "completed") {
+          reply = "Thanks, our team will follow up as scheduled.";
+          shouldTrimReply = false;
+        } else if (detectedIntent === "time_given" && conversationStage === "scheduling") {
+          const normalizedTime = extractCallbackTime(transcript);
+          savedCallbackTime = normalizedTime;
+          conversationStage = "completed";
+          reply = `Confirmed, I'll arrange a callback at ${normalizedTime} today.`;
+          shouldTrimReply = false;
+          console.log("[SCHEDULING TIME DETECTED]", transcript, normalizedTime);
+        } else if (detectedIntent === "permission" && conversationStage === "opening") {
+          console.log("[GEMINI ROUTE] permission intent");
           reply = buildShortPitch(kb);
           conversationStage = "pitch_given";
         } else if (detectedIntent === "permission" && conversationStage === "scheduling") {
-          reply = "Sure, what time works best for you?";
+          reply = "Sure, what time works best?";
         } else if (detectedIntent === "scheduling_yes") {
-          reply = "Sure, what time works best for you?";
-          conversationStage = "scheduling";
-        } else if (detectedIntent === "time_given") {
-          reply = "Got it, I'll note that time for a callback.";
+          reply = "Sure, what time works best?";
           conversationStage = "scheduling";
         } else {
           console.log("[GEMINI INPUT]", transcript);
@@ -1393,11 +1450,12 @@ async function startServer() {
             conversationStage,
             conversationHistory,
             detectedIntent,
+            maxWords: getMaxWordsForStage(),
           });
         }
 
-        if (detectedIntent === "pricing") conversationStage = "pricing_discussed";
-        if (detectedIntent === "scheduling" || reply.toLowerCase().includes("callback")) conversationStage = "scheduling";
+        if (detectedIntent === "pricing" && conversationStage !== "completed") conversationStage = "pricing_discussed";
+        if ((detectedIntent === "scheduling" || reply.toLowerCase().includes("callback")) && conversationStage !== "completed") conversationStage = "scheduling";
         if (conversationStage === "opening" && reply) conversationStage = "pitch_given";
 
         if (!reply || reply.trim().length === 0) {
@@ -1406,8 +1464,8 @@ async function startServer() {
           return;
         }
 
-        if (reply.split(/\s+/).filter(Boolean).length > 22) {
-          reply = reply.split(/\s+/).slice(0, 22).join(" ") + ".";
+        if (shouldTrimReply) {
+          reply = trimReplyForStage(reply);
         }
 
         console.log("[GEMINI OUTPUT]", reply);
