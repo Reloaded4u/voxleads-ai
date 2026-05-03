@@ -176,6 +176,7 @@ Rules:
 - Keep replies short and conversational (max 15 words)
 - Ask follow-up questions naturally
 - Do NOT repeat pitch unless user asks
+- Do NOT greet, introduce yourself, or say calling from; the greeting was already handled
 - Detect the language from User said and reply in the same language
 - KB can be any language; do not translate KB literally
 - If info not found in KB, say: 'I can arrange a callback for exact details.'
@@ -1174,7 +1175,9 @@ async function startServer() {
     let heldTranscript = "";
     let turnInProgress = false;
     let callCompletedLogged = false;
-    let conversationStage: "greeting_sent" | "awaiting_availability" | "awaiting_permission" | "hook_given" | "pitch_given" | "qualification" | "scheduling" | "completed" = "greeting_sent";
+    let greetingDelivered = false;
+    type ConversationStage = "greeting" | "availability" | "permission" | "hook" | "pitch" | "qualification" | "appointment" | "closing" | "ended";
+    let conversationStage: ConversationStage = "greeting";
     const conversationHistory: Array<{ role: string; text: string }> = [];
     const STT_WINDOW_FRAMES = 60; // 1.2 seconds at 20ms/frame
     const NON_ACTIONABLE = new Set([
@@ -1265,18 +1268,24 @@ async function startServer() {
     };
 
     const getCallGuidance = (kb: any) => kb?.callGuidance || kb?.guidance || {};
-    const getScriptField = (kb: any, field: string, fallback: string) => {
+    const getScriptField = (kb: any, field: string, fallback: string, aliases: string[] = []) => {
       const guidance = getCallGuidance(kb);
-      const value = guidance?.[field];
-      const text = firstText(value);
-      console.log("[KB SCRIPT FIELD USED]", field, text ? "kb" : "fallback");
-      return text || fallback;
+      for (const key of [field, ...aliases]) {
+        const text = firstText(guidance?.[key]);
+        if (text) {
+          console.log("[KB SCRIPT FIELD USED]", key, "kb");
+          return text;
+        }
+      }
+      console.log("[KB SCRIPT FIELD MISSING]", field, aliases.length ? aliases.join(",") : "no-aliases");
+      console.log("[KB SCRIPT FIELD USED]", field, "fallback");
+      return fallback;
     };
     const getOpeningHook = (kb: any) =>
-      getScriptField(kb, "openingLine", "May I take 30 seconds to explain?");
+      getScriptField(kb, "hook", "May I take 30 seconds to explain?", ["openingLine"]);
 
     const getMainPitch = (kb: any) =>
-      getScriptField(kb, "mainPitch", "I can share the key details briefly.");
+      getScriptField(kb, "pitch", "I can share the key details briefly.", ["mainPitch"]);
 
     const getFirstQualificationQuestion = (kb: any) =>
       getScriptField(kb, "qualificationQuestions", "May I ask what you are looking for?");
@@ -1324,7 +1333,7 @@ async function startServer() {
       "the business";
 
     const isOpeningCheckIn = (text: string) => {
-      if (conversationStage !== "greeting_sent" && conversationStage !== "awaiting_availability" && conversationStage !== "awaiting_permission") return false;
+      if (!["availability", "permission", "hook"].includes(conversationStage)) return false;
       return (
         text === "hello" ||
         text.includes("is this") ||
@@ -1332,6 +1341,16 @@ async function startServer() {
         text.includes("can you hear me") ||
         text.includes("who is this")
       );
+    };
+
+    const containsGreetingLikeText = (text: string) => /\b(hello|hi|good morning|good afternoon|this is|calling from)\b/i.test(text);
+
+    const sanitizeAiReplyForStage = (reply: string, fallback: string) => {
+      if (greetingDelivered && containsGreetingLikeText(reply)) {
+        console.log("[GREETING GUARD] rejected repeated greeting");
+        return fallback;
+      }
+      return reply;
     };
 
     const getLeadName = (callData: any) =>
@@ -1369,10 +1388,10 @@ async function startServer() {
     };
 
     const buildAvailabilityQuestion = (callData: any, kb: any) =>
-      applyGreetingPlaceholders(getScriptField(kb, "availabilityQuestion", "Is this a good time for a quick call?"), callData, kb);
+      applyGreetingPlaceholders(getScriptField(kb, "availabilityCheck", "Is this a good time for a quick call?", ["availabilityQuestion"]), callData, kb);
 
     const buildPermissionQuestion = (callData: any, kb: any) =>
-      applyGreetingPlaceholders(getScriptField(kb, "permissionQuestion", "May I quickly explain?"), callData, kb);
+      applyGreetingPlaceholders(getScriptField(kb, "permissionLine", "May I quickly explain?", ["permissionQuestion"]), callData, kb);
 
     const buildSchedulingQuestion = (callData: any, kb: any) => {
       const guidance = getCallGuidance(kb);
@@ -1383,10 +1402,12 @@ async function startServer() {
         appointments.callbackQuestion,
         appointments.rescheduleQuestion,
         appointments.callLaterQuestion,
+        guidance.appointmentPrompt,
         guidance.schedulingQuestion,
         guidance.callbackQuestion
       );
-      console.log("[KB SCRIPT FIELD USED]", "schedulingQuestion", text ? "kb" : "fallback");
+      console.log("[KB SCRIPT FIELD USED]", text ? "appointmentPrompt" : "appointmentPrompt fallback", text ? "kb" : "fallback");
+      if (!text) console.log("[KB SCRIPT FIELD MISSING]", "appointmentPrompt", "appointments/callGuidance fallback");
       return applyGreetingPlaceholders(text || "Sure, when would be a better time?", callData, kb);
     };
 
@@ -1515,13 +1536,16 @@ async function startServer() {
       const greetingText = buildInitialGreeting(callData, kb);
       console.log("[GREETING SOURCE]", getCallGuidance(kb)?.greeting ? "kb" : "fallback");
       console.log("[GREETING FINAL]", greetingText);
-      conversationStage = "greeting_sent";
+      conversationStage = "greeting";
       console.log("[STAGE FLOW]", conversationStage);
       const greetingAudio = await fetchTtsAudio(greetingText, ownerId);
       if (isEnded()) return;
 
       if (greetingAudio) {
         await sendVobizAudio(ws, greetingAudio);
+        greetingDelivered = true;
+        conversationStage = "availability";
+        console.log("[STAGE FLOW]", conversationStage);
       } else {
         console.error("[Vobiz Greeting] TTS failed");
       }
@@ -1562,7 +1586,7 @@ async function startServer() {
     };
 
     const processListeningAudio = async (audioBuffer: Buffer) => {
-      if (conversationStage === "completed") {
+      if (conversationStage === "ended") {
         if (!callCompletedLogged) {
           console.log("[CALL COMPLETED] no further processing");
           callCompletedLogged = true;
@@ -1628,7 +1652,7 @@ async function startServer() {
         const wordCount = normalizeTurnText(transcript).split(" ").filter(Boolean).length;
         const detectedIntent = detectIntent(transcript);
         const isOpeningHello =
-          (conversationStage === "greeting_sent" || conversationStage === "awaiting_availability" || conversationStage === "awaiting_permission") &&
+          (conversationStage === "availability" || conversationStage === "permission" || conversationStage === "hook") &&
           normalizeTurnText(transcript) === "hello";
         console.log("[CONVERSATION STAGE]", conversationStage);
         console.log("[INTENT DETECTED]", detectedIntent);
@@ -1653,15 +1677,17 @@ async function startServer() {
         let shouldTrimReply = true;
         let replyMaxWords = 10;
 
-        if (conversationStage === "completed") {
+        const pendingStage = conversationStage;
+
+        if (conversationStage === "ended") {
           reply = "";
           shouldTrimReply = false;
-        } else if (conversationStage === "scheduling") {
+        } else if (conversationStage === "appointment") {
           console.log("[STAGE GUARD] scheduling only");
           const normalizedTime = extractCallbackTime(transcript);
           if (normalizedTime) {
             savedCallbackTime = normalizedTime;
-            conversationStage = "completed";
+            conversationStage = "closing";
             console.log("[STAGE FLOW]", conversationStage);
             reply = `Got it, I'll arrange a callback at ${normalizedTime}. ${buildClosingLine(callData, kb)}`;
             shouldTrimReply = false;
@@ -1692,52 +1718,47 @@ async function startServer() {
               shouldTrimReply = false;
             }
           }
-        } else if (conversationStage === "greeting_sent" && isOpeningHello) {
-          reply = buildInitialGreeting(callData, kb);
-          console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "greeting_sent" && isIdentityConfirmed(transcript)) {
+        } else if (conversationStage === "availability" && (isOpeningHello || isIdentityConfirmed(transcript))) {
           reply = buildAvailabilityQuestion(callData, kb);
-          conversationStage = "awaiting_availability";
+          conversationStage = "permission";
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "awaiting_availability" && isAvailabilityPositive(transcript)) {
+        } else if (conversationStage === "permission" && isAvailabilityPositive(transcript)) {
           reply = buildPermissionQuestion(callData, kb);
-          conversationStage = "awaiting_permission";
+          conversationStage = "hook";
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "awaiting_availability" && (isAvailabilityNegative(transcript) || isBusyOrCallLater(transcript))) {
+        } else if (conversationStage === "permission" && (isAvailabilityNegative(transcript) || isBusyOrCallLater(transcript))) {
           reply = buildSchedulingQuestion(callData, kb);
-          conversationStage = "scheduling";
+          conversationStage = "appointment";
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (isBusyOrCallLater(transcript)) {
           reply = buildSchedulingQuestion(callData, kb);
-          conversationStage = "scheduling";
+          conversationStage = "appointment";
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "awaiting_permission" && isOpeningHello) {
+        } else if (conversationStage === "hook" && isOpeningHello) {
           reply = buildPermissionQuestion(callData, kb);
           console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "awaiting_permission" && isPermissionPositive(transcript)) {
+        } else if (conversationStage === "hook" && isPermissionPositive(transcript)) {
           reply = applyGreetingPlaceholders(getOpeningHook(kb), callData, kb);
-          conversationStage = "hook_given";
+          conversationStage = "pitch";
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "awaiting_permission" && isPermissionNegative(transcript)) {
+        } else if (conversationStage === "hook" && isPermissionNegative(transcript)) {
           reply = buildClosingLine(callData, kb);
-          conversationStage = "completed";
+          conversationStage = "closing";
           console.log("[STAGE FLOW]", conversationStage);
           shouldTrimReply = false;
           console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "hook_given" && isPositiveResponse(transcript)) {
+        } else if (conversationStage === "pitch" && isPositiveResponse(transcript)) {
           const pitch = applyGreetingPlaceholders(getMainPitch(kb), callData, kb);
           reply = pitch;
-          conversationStage = "pitch_given";
-          console.log("[STAGE FLOW]", conversationStage);
-          console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "pitch_given" && isPositiveResponse(transcript)) {
           conversationStage = "qualification";
           console.log("[STAGE FLOW]", conversationStage);
+          console.log("[DETERMINISTIC REPLY]", reply);
+        } else if (conversationStage === "qualification" && isPositiveResponse(transcript)) {
           const qualificationQuestion = applyGreetingPlaceholders(getFirstQualificationQuestion(kb), callData, kb);
           reply = qualificationQuestion;
           console.log("[DETERMINISTIC REPLY]", reply);
@@ -1758,6 +1779,9 @@ async function startServer() {
             detectedIntent,
             maxWords: getMaxWordsForStage(),
           });
+          reply = sanitizeAiReplyForStage(reply, applyGreetingPlaceholders(getFirstQualificationQuestion(kb), callData, kb));
+          conversationStage = pendingStage;
+          console.log("[STAGE FLOW]", conversationStage);
         } else {
           if (lowConfidenceWithoutTime) {
             console.log("[TURN HELD] low confidence", transcript, confidence);
@@ -1775,13 +1799,18 @@ async function startServer() {
             detectedIntent,
             maxWords: getMaxWordsForStage(),
           });
+          reply = sanitizeAiReplyForStage(reply, buildAvailabilityQuestion(callData, kb));
+          conversationStage = pendingStage;
+          console.log("[STAGE FLOW]", conversationStage);
         }
 
         if (
-          conversationStage !== "completed" &&
+          conversationStage !== "ended" &&
+          conversationStage !== "closing" &&
+          conversationStage !== "appointment" &&
           (detectedIntent === "scheduling" || /\b(callback|call back|schedule|time)\b/i.test(reply))
         ) {
-          conversationStage = "scheduling";
+          conversationStage = "appointment";
           console.log("[STAGE FLOW]", conversationStage);
         }
 
@@ -1834,8 +1863,10 @@ async function startServer() {
         console.log("[Vobiz State] SPEAKING reply");
         await sendVobizAudio(ws, replyAudio);
         mediaBuffers = [];
-        if (conversationStage === "completed") {
+        if (conversationStage === "closing" || conversationStage === "ended") {
           console.log("[CALL ENDING AFTER COMPLETION]");
+          conversationStage = "ended";
+          console.log("[STAGE FLOW]", conversationStage);
           state = "ENDING";
           if (ws.readyState === 1) ws.close();
           endCall();
@@ -1933,7 +1964,7 @@ async function startServer() {
         return;
       }
 
-      if (conversationStage === "completed" || state === "ENDING") {
+      if (conversationStage === "ended" || conversationStage === "closing" || state === "ENDING") {
         if (!callCompletedLogged) {
           console.log("[CALL COMPLETED] no further processing");
           callCompletedLogged = true;
