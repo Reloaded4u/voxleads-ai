@@ -1173,7 +1173,7 @@ async function startServer() {
     let lastAiReply = "";
     let heldTranscript = "";
     let turnInProgress = false;
-    let conversationStage: "opening" | "pitch_given" | "scheduling" | "completed" = "opening";
+    let conversationStage: "greeting_sent" | "awaiting_permission" | "hook_given" | "pitch_given" | "qualification" | "scheduling" | "completed" = "greeting_sent";
     const conversationHistory: Array<{ role: string; text: string }> = [];
     const STT_WINDOW_FRAMES = 60; // 1.2 seconds at 20ms/frame
     const NON_ACTIONABLE = new Set([
@@ -1227,7 +1227,7 @@ async function startServer() {
         result = candidate;
       }
 
-      return result || reply;
+      return result || words.slice(0, maxWords).join(" ") + ".";
     };
 
     const detectIntent = (text: string) => {
@@ -1236,6 +1236,50 @@ async function startServer() {
       if (t.includes("time") || t.includes("schedule")) return "scheduling";
       if (t.includes("yes") || t.includes("ok")) return "confirmation";
       return "general";
+    };
+
+    const isPermissionPositive = (text: string) => /\b(yes|okay|ok|go ahead|sure|continue)\b/i.test(text);
+    const isPermissionNegative = (text: string) => /\b(no|not interested)\b/i.test(text);
+    const isBusyOrCallLater = (text: string) => /\b(busy|call later|not now|later|meeting|driving)\b/i.test(text);
+    const isPositiveResponse = (text: string) => /\b(yes|okay|ok|sure|interested|go ahead|continue|please)\b/i.test(text);
+
+    const firstText = (...values: any[]) => {
+      for (const value of values) {
+        if (typeof value === "string" && value.trim()) return value.trim();
+        if (Array.isArray(value)) {
+          const first = value.find((item) => typeof item === "string" && item.trim());
+          if (first) return first.trim();
+          const objectText = value.find((item) => item && typeof item === "object" && typeof (item.question || item.text || item.value) === "string");
+          if (objectText) return String(objectText.question || objectText.text || objectText.value).trim();
+        }
+      }
+      return "";
+    };
+
+    const getCallGuidance = (kb: any) => kb?.callGuidance || kb?.guidance || {};
+    const getOpeningHook = (kb: any) => {
+      const guidance = getCallGuidance(kb);
+      return firstText(
+        guidance.openingLine,
+        guidance.hook,
+        guidance.openingHook,
+        guidance.permissionHook,
+        guidance.introduction,
+        "May I take 30 seconds to explain?"
+      );
+    };
+    const getMainPitch = (kb: any) => {
+      const guidance = getCallGuidance(kb);
+      return firstText(guidance.mainPitch, guidance.pitch, guidance.valueProposition, guidance.offer);
+    };
+    const getFirstQualificationQuestion = (kb: any) => {
+      const guidance = getCallGuidance(kb);
+      return firstText(
+        guidance.qualificationQuestions,
+        guidance.qualifyingQuestions,
+        guidance.questions,
+        guidance.firstQuestion
+      );
     };
 
     const isIncompletePhrase = (text: string) => {
@@ -1268,7 +1312,7 @@ async function startServer() {
       "the business";
 
     const isOpeningCheckIn = (text: string) => {
-      if (conversationStage !== "opening") return false;
+      if (conversationStage !== "awaiting_permission") return false;
       return (
         text === "hello" ||
         text.includes("is this") ||
@@ -1426,13 +1470,15 @@ async function startServer() {
       }
 
       const { callData, kb } = await loadCallContext();
+      const guidance = getCallGuidance(kb);
       const greetingTemplate =
-        kb?.callGuidance?.greeting ||
-        kb?.guidance?.greeting ||
+        guidance.greeting ||
         "Hello, this is an AI assistant calling on behalf of the business.";
       const greetingText = applyGreetingPlaceholders(greetingTemplate, callData, kb);
-      console.log("[GREETING SOURCE]", (kb?.callGuidance?.greeting || kb?.guidance?.greeting) ? "kb" : "fallback");
+      console.log("[GREETING SOURCE]", guidance.greeting ? "kb" : "fallback");
       console.log("[GREETING FINAL]", greetingText);
+      conversationStage = "awaiting_permission";
+      console.log("[STAGE FLOW]", conversationStage);
       const greetingAudio = await fetchTtsAudio(greetingText, ownerId);
       if (isEnded()) return;
 
@@ -1478,7 +1524,7 @@ async function startServer() {
     };
 
     const processListeningAudio = async (audioBuffer: Buffer) => {
-      if (state !== "LISTENING" || isEnded()) return;
+      if (state !== "LISTENING" || isEnded() || conversationStage === "completed") return;
 
       const vadScore = getVadScore(audioBuffer);
       const vadWindow = analyzeMulawWindow(audioBuffer);
@@ -1518,20 +1564,20 @@ async function startServer() {
         }
 
         const normalizedTranscript = normalizeTurnText(transcript);
-        if (isIncompletePhrase(normalizedTranscript)) {
+        if (isIncompletePhrase(normalizeTurnText(transcript))) {
           heldTranscript = transcript;
           console.log("[TURN HELD] incomplete phrase");
           state = "LISTENING";
           return;
         }
 
-        const wordCount = normalizedTranscript.split(" ").filter(Boolean).length;
-        const detectedIntent = detectIntent(normalizedTranscript);
-        const isOpeningHello = conversationStage === "opening" && normalizedTranscript === "hello";
+        const wordCount = normalizeTurnText(transcript).split(" ").filter(Boolean).length;
+        const detectedIntent = detectIntent(transcript);
+        const isOpeningHello = conversationStage === "awaiting_permission" && normalizeTurnText(transcript) === "hello";
         console.log("[CONVERSATION STAGE]", conversationStage);
         console.log("[INTENT DETECTED]", detectedIntent);
 
-        if (wordCount < 2 && NON_ACTIONABLE.has(normalizedTranscript) && !isOpeningHello) {
+        if (wordCount < 2 && ["hmm", "uh", "um"].includes(normalizeTurnText(transcript))) {
           console.log("[TURN BLOCKED]", transcript);
           state = "LISTENING";
           return;
@@ -1553,17 +1599,46 @@ async function startServer() {
         if (conversationStage === "completed") {
           reply = "";
           shouldTrimReply = false;
-        } else if (isOpeningHello) {
-          reply = "Yes, I'm here. May I quickly explain?";
-          conversationStage = "pitch_given";
-          shouldTrimReply = false;
+        } else if (isBusyOrCallLater(transcript)) {
+          reply = "Sure, no problem. When would be a better time to call you?";
+          conversationStage = "scheduling";
+          console.log("[STAGE FLOW]", conversationStage);
+          console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "scheduling" && extractCallbackTime(transcript)) {
           const normalizedTime = extractCallbackTime(transcript);
           savedCallbackTime = normalizedTime;
           conversationStage = "completed";
-          reply = buildAppointmentConfirmation(kb, normalizedTime);
+          console.log("[STAGE FLOW]", conversationStage);
+          reply = `Got it, I'll arrange a callback at ${normalizedTime}.`;
           shouldTrimReply = false;
           console.log("[SCHEDULING TIME DETECTED]", transcript, normalizedTime);
+          console.log("[DETERMINISTIC REPLY]", reply);
+        } else if (conversationStage === "awaiting_permission" && isOpeningHello) {
+          reply = "Yes, I'm here. May I quickly explain?";
+          console.log("[DETERMINISTIC REPLY]", reply);
+        } else if (conversationStage === "awaiting_permission" && isPermissionPositive(transcript)) {
+          reply = applyGreetingPlaceholders(getOpeningHook(kb), callData, kb);
+          conversationStage = "hook_given";
+          console.log("[STAGE FLOW]", conversationStage);
+          console.log("[DETERMINISTIC REPLY]", reply);
+        } else if (conversationStage === "awaiting_permission" && isPermissionNegative(transcript)) {
+          reply = "No problem, thank you for your time.";
+          conversationStage = "completed";
+          console.log("[STAGE FLOW]", conversationStage);
+          shouldTrimReply = false;
+          console.log("[DETERMINISTIC REPLY]", reply);
+        } else if (conversationStage === "hook_given" && isPositiveResponse(transcript)) {
+          const pitch = applyGreetingPlaceholders(getMainPitch(kb), callData, kb);
+          reply = pitch || "I can share the key details briefly.";
+          conversationStage = "pitch_given";
+          console.log("[STAGE FLOW]", conversationStage);
+          console.log("[DETERMINISTIC REPLY]", reply);
+        } else if (conversationStage === "pitch_given") {
+          const qualificationQuestion = applyGreetingPlaceholders(getFirstQualificationQuestion(kb), callData, kb);
+          reply = qualificationQuestion || "May I ask what you are looking for?";
+          conversationStage = "qualification";
+          console.log("[STAGE FLOW]", conversationStage);
+          console.log("[DETERMINISTIC REPLY]", reply);
         } else {
           console.log("[GEMINI INPUT]", transcript);
           reply = await generateGeminiReply({
@@ -1582,8 +1657,8 @@ async function startServer() {
           (detectedIntent === "scheduling" || /\b(callback|call back|schedule|time)\b/i.test(reply))
         ) {
           conversationStage = "scheduling";
+          console.log("[STAGE FLOW]", conversationStage);
         }
-        if (conversationStage === "opening" && reply) conversationStage = "pitch_given";
 
         if (!reply || reply.trim().length === 0) {
           console.log("[GEMINI OUTPUT]", "");
