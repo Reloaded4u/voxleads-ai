@@ -133,34 +133,47 @@ async function generateAiResponse(
 ) {
   const apiKey = process.env.GEMINI_API_KEY;
   const t = userSpeech.toLowerCase();
-  const pricingFallback = "Pricing depends on unit type. Want exact details?";
-  const isPricingQuestion = /(price|pricing|cost|rate)/.test(t);
+  const detailFallback = "I can arrange a callback for exact details.";
+  const needsSpecificDetails = /(price|pricing|cost|rate|detail|details|plan|service|product|offer)/.test(t);
 
-  if (!apiKey) return isPricingQuestion ? pricingFallback : "";
+  if (!apiKey) return needsSpecificDetails ? detailFallback : "";
 
-  const truncatedKB = (kb?.guidance?.mainPitch || "").slice(0, 200);
+  const truncatedKB = JSON.stringify({
+    profile: kb?.profile || {},
+    guidance: kb?.guidance || {},
+    faqs: kb?.faqs || [],
+    objections: kb?.objections || [],
+  }).slice(0, 1200);
   const historyText = (options.conversationHistory || [])
     .slice(-8)
     .map((item) => `${item.role}: ${item.text}`)
     .join("\n");
 
-  const context = `You are a real estate calling assistant.
+  const context = `You are a business calling assistant.
 
 Rules:
+- KB is the ONLY source of business context
+- Do not assume the industry, product, service, pricing model, or offer
+- Infer answers only from KB and the conversation so far
 - Answer the caller's latest question directly
 - Keep replies short and natural
 - Never read KB text directly
-- KB is background knowledge only
-- Max words depend on conversation stage
+- Never dump or summarize full KB
 - Ask one follow-up question when needed
 - Do not repeat the opening pitch
 - If info is missing, say: 'I can arrange a callback for exact details'
+
+Conversation Stage:
+${options.conversationStage || "opening"}
+
+Detected Intent:
+${options.detectedIntent || "general"}
 
 Conversation so far:
 ${historyText || "No previous turns."}
 
 Knowledge Base (reference only):
-${truncatedKB || "No KB pitch available."}
+${truncatedKB || "No KB available."}
 
 User said:
 ${userSpeech}
@@ -181,11 +194,11 @@ Reply:`;
     console.log("[GEMINI RAW]", JSON.stringify(data));
     if (!response.ok || data?.error) {
       console.error("[GEMINI ERROR]", JSON.stringify(data?.error || data));
-      return isPricingQuestion ? pricingFallback : "";
+      return needsSpecificDetails ? detailFallback : "";
     }
 
     let reply = (data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
-    if (!reply && isPricingQuestion) reply = pricingFallback;
+    if (!reply && needsSpecificDetails) reply = detailFallback;
 
     const maxWords = options.maxWords || 12;
     if (reply.split(/\s+/).filter(Boolean).length > maxWords) {
@@ -196,7 +209,7 @@ Reply:`;
     return reply;
   } catch (error) {
     console.error("[GEMINI ERROR]", error);
-    return isPricingQuestion ? pricingFallback : "";
+    return needsSpecificDetails ? detailFallback : "";
   }
 }
 
@@ -1108,7 +1121,7 @@ async function startServer() {
     let lastTranscript = "";
     let lastAiReply = "";
     let turnInProgress = false;
-    let conversationStage: "opening" | "pitch_given" | "pricing_discussed" | "scheduling" | "completed" = "opening";
+    let conversationStage: "opening" | "pitch_given" | "scheduling" | "completed" = "opening";
     const conversationHistory: Array<{ role: string; text: string }> = [];
     const STT_WINDOW_FRAMES = 60; // 1.2 seconds at 20ms/frame
     const NON_ACTIONABLE_UTTERANCES = new Set([
@@ -1125,15 +1138,6 @@ async function startServer() {
       "price",
       "details",
     ]);
-
-    const PERMISSION_INTENTS = [
-      "please go ahead",
-      "go ahead",
-      "please share",
-      "share now",
-      "continue",
-      "yes please",
-    ];
 
     let savedCallbackTime = "";
 
@@ -1170,7 +1174,6 @@ async function startServer() {
     const getMaxWordsForStage = () => {
       if (conversationStage === "opening") return 15;
       if (conversationStage === "pitch_given") return 12;
-      if (conversationStage === "pricing_discussed") return 12;
       if (conversationStage === "scheduling") return 8;
       if (conversationStage === "completed") return 6;
       return 12;
@@ -1183,18 +1186,13 @@ async function startServer() {
     };
 
     const detectIntent = (text: string) => {
-      if (conversationStage === "scheduling" && extractCallbackTime(text)) return "time_given";
-      if (/(price|pricing|cost|rate)/.test(text)) return "pricing";
-      if (/\b(yes|yeah|ok|okay|sure)\b/.test(text) && conversationStage === "scheduling") return "scheduling_yes";
-      if (PERMISSION_INTENTS.some((p) => text.includes(p))) return "permission";
-      if (/(call me|callback|meeting|schedule|appointment)/.test(text)) return "scheduling";
+      const t = text.toLowerCase().trim();
+      if (conversationStage === "scheduling" && extractCallbackTime(t)) return "time_given";
+      if (["go ahead", "yes", "continue", "please share"].some((p) => t.includes(p))) return "permission";
+      if (["price", "cost", "pricing", "rate"].some((p) => t.includes(p))) return "question_pricing";
+      if (["when", "time", "schedule", "meeting", "call"].some((p) => t.includes(p))) return "scheduling";
+      if (["yes", "okay", "sure"].includes(t)) return "confirmation";
       return "general";
-    };
-
-    const buildShortPitch = (kb: any) => {
-      const businessName = kb?.profile?.name || "We";
-      const pitch = (kb?.guidance?.mainPitch || "premium real estate options").slice(0, 120);
-      return trimReplyForStage(`${businessName} offers ${pitch}`);
     };
 
     console.log("[Vobiz State] GREETING");
@@ -1360,7 +1358,7 @@ async function startServer() {
         const confidence = typeof stt.confidence === "number" ? stt.confidence : 0;
         const hasActionableIntent = ACTIONABLE_UTTERANCES.has(normalizedTranscript);
         const detectedIntent = detectIntent(normalizedTranscript);
-        const hasConversationIntent = ["scheduling_yes", "time_given", "scheduling", "pricing"].includes(detectedIntent);
+        const hasConversationIntent = ["permission", "confirmation", "time_given", "scheduling", "question_pricing"].includes(detectedIntent);
         const minimumConfidence = conversationStage === "scheduling" ? 0.35 : 0.85;
         console.log("[CONVERSATION STAGE]", conversationStage);
         console.log("[INTENT DETECTED]", transcript);
@@ -1429,19 +1427,15 @@ async function startServer() {
           const normalizedTime = extractCallbackTime(transcript);
           savedCallbackTime = normalizedTime;
           conversationStage = "completed";
-          reply = `Confirmed, I'll arrange a callback at ${normalizedTime} today.`;
+          reply = `Confirmed, I'll arrange a callback at ${normalizedTime}.`;
           shouldTrimReply = false;
           console.log("[SCHEDULING TIME DETECTED]", transcript, normalizedTime);
-        } else if (detectedIntent === "permission" && conversationStage === "opening") {
-          console.log("[GEMINI ROUTE] permission intent");
-          reply = buildShortPitch(kb);
-          conversationStage = "pitch_given";
-        } else if (detectedIntent === "permission" && conversationStage === "scheduling") {
+        } else if ((detectedIntent === "permission" || detectedIntent === "confirmation") && conversationStage === "scheduling") {
           reply = "Sure, what time works best?";
-        } else if (detectedIntent === "scheduling_yes") {
-          reply = "Sure, what time works best?";
-          conversationStage = "scheduling";
         } else {
+          if (detectedIntent === "permission" && conversationStage === "opening") {
+            console.log("[GEMINI ROUTE] permission intent");
+          }
           console.log("[GEMINI INPUT]", transcript);
           reply = await generateGeminiReply({
             transcript,
@@ -1454,7 +1448,6 @@ async function startServer() {
           });
         }
 
-        if (detectedIntent === "pricing" && conversationStage !== "completed") conversationStage = "pricing_discussed";
         if ((detectedIntent === "scheduling" || reply.toLowerCase().includes("callback")) && conversationStage !== "completed") conversationStage = "scheduling";
         if (conversationStage === "opening" && reply) conversationStage = "pitch_given";
 
