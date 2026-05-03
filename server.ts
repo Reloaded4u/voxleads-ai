@@ -1165,7 +1165,7 @@ async function startServer() {
     console.log(`[WS OPEN] callId=${callId} ownerId=${ownerId}`);
     void ensureVobizRecordingStarted(callId, ownerId);
 
-    type CallState = "GREETING" | "SPEAKING" | "COOLDOWN" | "LISTENING" | "PROCESSING" | "ENDED";
+    type CallState = "GREETING" | "SPEAKING" | "COOLDOWN" | "LISTENING" | "PROCESSING" | "ENDING" | "ENDED";
 
     let state: CallState = "GREETING";
     let mediaBuffers: Buffer[] = [];
@@ -1173,6 +1173,7 @@ async function startServer() {
     let lastAiReply = "";
     let heldTranscript = "";
     let turnInProgress = false;
+    let callCompletedLogged = false;
     let conversationStage: "greeting_sent" | "awaiting_availability" | "awaiting_permission" | "hook_given" | "pitch_given" | "qualification" | "scheduling" | "completed" = "greeting_sent";
     const conversationHistory: Array<{ role: string; text: string }> = [];
     const STT_WINDOW_FRAMES = 60; // 1.2 seconds at 20ms/frame
@@ -1260,30 +1261,21 @@ async function startServer() {
     };
 
     const getCallGuidance = (kb: any) => kb?.callGuidance || kb?.guidance || {};
-    const getOpeningHook = (kb: any) => {
+    const getScriptField = (kb: any, field: string, fallback: string) => {
       const guidance = getCallGuidance(kb);
-      return firstText(
-        guidance.openingLine,
-        guidance.hook,
-        guidance.openingHook,
-        guidance.permissionHook,
-        guidance.introduction,
-        "May I take 30 seconds to explain?"
-      );
+      const value = guidance?.[field];
+      const text = firstText(value);
+      console.log("[KB SCRIPT FIELD USED]", field, text ? "kb" : "fallback");
+      return text || fallback;
     };
-    const getMainPitch = (kb: any) => {
-      const guidance = getCallGuidance(kb);
-      return firstText(guidance.mainPitch, guidance.pitch, guidance.valueProposition, guidance.offer);
-    };
-    const getFirstQualificationQuestion = (kb: any) => {
-      const guidance = getCallGuidance(kb);
-      return firstText(
-        guidance.qualificationQuestions,
-        guidance.qualifyingQuestions,
-        guidance.questions,
-        guidance.firstQuestion
-      );
-    };
+    const getOpeningHook = (kb: any) =>
+      getScriptField(kb, "openingLine", "May I take 30 seconds to explain?");
+
+    const getMainPitch = (kb: any) =>
+      getScriptField(kb, "mainPitch", "I can share the key details briefly.");
+
+    const getFirstQualificationQuestion = (kb: any) =>
+      getScriptField(kb, "qualificationQuestions", "May I ask what you are looking for?");
 
     const isIncompletePhrase = (text: string) => {
       const words = text.toLowerCase().trim().split(/\s+/).filter(Boolean);
@@ -1354,11 +1346,35 @@ async function startServer() {
         .trim();
     };
 
-    const buildInitialGreeting = (callData: any) => {
-      const leadName = String(getLeadName(callData) || "").trim();
-      const leadValue = leadName && leadName.toLowerCase() !== "unknown lead" ? leadName : "you";
-      return `Hello, am I speaking to ${leadValue}?`;
+    const buildInitialGreeting = (callData: any, kb: any) => {
+      const greeting = getScriptField(kb, "greeting", "Hello, am I speaking to [Lead Name]?");
+      return applyGreetingPlaceholders(greeting, callData, kb);
     };
+
+    const buildAvailabilityQuestion = (callData: any, kb: any) =>
+      applyGreetingPlaceholders(getScriptField(kb, "availabilityQuestion", "Is this a good time for a quick call?"), callData, kb);
+
+    const buildPermissionQuestion = (callData: any, kb: any) =>
+      applyGreetingPlaceholders(getScriptField(kb, "permissionQuestion", "May I quickly explain?"), callData, kb);
+
+    const buildSchedulingQuestion = (callData: any, kb: any) => {
+      const guidance = getCallGuidance(kb);
+      const appointments = kb?.appointments || {};
+      const text = firstText(
+        appointments.betterTimeQuestion,
+        appointments.schedulingQuestion,
+        appointments.callbackQuestion,
+        appointments.rescheduleQuestion,
+        appointments.callLaterQuestion,
+        guidance.schedulingQuestion,
+        guidance.callbackQuestion
+      );
+      console.log("[KB SCRIPT FIELD USED]", "schedulingQuestion", text ? "kb" : "fallback");
+      return applyGreetingPlaceholders(text || "Sure, when would be a better time?", callData, kb);
+    };
+
+    const buildClosingLine = (callData: any, kb: any) =>
+      applyGreetingPlaceholders(getScriptField(kb, "closingLine", "Thank you for your time. Have a great day."), callData, kb);
 
     console.log("[Vobiz State] GREETING");
 
@@ -1478,9 +1494,9 @@ async function startServer() {
         return;
       }
 
-      const { callData } = await loadCallContext();
-      const greetingText = buildInitialGreeting(callData);
-      console.log("[GREETING SOURCE]", "deterministic");
+      const { callData, kb } = await loadCallContext();
+      const greetingText = buildInitialGreeting(callData, kb);
+      console.log("[GREETING SOURCE]", getCallGuidance(kb)?.greeting ? "kb" : "fallback");
       console.log("[GREETING FINAL]", greetingText);
       conversationStage = "greeting_sent";
       console.log("[STAGE FLOW]", conversationStage);
@@ -1529,7 +1545,14 @@ async function startServer() {
     };
 
     const processListeningAudio = async (audioBuffer: Buffer) => {
-      if (state !== "LISTENING" || isEnded() || conversationStage === "completed") return;
+      if (conversationStage === "completed") {
+        if (!callCompletedLogged) {
+          console.log("[CALL COMPLETED] no further processing");
+          callCompletedLogged = true;
+        }
+        return;
+      }
+      if (state !== "LISTENING" || isEnded()) return;
 
       const vadScore = getVadScore(audioBuffer);
       const vadWindow = analyzeMulawWindow(audioBuffer);
@@ -1607,25 +1630,25 @@ async function startServer() {
           reply = "";
           shouldTrimReply = false;
         } else if (conversationStage === "greeting_sent" && isOpeningHello) {
-          reply = buildInitialGreeting(callData);
+          reply = buildInitialGreeting(callData, kb);
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "greeting_sent" && isIdentityConfirmed(transcript)) {
-          reply = "Is this a good time for a quick 30-second call?";
+          reply = buildAvailabilityQuestion(callData, kb);
           conversationStage = "awaiting_availability";
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "awaiting_availability" && isAvailabilityPositive(transcript)) {
-          reply = "Great, may I quickly explain?";
+          reply = buildPermissionQuestion(callData, kb);
           conversationStage = "awaiting_permission";
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "awaiting_availability" && (isAvailabilityNegative(transcript) || isBusyOrCallLater(transcript))) {
-          reply = "Sure, when would be a better time?";
+          reply = buildSchedulingQuestion(callData, kb);
           conversationStage = "scheduling";
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (isBusyOrCallLater(transcript)) {
-          reply = "Sure, no problem. When would be a better time to call you?";
+          reply = buildSchedulingQuestion(callData, kb);
           conversationStage = "scheduling";
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
@@ -1634,12 +1657,12 @@ async function startServer() {
           savedCallbackTime = normalizedTime;
           conversationStage = "completed";
           console.log("[STAGE FLOW]", conversationStage);
-          reply = `Got it, I'll arrange a callback at ${normalizedTime}.`;
+          reply = `Got it, I'll arrange a callback at ${normalizedTime}. ${buildClosingLine(callData, kb)}`;
           shouldTrimReply = false;
           console.log("[SCHEDULING TIME DETECTED]", transcript, normalizedTime);
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "awaiting_permission" && isOpeningHello) {
-          reply = "Yes, I'm here. May I quickly explain?";
+          reply = buildPermissionQuestion(callData, kb);
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "awaiting_permission" && isPermissionPositive(transcript)) {
           reply = applyGreetingPlaceholders(getOpeningHook(kb), callData, kb);
@@ -1647,20 +1670,20 @@ async function startServer() {
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "awaiting_permission" && isPermissionNegative(transcript)) {
-          reply = "No problem, thank you for your time.";
+          reply = buildClosingLine(callData, kb);
           conversationStage = "completed";
           console.log("[STAGE FLOW]", conversationStage);
           shouldTrimReply = false;
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "hook_given" && isPositiveResponse(transcript)) {
           const pitch = applyGreetingPlaceholders(getMainPitch(kb), callData, kb);
-          reply = pitch || "I can share the key details briefly.";
+          reply = pitch;
           conversationStage = "pitch_given";
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "pitch_given") {
           const qualificationQuestion = applyGreetingPlaceholders(getFirstQualificationQuestion(kb), callData, kb);
-          reply = qualificationQuestion || "May I ask what you are looking for?";
+          reply = qualificationQuestion;
           conversationStage = "qualification";
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
@@ -1732,6 +1755,13 @@ async function startServer() {
         console.log("[Vobiz State] SPEAKING reply");
         await sendVobizAudio(ws, replyAudio);
         mediaBuffers = [];
+        if (conversationStage === "completed") {
+          console.log("[CALL ENDING AFTER COMPLETION]");
+          state = "ENDING";
+          if (ws.readyState === 1) ws.close();
+          endCall();
+          return;
+        }
         await enterCooldownThenListen();
       } catch (err) {
         console.error("[Vobiz Turn] Error:", err);
@@ -1821,6 +1851,14 @@ async function startServer() {
 
       if (state === "GREETING") {
         await handleGreeting();
+        return;
+      }
+
+      if (conversationStage === "completed" || state === "ENDING") {
+        if (!callCompletedLogged) {
+          console.log("[CALL COMPLETED] no further processing");
+          callCompletedLogged = true;
+        }
         return;
       }
 
