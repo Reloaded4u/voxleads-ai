@@ -1227,6 +1227,24 @@ async function startServer() {
       return `Confirmed, I'll arrange a callback at ${callbackTime}.`;
     };
 
+    const getKbBusinessName = (kb: any) =>
+      kb?.businessProfile?.name ||
+      kb?.businessProfile?.businessName ||
+      kb?.businessProfile?.companyName ||
+      kb?.profile?.name ||
+      "the business";
+
+    const isOpeningCheckIn = (text: string) => {
+      if (conversationStage !== "opening") return false;
+      return (
+        text === "hello" ||
+        text.includes("is this") ||
+        text.includes("are you there") ||
+        text.includes("can you hear me") ||
+        text.includes("who is this")
+      );
+    };
+
     console.log("[Vobiz State] GREETING");
 
     const isEnded = () => state === "ENDED";
@@ -1314,7 +1332,12 @@ async function startServer() {
         return;
       }
 
-      const greetingText = "Hello, this is VoxLeads AI calling. May I speak with you for a moment?";
+      const { kb } = await loadCallContext();
+      const greetingText =
+        kb?.callGuidance?.greeting ||
+        kb?.guidance?.greeting ||
+        "Hello, this is an AI assistant calling on behalf of the business.";
+      console.log("[GREETING SOURCE]", (kb?.callGuidance?.greeting || kb?.guidance?.greeting) ? "kb" : "fallback");
       const greetingAudio = await fetchTtsAudio(greetingText, ownerId);
       if (isEnded()) return;
 
@@ -1368,6 +1391,7 @@ async function startServer() {
       }
 
       turnInProgress = true;
+      console.log("[TURN LOCK] acquired");
 
       try {
         console.log("[Vobiz VAD] score=", getVadScore(audioBuffer));
@@ -1391,19 +1415,20 @@ async function startServer() {
         const hasActionableIntent = ACTIONABLE_UTTERANCES.has(normalizedTranscript);
         const detectedIntent = detectIntent(normalizedTranscript);
         const hasConversationIntent = ["permission", "confirmation", "time_given", "scheduling", "question_pricing"].includes(detectedIntent);
+        const isOpeningCheckInTurn = isOpeningCheckIn(normalizedTranscript);
         const minimumConfidence = conversationStage === "scheduling" ? 0.35 : 0.85;
         console.log("[CONVERSATION STAGE]", conversationStage);
         console.log("[INTENT DETECTED]", transcript);
 
-        if (NON_ACTIONABLE_UTTERANCES.has(normalizedTranscript)) {
+        if (NON_ACTIONABLE_UTTERANCES.has(normalizedTranscript) && !isOpeningCheckInTurn) {
           console.log("[TURN BLOCKED] non-actionable/low-confidence transcript:", transcript);
           state = "LISTENING";
           return;
         }
 
-        if (hasActionableIntent || hasConversationIntent) {
+        if (hasActionableIntent || hasConversationIntent || isOpeningCheckInTurn) {
           const requiredConfidence = conversationStage === "scheduling" ? 0.35 : 0.70;
-          if (confidence < requiredConfidence) {
+          if (!isOpeningCheckInTurn && confidence < requiredConfidence) {
             console.log("[TURN BLOCKED] non-actionable/low-confidence transcript:", transcript);
             state = "LISTENING";
             return;
@@ -1415,13 +1440,13 @@ async function startServer() {
           return;
         }
 
-        if (detectedIntent !== "time_given" && !isValidTranscript(transcript)) {
+        if (!isOpeningCheckInTurn && detectedIntent !== "time_given" && !isValidTranscript(transcript)) {
           console.log("[TURN BLOCKED] invalid transcript:", transcript);
           state = "LISTENING";
           return;
         }
 
-        if (detectedIntent !== "time_given" && (!normalizedTranscript || normalizedTranscript.length < 4)) {
+        if (!isOpeningCheckInTurn && detectedIntent !== "time_given" && (!normalizedTranscript || normalizedTranscript.length < 4)) {
           console.log("[TURN BLOCKED] invalid transcript:", transcript);
           state = "LISTENING";
           return;
@@ -1454,6 +1479,10 @@ async function startServer() {
 
         if (conversationStage === "completed") {
           reply = "Thanks, our team will follow up as scheduled.";
+          shouldTrimReply = false;
+        } else if (isOpeningCheckInTurn) {
+          reply = `Yes, I'm here. I'm calling from ${getKbBusinessName(kb)}. May I quickly explain?`;
+          conversationStage = "pitch_given";
           shouldTrimReply = false;
         } else if (detectedIntent === "time_given" && conversationStage === "scheduling") {
           const normalizedTime = extractCallbackTime(transcript);
@@ -1529,14 +1558,16 @@ async function startServer() {
         state = "SPEAKING";
         console.log("[Vobiz State] SPEAKING reply");
         await sendVobizAudio(ws, replyAudio);
-        turnInProgress = false;
         mediaBuffers = [];
         await enterCooldownThenListen();
       } catch (err) {
         console.error("[Vobiz Turn] Error:", err);
         if (!isEnded()) state = "LISTENING";
       } finally {
-        if (turnInProgress) turnInProgress = false;
+        if (turnInProgress) {
+          turnInProgress = false;
+          console.log("[TURN LOCK] released");
+        }
       }
     };
 
@@ -1544,7 +1575,10 @@ async function startServer() {
       if (isEnded()) return;
       state = "ENDED";
       console.log("[Vobiz State] ENDED");
-      turnInProgress = false;
+      if (turnInProgress) {
+        turnInProgress = false;
+        console.log("[TURN LOCK] released");
+      }
       mediaBuffers = [];
     };
 
