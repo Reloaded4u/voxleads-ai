@@ -132,36 +132,56 @@ async function generateAiResponse(
   } = {}
 ) {
   const apiKey = process.env.GEMINI_API_KEY;
-  const t = userSpeech.toLowerCase();
-  const detailFallback = "I can arrange a callback for exact details.";
-  const needsSpecificDetails = /(price|pricing|cost|rate|detail|details|plan|service|product|offer)/.test(t);
 
-  if (!apiKey) return needsSpecificDetails ? detailFallback : "";
+  if (!apiKey) return "";
 
-  const truncatedKB = JSON.stringify({
-    profile: kb?.profile || {},
-    guidance: kb?.guidance || {},
-    faqs: kb?.faqs || [],
-    objections: kb?.objections || [],
-  }).slice(0, 1200);
+  const kbContext = {
+    business: kb?.businessProfile,
+    guidance: kb?.callGuidance,
+    faqs: kb?.faqs,
+    objections: kb?.objections,
+    appointments: kb?.appointments,
+    tone: kb?.tone,
+  };
+  const formatKbSection = (value: any) => {
+    if (!value) return "Not provided";
+    return typeof value === "string" ? value : JSON.stringify(value);
+  };
   const historyText = (options.conversationHistory || [])
     .slice(-8)
     .map((item) => `${item.role}: ${item.text}`)
     .join("\n");
 
-  const context = `You are a business calling assistant.
+  const context = `You are an AI caller.
+
+Use the following structured knowledge:
+
+Business Info:
+${formatKbSection(kbContext.business)}
+
+Call Guidance:
+${formatKbSection(kbContext.guidance)}
+
+FAQs:
+${formatKbSection(kbContext.faqs)}
+
+Objections:
+${formatKbSection(kbContext.objections)}
+
+Appointments:
+${formatKbSection(kbContext.appointments)}
+
+Tone:
+${formatKbSection(kbContext.tone)}
 
 Rules:
-- KB is the ONLY source of business context
-- Do not assume the industry, product, service, pricing model, or offer
-- Infer answers only from KB and the conversation so far
-- Answer the caller's latest question directly
-- Keep replies short and natural
-- Never read KB text directly
-- Never dump or summarize full KB
-- Ask one follow-up question when needed
+- Answer based on this knowledge only
+- Do not assume industry
+- Do not read sections directly
+- Pick relevant info only
+- Keep responses short and conversational
 - Do not repeat the opening pitch
-- If info is missing, say: 'I can arrange a callback for exact details'
+- If the knowledge does not contain the answer, say: "I can arrange a callback for exact details."
 
 Conversation Stage:
 ${options.conversationStage || "opening"}
@@ -169,11 +189,8 @@ ${options.conversationStage || "opening"}
 Detected Intent:
 ${options.detectedIntent || "general"}
 
-Conversation so far:
+Conversation:
 ${historyText || "No previous turns."}
-
-Knowledge Base (reference only):
-${truncatedKB || "No KB available."}
 
 User said:
 ${userSpeech}
@@ -194,11 +211,10 @@ Reply:`;
     console.log("[GEMINI RAW]", JSON.stringify(data));
     if (!response.ok || data?.error) {
       console.error("[GEMINI ERROR]", JSON.stringify(data?.error || data));
-      return needsSpecificDetails ? detailFallback : "";
+      return "";
     }
 
     let reply = (data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
-    if (!reply && needsSpecificDetails) reply = detailFallback;
 
     const maxWords = options.maxWords || 12;
     if (reply.split(/\s+/).filter(Boolean).length > maxWords) {
@@ -209,7 +225,7 @@ Reply:`;
     return reply;
   } catch (error) {
     console.error("[GEMINI ERROR]", error);
-    return needsSpecificDetails ? detailFallback : "";
+    return "";
   }
 }
 
@@ -1195,6 +1211,22 @@ async function startServer() {
       return "general";
     };
 
+    const buildAppointmentConfirmation = (kb: any, callbackTime: string) => {
+      const appointments = kb?.appointments || {};
+      const template =
+        appointments.confirmationTemplate ||
+        appointments.confirmationMessage ||
+        appointments.callbackConfirmation;
+
+      if (typeof template === "string" && template.trim()) {
+        return template
+          .replace(/\{\{\s*time\s*\}\}/gi, callbackTime)
+          .replace(/\{\s*time\s*\}/gi, callbackTime);
+      }
+
+      return `Confirmed, I'll arrange a callback at ${callbackTime}.`;
+    };
+
     console.log("[Vobiz State] GREETING");
 
     const isEnded = () => state === "ENDED";
@@ -1427,7 +1459,7 @@ async function startServer() {
           const normalizedTime = extractCallbackTime(transcript);
           savedCallbackTime = normalizedTime;
           conversationStage = "completed";
-          reply = `Confirmed, I'll arrange a callback at ${normalizedTime}.`;
+          reply = buildAppointmentConfirmation(kb, normalizedTime);
           shouldTrimReply = false;
           console.log("[SCHEDULING TIME DETECTED]", transcript, normalizedTime);
         } else if ((detectedIntent === "permission" || detectedIntent === "confirmation") && conversationStage === "scheduling") {
