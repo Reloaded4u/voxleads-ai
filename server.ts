@@ -1213,12 +1213,14 @@ async function startServer() {
       return suffix ? `${hour} ${suffix}` : hour;
     };
 
-    const getMaxWordsForStage = () => 15;
+    const getMaxWordsForStage = () => 14;
 
-    const trimReplyForStage = (reply: string) => {
-      const maxWords = getMaxWordsForStage();
+    const trimReplyForStage = (reply: string, maxWords = getMaxWordsForStage()) => {
       const words = reply.split(/\s+/).filter(Boolean);
-      if (words.length <= maxWords) return reply;
+      if (words.length <= maxWords) {
+        console.log("[REPLY WORD COUNT]", words.length);
+        return reply;
+      }
 
       const sentences = reply.match(/[^.!?]+[.!?]+/g) || [];
       let result = "";
@@ -1228,7 +1230,9 @@ async function startServer() {
         result = candidate;
       }
 
-      return result || words.slice(0, maxWords).join(" ") + ".";
+      const trimmed = result || words.slice(0, maxWords).join(" ") + ".";
+      console.log("[REPLY WORD COUNT]", trimmed.split(/\s+/).filter(Boolean).length);
+      return trimmed;
     };
 
     const detectIntent = (text: string) => {
@@ -1282,6 +1286,19 @@ async function startServer() {
       const lastWord = words[words.length - 1] || "";
       return ["of", "your", "for", "to", "about", "need", "want"].includes(lastWord);
     };
+
+    const isVaguePartialTranscript = (text: string) => {
+      const normalized = normalizeTurnText(text);
+      return [
+        "but one",
+        "yeah before can",
+        "i would like to",
+        "i need your",
+        "before can",
+      ].some((phrase) => normalized === phrase || normalized.endsWith(` ${phrase}`));
+    };
+
+    const isLowConfidenceAllowed = (text: string) => Boolean(extractCallbackTime(text));
 
     const buildAppointmentConfirmation = (kb: any, callbackTime: string) => {
       const appointments = kb?.appointments || {};
@@ -1586,13 +1603,22 @@ async function startServer() {
           return;
         }
 
+        const confidence = typeof stt.confidence === "number" ? stt.confidence : 0;
+        const lowConfidenceWithoutTime = confidence < 0.65 && !isLowConfidenceAllowed(transcript);
+
+        if (isVaguePartialTranscript(transcript)) {
+          console.log("[TURN HELD] incomplete phrase");
+          state = "LISTENING";
+          return;
+        }
+
         if (heldTranscript) {
           transcript = `${heldTranscript} ${transcript}`.trim();
           heldTranscript = "";
         }
 
         const normalizedTranscript = normalizeTurnText(transcript);
-        if (isIncompletePhrase(normalizeTurnText(transcript))) {
+        if (isIncompletePhrase(normalizedTranscript)) {
           heldTranscript = transcript;
           console.log("[TURN HELD] incomplete phrase");
           state = "LISTENING";
@@ -1625,10 +1651,47 @@ async function startServer() {
         const callContext = { ...callData, transcript: transcriptWithLead };
         let reply = "";
         let shouldTrimReply = true;
+        let replyMaxWords = 10;
 
         if (conversationStage === "completed") {
           reply = "";
           shouldTrimReply = false;
+        } else if (conversationStage === "scheduling") {
+          console.log("[STAGE GUARD] scheduling only");
+          const normalizedTime = extractCallbackTime(transcript);
+          if (normalizedTime) {
+            savedCallbackTime = normalizedTime;
+            conversationStage = "completed";
+            console.log("[STAGE FLOW]", conversationStage);
+            reply = `Got it, I'll arrange a callback at ${normalizedTime}. ${buildClosingLine(callData, kb)}`;
+            shouldTrimReply = false;
+            console.log("[SCHEDULING TIME DETECTED]", transcript, normalizedTime);
+            console.log("[DETERMINISTIC REPLY]", reply);
+          } else if (isBusyOrCallLater(transcript) || detectedIntent === "scheduling") {
+            reply = buildSchedulingQuestion(callData, kb);
+            console.log("[DETERMINISTIC REPLY]", reply);
+          } else {
+            if (lowConfidenceWithoutTime) {
+              console.log("[TURN HELD] low confidence", transcript, confidence);
+              reply = buildSchedulingQuestion(callData, kb);
+              console.log("[DETERMINISTIC REPLY]", reply);
+            } else {
+              replyMaxWords = 14;
+              console.log("[GEMINI INPUT]", transcript);
+              const answer = await generateGeminiReply({
+                transcript,
+                knowledgeBase: kb,
+                callContext,
+                conversationStage,
+                conversationHistory,
+                detectedIntent,
+                maxWords: 7,
+              });
+              const briefAnswer = trimReplyForStage(answer || "I can arrange a callback.", 7);
+              reply = `${briefAnswer} What time works?`;
+              shouldTrimReply = false;
+            }
+          }
         } else if (conversationStage === "greeting_sent" && isOpeningHello) {
           reply = buildInitialGreeting(callData, kb);
           console.log("[DETERMINISTIC REPLY]", reply);
@@ -1652,15 +1715,6 @@ async function startServer() {
           conversationStage = "scheduling";
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "scheduling" && extractCallbackTime(transcript)) {
-          const normalizedTime = extractCallbackTime(transcript);
-          savedCallbackTime = normalizedTime;
-          conversationStage = "completed";
-          console.log("[STAGE FLOW]", conversationStage);
-          reply = `Got it, I'll arrange a callback at ${normalizedTime}. ${buildClosingLine(callData, kb)}`;
-          shouldTrimReply = false;
-          console.log("[SCHEDULING TIME DETECTED]", transcript, normalizedTime);
-          console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "awaiting_permission" && isOpeningHello) {
           reply = buildPermissionQuestion(callData, kb);
           console.log("[DETERMINISTIC REPLY]", reply);
@@ -1681,13 +1735,36 @@ async function startServer() {
           conversationStage = "pitch_given";
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "pitch_given") {
-          const qualificationQuestion = applyGreetingPlaceholders(getFirstQualificationQuestion(kb), callData, kb);
-          reply = qualificationQuestion;
+        } else if (conversationStage === "pitch_given" && isPositiveResponse(transcript)) {
           conversationStage = "qualification";
           console.log("[STAGE FLOW]", conversationStage);
+          const qualificationQuestion = applyGreetingPlaceholders(getFirstQualificationQuestion(kb), callData, kb);
+          reply = qualificationQuestion;
           console.log("[DETERMINISTIC REPLY]", reply);
+        } else if (conversationStage === "qualification") {
+          if (lowConfidenceWithoutTime) {
+            console.log("[TURN HELD] low confidence", transcript, confidence);
+            state = "LISTENING";
+            return;
+          }
+          replyMaxWords = 14;
+          console.log("[GEMINI INPUT]", transcript);
+          reply = await generateGeminiReply({
+            transcript,
+            knowledgeBase: kb,
+            callContext,
+            conversationStage,
+            conversationHistory,
+            detectedIntent,
+            maxWords: getMaxWordsForStage(),
+          });
         } else {
+          if (lowConfidenceWithoutTime) {
+            console.log("[TURN HELD] low confidence", transcript, confidence);
+            state = "LISTENING";
+            return;
+          }
+          replyMaxWords = 14;
           console.log("[GEMINI INPUT]", transcript);
           reply = await generateGeminiReply({
             transcript,
@@ -1715,7 +1792,9 @@ async function startServer() {
         }
 
         if (shouldTrimReply) {
-          reply = trimReplyForStage(reply);
+          reply = trimReplyForStage(reply, replyMaxWords);
+        } else {
+          console.log("[REPLY WORD COUNT]", reply.split(/\s+/).filter(Boolean).length);
         }
 
         console.log("[GEMINI OUTPUT]", reply);
