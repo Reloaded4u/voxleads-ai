@@ -152,6 +152,22 @@ async function generateAiResponse(
     .map((item) => `${item.role}: ${item.text}`)
     .join("\n");
 
+  console.log("[KB SECTIONS PASSED] businessProfile, callGuidance, faqs, objections, appointments, tone");
+
+  const countWords = (value: string) => value.split(/\s+/).filter(Boolean).length;
+  const lastCompleteSentenceWithinLimit = (value: string, maxWords: number) => {
+    const sentences = value.match(/[^.!?]+[.!?]+/g) || [];
+    let result = "";
+
+    for (const sentence of sentences) {
+      const candidate = `${result} ${sentence.trim()}`.trim();
+      if (countWords(candidate) > maxWords) break;
+      result = candidate;
+    }
+
+    return result.trim();
+  };
+
   const context = `You are an AI caller.
 
 Use the following structured knowledge:
@@ -176,6 +192,8 @@ ${formatKbSection(kbContext.tone)}
 
 Rules:
 - Answer based on this knowledge only
+- Answer using the most relevant KB section only: FAQs first, then Call Guidance, then Business Profile
+- Do not give a generic callback answer if KB contains an answer
 - Do not assume industry
 - Do not read sections directly
 - Pick relevant info only
@@ -217,8 +235,29 @@ Reply:`;
     let reply = (data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
 
     const maxWords = options.maxWords || 12;
-    if (reply.split(/\s+/).filter(Boolean).length > maxWords) {
-      reply = reply.split(/\s+/).slice(0, maxWords).join(" ") + ".";
+    if (countWords(reply) > maxWords) {
+      const shortenResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{
+              text: `${context}\n\nPrevious reply:\n${reply}\n\nRewrite the previous reply in ${maxWords} words or fewer. Keep a complete sentence. Reply:`
+            }]
+          }]
+        })
+      });
+      const shortenData = await shortenResponse.json();
+      console.log("[GEMINI RAW]", JSON.stringify(shortenData));
+      if (shortenResponse.ok && !shortenData?.error) {
+        const shorterReply = (shortenData?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+        if (shorterReply) reply = shorterReply;
+      }
+    }
+
+    if (countWords(reply) > maxWords) {
+      const sentenceCut = lastCompleteSentenceWithinLimit(reply, maxWords);
+      if (sentenceCut) reply = sentenceCut;
     }
 
     console.log("[GEMINI FINAL REPLY]", reply);
@@ -1198,7 +1237,17 @@ async function startServer() {
     const trimReplyForStage = (reply: string) => {
       const maxWords = getMaxWordsForStage();
       const words = reply.split(/\s+/).filter(Boolean);
-      return words.length > maxWords ? words.slice(0, maxWords).join(" ") + "." : reply;
+      if (words.length <= maxWords) return reply;
+
+      const sentences = reply.match(/[^.!?]+[.!?]+/g) || [];
+      let result = "";
+      for (const sentence of sentences) {
+        const candidate = `${result} ${sentence.trim()}`.trim();
+        if (candidate.split(/\s+/).filter(Boolean).length > maxWords) break;
+        result = candidate;
+      }
+
+      return result || reply;
     };
 
     const detectIntent = (text: string) => {
@@ -1243,6 +1292,35 @@ async function startServer() {
         text.includes("can you hear me") ||
         text.includes("who is this")
       );
+    };
+
+    const getLeadName = (callData: any) =>
+      callData?.lead?.name ||
+      callData?.lead?.fullName ||
+      callData?.leadName ||
+      callData?.name ||
+      "";
+
+    const getAgentName = (kb: any, callData: any) =>
+      kb?.callGuidance?.agentName ||
+      kb?.businessProfile?.agentName ||
+      kb?.agentName ||
+      callData?.agentName ||
+      "AI assistant";
+
+    const applyGreetingPlaceholders = (greeting: string, callData: any, kb: any) => {
+      const leadName = String(getLeadName(callData) || "").trim();
+      const leadValue = leadName && leadName.toLowerCase() !== "unknown lead" ? leadName : "you";
+      const businessName = getKbBusinessName(kb);
+      const agentName = getAgentName(kb, callData);
+
+      return greeting
+        .replace(/\[Lead Name\]|\{\{\s*leadName\s*\}\}|\{\s*leadName\s*\}/gi, leadValue)
+        .replace(/\[Business Name\]|\{\{\s*businessName\s*\}\}|\{\s*businessName\s*\}/gi, businessName)
+        .replace(/\[Agent Name\]|\{\{\s*agentName\s*\}\}|\{\s*agentName\s*\}/gi, agentName)
+        .replace(/\bto\s+you\s*,/gi, "to you,")
+        .replace(/\s+/g, " ")
+        .trim();
     };
 
     console.log("[Vobiz State] GREETING");
@@ -1332,12 +1410,14 @@ async function startServer() {
         return;
       }
 
-      const { kb } = await loadCallContext();
-      const greetingText =
+      const { callData, kb } = await loadCallContext();
+      const greetingTemplate =
         kb?.callGuidance?.greeting ||
         kb?.guidance?.greeting ||
         "Hello, this is an AI assistant calling on behalf of the business.";
+      const greetingText = applyGreetingPlaceholders(greetingTemplate, callData, kb);
       console.log("[GREETING SOURCE]", (kb?.callGuidance?.greeting || kb?.guidance?.greeting) ? "kb" : "fallback");
+      console.log("[GREETING FINAL]", greetingText);
       const greetingAudio = await fetchTtsAudio(greetingText, ownerId);
       if (isEnded()) return;
 
