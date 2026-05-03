@@ -216,6 +216,13 @@ ${userSpeech}
 Reply:`;
 
   try {
+    console.log("[KB DIAG] businessProfile=", !!kb?.businessProfile);
+    console.log("[KB DIAG] callGuidance=", !!kb?.callGuidance);
+    console.log("[KB DIAG] faqsCount=", kb?.faqs?.length || 0);
+    console.log("[KB DIAG] objectionsCount=", kb?.objections?.length || 0);
+    console.log("[KB DIAG] appointments=", !!kb?.appointments);
+    console.log("[KB DIAG] tone=", !!kb?.tone);
+    console.log("[GEMINI PROMPT PREVIEW]", context.slice(0, 800));
     console.log("[GEMINI ROUTE] Gemini question handling", userSpeech);
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
       method: "POST",
@@ -1343,6 +1350,37 @@ async function startServer() {
       return sum / audioBuffer.length;
     }
 
+    function analyzeMulawWindow(audioBuffer: Buffer) {
+      const counts = new Map<number, number>();
+      let sum = 0;
+      for (const byte of audioBuffer) {
+        counts.set(byte, (counts.get(byte) || 0) + 1);
+        sum += byte;
+      }
+
+      const mean = audioBuffer.length ? sum / audioBuffer.length : 0;
+      let varianceSum = 0;
+      for (const byte of audioBuffer) {
+        const delta = byte - mean;
+        varianceSum += delta * delta;
+      }
+
+      const unique = counts.size;
+      const maxByteCount = Math.max(0, ...counts.values());
+      const mostCommonRatio = audioBuffer.length ? maxByteCount / audioBuffer.length : 1;
+      const averageEnergy = audioBuffer.length ? Math.sqrt(varianceSum / audioBuffer.length) : 0;
+      const likelyConstantSilence = unique < 8 || mostCommonRatio > 0.85;
+      const lowVariationNoise = unique < 12 && averageEnergy < 10;
+
+      return {
+        unique,
+        maxByteCount,
+        mostCommonRatio,
+        averageEnergy,
+        isSilent: likelyConstantSilence || lowVariationNoise,
+      };
+    }
+
     function isValidTranscript(text: string) {
       if (!text) return false;
       const t = text.trim().toLowerCase();
@@ -1465,6 +1503,16 @@ async function startServer() {
     const processListeningAudio = async (audioBuffer: Buffer) => {
       if (state !== "LISTENING" || isEnded()) return;
 
+      const vadScore = getVadScore(audioBuffer);
+      const vadWindow = analyzeMulawWindow(audioBuffer);
+      console.log("[Vobiz VAD] score=", vadScore);
+      console.log("[Vobiz VAD] unique=", vadWindow.unique, "mostCommonRatio=", vadWindow.mostCommonRatio, "averageEnergy=", vadWindow.averageEnergy);
+
+      if (vadWindow.isSilent) {
+        console.log("[Vobiz VAD] true silence/constant noise, skipping Deepgram");
+        return;
+      }
+
       if (turnInProgress) {
         console.log("[TURN BLOCKED] already in progress");
         return;
@@ -1474,8 +1522,6 @@ async function startServer() {
       console.log("[TURN LOCK] acquired");
 
       try {
-        console.log("[Vobiz VAD] score=", getVadScore(audioBuffer));
-
         const stt = await transcribeBuffer(audioBuffer);
         const transcript = stt.transcript;
         console.log("[Deepgram STT] transcript=", transcript);
