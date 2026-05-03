@@ -136,12 +136,12 @@ async function generateAiResponse(
   if (!apiKey) return "";
 
   const kbContext = {
-    business: kb?.businessProfile,
-    guidance: kb?.callGuidance,
-    faqs: kb?.faqs,
-    objections: kb?.objections,
-    appointments: kb?.appointments,
-    tone: kb?.tone,
+    businessProfile: kb?.businessProfile || kb?.business || {},
+    callGuidance: kb?.callGuidance || kb?.guidance || {},
+    faqs: kb?.faqs?.items || kb?.faqs || [],
+    objections: kb?.objections?.items || kb?.objections || [],
+    appointments: kb?.appointments || {},
+    tone: kb?.tone || {},
   };
   const conversationText = (options.conversationHistory || [])
     .slice(-8)
@@ -164,6 +164,8 @@ async function generateAiResponse(
     options.detectedIntent === "pricing" ? "faqs" :
     options.detectedIntent === "scheduling" ? "appointments" :
     "faqs, callGuidance, businessProfile";
+  const faqText = JSON.stringify(kbContext.faqs).toLowerCase();
+  const hasPricingInFaqs = /(price|pricing|cost|rate|fee|charges|amount)/.test(faqText);
 
   const prompt = `You are an AI calling assistant.
 
@@ -197,14 +199,19 @@ Reply:`;
 
   try {
     console.log("[KB SECTIONS PASSED] businessProfile, callGuidance, faqs, objections, appointments, tone");
-    console.log("[KB DIAG] businessProfile=", !!kb?.businessProfile);
-    console.log("[KB DIAG] callGuidance=", !!kb?.callGuidance);
-    console.log("[KB DIAG] faqsCount=", kb?.faqs?.length || 0);
-    console.log("[KB DIAG] objectionsCount=", kb?.objections?.length || 0);
-    console.log("[KB DIAG] appointments=", !!kb?.appointments);
-    console.log("[KB DIAG] tone=", !!kb?.tone);
+    console.log("[KB DIAG] businessProfile=", Object.keys(kbContext.businessProfile || {}).length > 0);
+    console.log("[KB DIAG] callGuidance=", Object.keys(kbContext.callGuidance || {}).length > 0);
+    console.log("[KB DIAG] faqsCount=", Array.isArray(kbContext.faqs) ? kbContext.faqs.length : 0);
+    console.log("[KB DIAG] objectionsCount=", Array.isArray(kbContext.objections) ? kbContext.objections.length : 0);
+    console.log("[KB DIAG] appointments=", Object.keys(kbContext.appointments || {}).length > 0);
+    console.log("[KB DIAG] tone=", Object.keys(kbContext.tone || {}).length > 0);
     console.log("[KB USED SECTION]", kbUsedSection);
     console.log("[GEMINI PROMPT PREVIEW]", prompt.slice(0, 800));
+    if (options.detectedIntent === "pricing" && !hasPricingInFaqs) {
+      const reply = "I don't have exact pricing here. I can arrange a callback.";
+      console.log("[GEMINI FINAL REPLY]", reply);
+      return reply;
+    }
     console.log("[GEMINI ROUTE] Gemini question handling", userSpeech);
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
       method: "POST",
@@ -1164,6 +1171,7 @@ async function startServer() {
     let mediaBuffers: Buffer[] = [];
     let lastTranscript = "";
     let lastAiReply = "";
+    let heldTranscript = "";
     let turnInProgress = false;
     let conversationStage: "opening" | "pitch_given" | "scheduling" | "completed" = "opening";
     const conversationHistory: Array<{ role: string; text: string }> = [];
@@ -1228,6 +1236,12 @@ async function startServer() {
       if (t.includes("time") || t.includes("schedule")) return "scheduling";
       if (t.includes("yes") || t.includes("ok")) return "confirmation";
       return "general";
+    };
+
+    const isIncompletePhrase = (text: string) => {
+      const words = text.toLowerCase().trim().split(/\s+/).filter(Boolean);
+      const lastWord = words[words.length - 1] || "";
+      return ["of", "your", "for", "to", "about", "need", "want"].includes(lastWord);
     };
 
     const buildAppointmentConfirmation = (kb: any, callbackTime: string) => {
@@ -1486,7 +1500,7 @@ async function startServer() {
 
       try {
         const stt = await transcribeBuffer(audioBuffer);
-        const transcript = stt.transcript;
+        let transcript = stt.transcript;
         console.log("[Deepgram STT] transcript=", transcript);
         console.log("[Deepgram STT] confidence=", stt.confidence);
         console.log("[Deepgram STT] words=", stt.words);
@@ -1498,7 +1512,19 @@ async function startServer() {
           return;
         }
 
+        if (heldTranscript) {
+          transcript = `${heldTranscript} ${transcript}`.trim();
+          heldTranscript = "";
+        }
+
         const normalizedTranscript = normalizeTurnText(transcript);
+        if (isIncompletePhrase(normalizedTranscript)) {
+          heldTranscript = transcript;
+          console.log("[TURN HELD] incomplete phrase");
+          state = "LISTENING";
+          return;
+        }
+
         const wordCount = normalizedTranscript.split(" ").filter(Boolean).length;
         const detectedIntent = detectIntent(normalizedTranscript);
         const isOpeningHello = conversationStage === "opening" && normalizedTranscript === "hello";
