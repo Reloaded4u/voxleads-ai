@@ -1176,6 +1176,12 @@ async function startServer() {
     let turnInProgress = false;
     let callCompletedLogged = false;
     let greetingDelivered = false;
+    let nameConfirmed = false;
+    let availabilityDelivered = false;
+    let permissionDelivered = false;
+    let hookDelivered = false;
+    let pitchDelivered = false;
+    let qualificationStarted = false;
     type ConversationStage = "greeting" | "availability" | "permission" | "hook" | "pitch" | "qualification" | "appointment" | "closing" | "ended";
     let conversationStage: ConversationStage = "greeting";
     const conversationHistory: Array<{ role: string; text: string }> = [];
@@ -1413,6 +1419,51 @@ async function startServer() {
 
     const buildClosingLine = (callData: any, kb: any) =>
       applyGreetingPlaceholders(getScriptField(kb, "closingLine", "Thank you for your time. Have a great day."), callData, kb);
+
+    const preQualificationStagesDelivered = () =>
+      availabilityDelivered && permissionDelivered && hookDelivered && pitchDelivered;
+
+    const deliverMissingPreQualificationStage = (callData: any, kb: any) => {
+      console.log("[FLOW GUARD] qualification blocked because previous KB stages missing");
+
+      if (!availabilityDelivered) {
+        const text = buildAvailabilityQuestion(callData, kb);
+        availabilityDelivered = true;
+        conversationStage = "permission";
+        console.log("[FLOW STEP] delivered availabilityCheck");
+        console.log("[STAGE FLOW]", conversationStage);
+        return text;
+      }
+
+      if (!permissionDelivered) {
+        const text = buildPermissionQuestion(callData, kb);
+        permissionDelivered = true;
+        conversationStage = "hook";
+        console.log("[FLOW STEP] delivered permissionLine");
+        console.log("[STAGE FLOW]", conversationStage);
+        return text;
+      }
+
+      if (!hookDelivered) {
+        const text = applyGreetingPlaceholders(getOpeningHook(kb), callData, kb);
+        hookDelivered = true;
+        conversationStage = "pitch";
+        console.log("[FLOW STEP] delivered hook");
+        console.log("[STAGE FLOW]", conversationStage);
+        return text;
+      }
+
+      if (!pitchDelivered) {
+        const text = applyGreetingPlaceholders(getMainPitch(kb), callData, kb);
+        pitchDelivered = true;
+        conversationStage = "qualification";
+        console.log("[FLOW STEP] delivered pitch");
+        console.log("[STAGE FLOW]", conversationStage);
+        return text;
+      }
+
+      return "";
+    };
 
     console.log("[Vobiz State] GREETING");
 
@@ -1719,13 +1770,21 @@ async function startServer() {
             }
           }
         } else if (conversationStage === "availability" && (isOpeningHello || isIdentityConfirmed(transcript))) {
+          nameConfirmed = nameConfirmed || isIdentityConfirmed(transcript);
+          if (nameConfirmed) console.log("[FLOW STEP] name confirmed");
+          conversationStage = "availability";
+          console.log("[STAGE FLOW]", conversationStage);
           reply = buildAvailabilityQuestion(callData, kb);
+          availabilityDelivered = true;
           conversationStage = "permission";
+          console.log("[FLOW STEP] delivered availabilityCheck");
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "permission" && isAvailabilityPositive(transcript)) {
           reply = buildPermissionQuestion(callData, kb);
+          permissionDelivered = true;
           conversationStage = "hook";
+          console.log("[FLOW STEP] delivered permissionLine");
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "permission" && (isAvailabilityNegative(transcript) || isBusyOrCallLater(transcript))) {
@@ -1742,9 +1801,15 @@ async function startServer() {
           reply = buildPermissionQuestion(callData, kb);
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "hook" && isPermissionPositive(transcript)) {
-          reply = applyGreetingPlaceholders(getOpeningHook(kb), callData, kb);
-          conversationStage = "pitch";
-          console.log("[STAGE FLOW]", conversationStage);
+          if (!availabilityDelivered || !permissionDelivered) {
+            reply = deliverMissingPreQualificationStage(callData, kb);
+          } else {
+            reply = applyGreetingPlaceholders(getOpeningHook(kb), callData, kb);
+            hookDelivered = true;
+            conversationStage = "pitch";
+            console.log("[FLOW STEP] delivered hook");
+            console.log("[STAGE FLOW]", conversationStage);
+          }
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "hook" && isPermissionNegative(transcript)) {
           reply = buildClosingLine(callData, kb);
@@ -1753,24 +1818,41 @@ async function startServer() {
           shouldTrimReply = false;
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "pitch" && isPositiveResponse(transcript)) {
-          const pitch = applyGreetingPlaceholders(getMainPitch(kb), callData, kb);
-          reply = pitch;
-          conversationStage = "qualification";
-          console.log("[STAGE FLOW]", conversationStage);
+          if (!availabilityDelivered || !permissionDelivered || !hookDelivered) {
+            reply = deliverMissingPreQualificationStage(callData, kb);
+          } else {
+            const pitch = applyGreetingPlaceholders(getMainPitch(kb), callData, kb);
+            reply = pitch;
+            pitchDelivered = true;
+            conversationStage = "qualification";
+            console.log("[FLOW STEP] delivered pitch");
+            console.log("[STAGE FLOW]", conversationStage);
+          }
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (conversationStage === "qualification" && isPositiveResponse(transcript)) {
-          const qualificationQuestion = applyGreetingPlaceholders(getFirstQualificationQuestion(kb), callData, kb);
-          reply = qualificationQuestion;
-          console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "qualification") {
-          if (lowConfidenceWithoutTime) {
-            console.log("[TURN HELD] low confidence", transcript, confidence);
-            state = "LISTENING";
-            return;
+          if (!preQualificationStagesDelivered()) {
+            reply = deliverMissingPreQualificationStage(callData, kb);
+            console.log("[DETERMINISTIC REPLY]", reply);
+          } else {
+            const qualificationQuestion = applyGreetingPlaceholders(getFirstQualificationQuestion(kb), callData, kb);
+            reply = qualificationQuestion;
+            qualificationStarted = true;
+            console.log("[FLOW STEP] qualification started", qualificationStarted);
+            console.log("[DETERMINISTIC REPLY]", reply);
           }
-          replyMaxWords = 14;
-          console.log("[GEMINI INPUT]", transcript);
-          reply = await generateGeminiReply({
+        } else if (conversationStage === "qualification") {
+          if (!preQualificationStagesDelivered()) {
+            reply = deliverMissingPreQualificationStage(callData, kb);
+            console.log("[DETERMINISTIC REPLY]", reply);
+          } else {
+            if (lowConfidenceWithoutTime) {
+              console.log("[TURN HELD] low confidence", transcript, confidence);
+              state = "LISTENING";
+              return;
+            }
+            replyMaxWords = 14;
+            console.log("[GEMINI INPUT]", transcript);
+            reply = await generateGeminiReply({
             transcript,
             knowledgeBase: kb,
             callContext,
@@ -1779,9 +1861,10 @@ async function startServer() {
             detectedIntent,
             maxWords: getMaxWordsForStage(),
           });
-          reply = sanitizeAiReplyForStage(reply, applyGreetingPlaceholders(getFirstQualificationQuestion(kb), callData, kb));
-          conversationStage = pendingStage;
-          console.log("[STAGE FLOW]", conversationStage);
+            reply = sanitizeAiReplyForStage(reply, applyGreetingPlaceholders(getFirstQualificationQuestion(kb), callData, kb));
+            conversationStage = pendingStage;
+            console.log("[STAGE FLOW]", conversationStage);
+          }
         } else {
           if (lowConfidenceWithoutTime) {
             console.log("[TURN HELD] low confidence", transcript, confidence);
