@@ -1173,7 +1173,7 @@ async function startServer() {
     let lastAiReply = "";
     let heldTranscript = "";
     let turnInProgress = false;
-    let conversationStage: "greeting_sent" | "awaiting_permission" | "hook_given" | "pitch_given" | "qualification" | "scheduling" | "completed" = "greeting_sent";
+    let conversationStage: "greeting_sent" | "awaiting_availability" | "awaiting_permission" | "hook_given" | "pitch_given" | "qualification" | "scheduling" | "completed" = "greeting_sent";
     const conversationHistory: Array<{ role: string; text: string }> = [];
     const STT_WINDOW_FRAMES = 60; // 1.2 seconds at 20ms/frame
     const NON_ACTIONABLE = new Set([
@@ -1241,6 +1241,9 @@ async function startServer() {
     const isPermissionPositive = (text: string) => /\b(yes|okay|ok|go ahead|sure|continue)\b/i.test(text);
     const isPermissionNegative = (text: string) => /\b(no|not interested)\b/i.test(text);
     const isBusyOrCallLater = (text: string) => /\b(busy|call later|not now|later|meeting|driving)\b/i.test(text);
+    const isIdentityConfirmed = (text: string) => /\b(yes|yeah|yep|speaking|correct|right|this is|it is|okay|ok|sure)\b/i.test(text);
+    const isAvailabilityPositive = (text: string) => /\b(yes|yeah|yep|okay|ok|sure|go ahead|continue)\b/i.test(text);
+    const isAvailabilityNegative = (text: string) => /\b(no|not now|busy|later|meeting|driving|call later)\b/i.test(text);
     const isPositiveResponse = (text: string) => /\b(yes|okay|ok|sure|interested|go ahead|continue|please)\b/i.test(text);
 
     const firstText = (...values: any[]) => {
@@ -1312,7 +1315,7 @@ async function startServer() {
       "the business";
 
     const isOpeningCheckIn = (text: string) => {
-      if (conversationStage !== "awaiting_permission") return false;
+      if (conversationStage !== "greeting_sent" && conversationStage !== "awaiting_availability" && conversationStage !== "awaiting_permission") return false;
       return (
         text === "hello" ||
         text.includes("is this") ||
@@ -1349,6 +1352,12 @@ async function startServer() {
         .replace(/\bto\s+you\s*,/gi, "to you,")
         .replace(/\s+/g, " ")
         .trim();
+    };
+
+    const buildInitialGreeting = (callData: any) => {
+      const leadName = String(getLeadName(callData) || "").trim();
+      const leadValue = leadName && leadName.toLowerCase() !== "unknown lead" ? leadName : "you";
+      return `Hello, am I speaking to ${leadValue}?`;
     };
 
     console.log("[Vobiz State] GREETING");
@@ -1469,15 +1478,11 @@ async function startServer() {
         return;
       }
 
-      const { callData, kb } = await loadCallContext();
-      const guidance = getCallGuidance(kb);
-      const greetingTemplate =
-        guidance.greeting ||
-        "Hello, this is an AI assistant calling on behalf of the business.";
-      const greetingText = applyGreetingPlaceholders(greetingTemplate, callData, kb);
-      console.log("[GREETING SOURCE]", guidance.greeting ? "kb" : "fallback");
+      const { callData } = await loadCallContext();
+      const greetingText = buildInitialGreeting(callData);
+      console.log("[GREETING SOURCE]", "deterministic");
       console.log("[GREETING FINAL]", greetingText);
-      conversationStage = "awaiting_permission";
+      conversationStage = "greeting_sent";
       console.log("[STAGE FLOW]", conversationStage);
       const greetingAudio = await fetchTtsAudio(greetingText, ownerId);
       if (isEnded()) return;
@@ -1573,7 +1578,9 @@ async function startServer() {
 
         const wordCount = normalizeTurnText(transcript).split(" ").filter(Boolean).length;
         const detectedIntent = detectIntent(transcript);
-        const isOpeningHello = conversationStage === "awaiting_permission" && normalizeTurnText(transcript) === "hello";
+        const isOpeningHello =
+          (conversationStage === "greeting_sent" || conversationStage === "awaiting_availability" || conversationStage === "awaiting_permission") &&
+          normalizeTurnText(transcript) === "hello";
         console.log("[CONVERSATION STAGE]", conversationStage);
         console.log("[INTENT DETECTED]", detectedIntent);
 
@@ -1599,6 +1606,24 @@ async function startServer() {
         if (conversationStage === "completed") {
           reply = "";
           shouldTrimReply = false;
+        } else if (conversationStage === "greeting_sent" && isOpeningHello) {
+          reply = buildInitialGreeting(callData);
+          console.log("[DETERMINISTIC REPLY]", reply);
+        } else if (conversationStage === "greeting_sent" && isIdentityConfirmed(transcript)) {
+          reply = "Is this a good time for a quick 30-second call?";
+          conversationStage = "awaiting_availability";
+          console.log("[STAGE FLOW]", conversationStage);
+          console.log("[DETERMINISTIC REPLY]", reply);
+        } else if (conversationStage === "awaiting_availability" && isAvailabilityPositive(transcript)) {
+          reply = "Great, may I quickly explain?";
+          conversationStage = "awaiting_permission";
+          console.log("[STAGE FLOW]", conversationStage);
+          console.log("[DETERMINISTIC REPLY]", reply);
+        } else if (conversationStage === "awaiting_availability" && (isAvailabilityNegative(transcript) || isBusyOrCallLater(transcript))) {
+          reply = "Sure, when would be a better time?";
+          conversationStage = "scheduling";
+          console.log("[STAGE FLOW]", conversationStage);
+          console.log("[DETERMINISTIC REPLY]", reply);
         } else if (isBusyOrCallLater(transcript)) {
           reply = "Sure, no problem. When would be a better time to call you?";
           conversationStage = "scheduling";
