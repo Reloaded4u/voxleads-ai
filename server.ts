@@ -1042,6 +1042,35 @@ async function startServer() {
     res.json({ status: "ok" });
   });
 
+  app.get("/api/debug/gemini-models", async (_req, res) => {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ success: false, message: "Missing GEMINI_API_KEY" });
+    }
+
+    try {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+      const data = await response.json() as any;
+
+      if (!response.ok || data?.error) {
+        console.error("[GEMINI ERROR]", JSON.stringify(data?.error || data));
+        return res.status(response.status || 500).json({ success: false, error: data?.error || data });
+      }
+
+      const models = (data?.models || []).filter((model: any) =>
+        Array.isArray(model.supportedGenerationMethods) &&
+        model.supportedGenerationMethods.includes("generateContent")
+      );
+      const names = models.map((model: any) => model.name);
+      console.log("[GEMINI AVAILABLE MODELS]", names);
+
+      res.json({ success: true, models });
+    } catch (error) {
+      console.error("[GEMINI ERROR]", error);
+      res.status(500).json({ success: false, message: "Failed to fetch Gemini models" });
+    }
+  });
+
   // Vobiz WebSocket connection handler
   wss.on("connection", (ws, request) => {
     console.log("[VOBIZ ACTIVE HANDLER HIT]");
