@@ -139,7 +139,10 @@ async function generateAiResponse(userSpeech: string, callData: any, kb: any) {
     return `${businessName} offers ${kb?.guidance?.mainPitch?.slice(0, 120) || "premium properties"}`;
   }
 
-  if (!apiKey) return "";
+  const pricingFallback = "Pricing depends on the unit type, and I can arrange exact details for you.";
+  const isPricingQuestion = t.includes("price") || t.includes("pricing") || t.includes("cost") || t.includes("rate");
+
+  if (!apiKey) return isPricingQuestion ? pricingFallback : "";
 
   const truncatedKB = (kb?.guidance?.mainPitch || "").slice(0, 200);
   const context = `You are a real estate calling assistant.
@@ -161,7 +164,7 @@ Reply:`;
 
   try {
     console.log("[GEMINI ROUTE] Gemini question handling", userSpeech);
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -171,8 +174,12 @@ Reply:`;
 
     const data = await response.json();
     console.log("[GEMINI RAW]", JSON.stringify(data));
+    if (!response.ok || data?.error) {
+      console.error("[GEMINI ERROR]", JSON.stringify(data?.error || data));
+      return isPricingQuestion ? pricingFallback : "";
+    }
     const rawReply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    let reply = rawReply.trim();
+    let reply = rawReply.trim() || (isPricingQuestion ? pricingFallback : "");
 
     if (reply.split(/\s+/).filter(Boolean).length > 22) {
       reply = reply.split(/\s+/).slice(0, 22).join(" ") + ".";
@@ -181,8 +188,8 @@ Reply:`;
     console.log("[GEMINI FINAL REPLY]", reply);
     return reply;
   } catch (error) {
-    console.error('[AI Response] Gemini error:', error);
-    return "";
+    console.error("[GEMINI ERROR]", error);
+    return isPricingQuestion ? pricingFallback : "";
   }
 }
 
@@ -1294,7 +1301,9 @@ async function startServer() {
           callContext,
         });
         if (!reply || reply.trim().length === 0) {
-          reply = "Sorry, could you repeat that?";
+          console.log("[GEMINI OUTPUT]", "");
+          state = "LISTENING";
+          return;
         }
         console.log("[GEMINI OUTPUT]", reply);
         if (isEnded()) return;
