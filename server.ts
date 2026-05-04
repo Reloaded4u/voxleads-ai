@@ -1244,21 +1244,51 @@ async function startServer() {
       return trimmed;
     };
 
+    const normalizeSttTranscript = (text: string) => {
+      const normalized = normalizeTurnText(text);
+      if (normalized === "yesterday sir" || normalized === "yesterday") return "yes sudesh here";
+      if (normalized === "yes sir" || normalized === "yeah sir") return "yes";
+      return text;
+    };
+
+    const isPositiveNameConfirmation = (text: string) => {
+      const t = normalizeTurnText(text);
+      return (
+        t === "yes sudesh here" ||
+        t === "yes sir" ||
+        t === "yes" ||
+        t === "yeah" ||
+        t === "yep" ||
+        t === "correct" ||
+        t === "speaking" ||
+        t.includes("this is") ||
+        t.includes("speaking")
+      );
+    };
+
+    const isExplicitSchedulingRequest = (text: string) => {
+      const t = normalizeTurnText(text);
+      return (
+        /\b(call me later|schedule|book meeting|arrange callback|i am busy|im busy|not now|tomorrow at|today evening)\b/i.test(t) ||
+        /\bat\s+\d{1,2}\s*(am|pm|a m|p m)\b/i.test(t)
+      );
+    };
+
     const detectIntent = (text: string) => {
       const t = text.toLowerCase();
       if (t.includes("price") || t.includes("cost")) return "pricing";
-      if (t.includes("time") || t.includes("schedule")) return "scheduling";
+      if (isExplicitSchedulingRequest(text)) return "scheduling";
       if (t.includes("yes") || t.includes("ok")) return "confirmation";
       return "general";
     };
 
-    const isPermissionPositive = (text: string) => /\b(yes|okay|ok|go ahead|sure|continue)\b/i.test(text);
+    const isPermissionPositive = (text: string) => /\b(yes|okay|ok|go ahead|sure|continue)\b/i.test(text) || isPositiveNameConfirmation(text);
     const isPermissionNegative = (text: string) => /\b(no|not interested)\b/i.test(text);
-    const isBusyOrCallLater = (text: string) => /\b(busy|call later|not now|later|meeting|driving)\b/i.test(text);
-    const isIdentityConfirmed = (text: string) => /\b(yes|yeah|yep|speaking|correct|right|this is|it is|okay|ok|sure)\b/i.test(text);
-    const isAvailabilityPositive = (text: string) => /\b(yes|yeah|yep|okay|ok|sure|go ahead|continue)\b/i.test(text);
-    const isAvailabilityNegative = (text: string) => /\b(no|not now|busy|later|meeting|driving|call later)\b/i.test(text);
-    const isPositiveResponse = (text: string) => /\b(yes|okay|ok|sure|interested|go ahead|continue|please)\b/i.test(text);
+    const isBusyOrCallLater = (text: string) => isExplicitSchedulingRequest(text);
+    const isIdentityConfirmed = (text: string) => isPositiveNameConfirmation(text) || /\b(right|it is|okay|ok|sure)\b/i.test(text);
+    const isAvailabilityPositive = (text: string) => /\b(yes|yeah|yep|okay|ok|sure|go ahead|continue)\b/i.test(text) || isPositiveNameConfirmation(text);
+    const isAvailabilityNegative = (text: string) => /\b(no|not interested)\b/i.test(text) || isExplicitSchedulingRequest(text);
+    const isPositiveResponse = (text: string) => /\b(yes|okay|ok|sure|interested|go ahead|continue|please)\b/i.test(text) || isPositiveNameConfirmation(text);
 
     const firstText = (...values: any[]) => {
       for (const value of values) {
@@ -1667,6 +1697,11 @@ async function startServer() {
       try {
         const stt = await transcribeBuffer(audioBuffer);
         let transcript = stt.transcript;
+        const originalTranscript = transcript;
+        transcript = normalizeSttTranscript(transcript);
+        if (originalTranscript !== transcript) {
+          console.log("[STT NORMALIZED]", originalTranscript, "->", transcript);
+        }
         console.log("[Deepgram STT] transcript=", transcript);
         console.log("[Deepgram STT] confidence=", stt.confidence);
         console.log("[Deepgram STT] words=", stt.words);
@@ -1770,8 +1805,9 @@ async function startServer() {
             }
           }
         } else if (conversationStage === "availability" && (isOpeningHello || isIdentityConfirmed(transcript))) {
-          nameConfirmed = nameConfirmed || isIdentityConfirmed(transcript);
-          if (nameConfirmed) console.log("[FLOW STEP] name confirmed");
+          nameConfirmed = true;
+          console.log("[NAME CONFIRMATION] accepted");
+          console.log("[FLOW STEP] name confirmed");
           conversationStage = "availability";
           console.log("[STAGE FLOW]", conversationStage);
           reply = buildAvailabilityQuestion(callData, kb);
@@ -1780,17 +1816,24 @@ async function startServer() {
           console.log("[FLOW STEP] delivered availabilityCheck");
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "permission" && isAvailabilityPositive(transcript)) {
+        } else if (conversationStage === "permission" && (isAvailabilityPositive(transcript) || wordCount <= 2)) {
           reply = buildPermissionQuestion(callData, kb);
           permissionDelivered = true;
           conversationStage = "hook";
+          console.log("[FLOW STEP] availability -> permission");
           console.log("[FLOW STEP] delivered permissionLine");
           console.log("[STAGE FLOW]", conversationStage);
           console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "permission" && (isAvailabilityNegative(transcript) || isBusyOrCallLater(transcript))) {
+        } else if (conversationStage === "permission" && isExplicitSchedulingRequest(transcript)) {
           reply = buildSchedulingQuestion(callData, kb);
           conversationStage = "appointment";
           console.log("[STAGE FLOW]", conversationStage);
+          console.log("[DETERMINISTIC REPLY]", reply);
+        } else if (conversationStage === "permission" && isPermissionNegative(transcript)) {
+          reply = buildClosingLine(callData, kb);
+          conversationStage = "closing";
+          console.log("[STAGE FLOW]", conversationStage);
+          shouldTrimReply = false;
           console.log("[DETERMINISTIC REPLY]", reply);
         } else if (isBusyOrCallLater(transcript)) {
           reply = buildSchedulingQuestion(callData, kb);
@@ -1891,10 +1934,17 @@ async function startServer() {
           conversationStage !== "ended" &&
           conversationStage !== "closing" &&
           conversationStage !== "appointment" &&
-          (detectedIntent === "scheduling" || /\b(callback|call back|schedule|time)\b/i.test(reply))
+          isExplicitSchedulingRequest(transcript)
         ) {
           conversationStage = "appointment";
           console.log("[STAGE FLOW]", conversationStage);
+        } else if (
+          conversationStage !== "ended" &&
+          conversationStage !== "closing" &&
+          conversationStage !== "appointment" &&
+          /\b(callback|call back|schedule|time)\b/i.test(reply)
+        ) {
+          console.log("[SCHEDULING GUARD] blocked false appointment jump");
         }
 
         if (!reply || reply.trim().length === 0) {
