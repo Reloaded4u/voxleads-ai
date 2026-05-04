@@ -38,8 +38,14 @@ export default function Calls() {
   const [searchTerm, setSearchTerm] = useState('');
   const audioRef = useRef<HTMLAudioElement>(null);
 
+  const summaryFallback = (call: CallRecord) =>
+    call.status === 'in-progress' ? 'Call is currently active...' : 'No summary available yet.';
+
+  const recordingTooltip = (call: CallRecord) =>
+    call.recordingUrl ? 'Listen to recording' : 'Recording not available.';
+
   const filteredCalls = calls.filter(call =>
-    call.summary.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    (call.summary || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
     call.leadId.toLowerCase().includes(searchTerm.toLowerCase()) ||
     (call.leadName || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
     (call.leadPhone || '').toLowerCase().includes(searchTerm.toLowerCase())
@@ -159,7 +165,7 @@ export default function Calls() {
                         </span>
                       </div>
                       <p className="text-sm text-zinc-600 mt-2 line-clamp-2 leading-relaxed">
-                        {call.summary || (call.status === 'in-progress' ? 'Call is currently active...' : 'No summary available.')}
+                        {call.summary || summaryFallback(call)}
                       </p>
                       <div className="flex flex-wrap items-center gap-4 mt-4 text-xs text-zinc-500">
                         <div className="flex items-center gap-1.5 font-medium">
@@ -202,9 +208,10 @@ export default function Calls() {
                     {call.status === 'completed' && (
                       <button 
                         onClick={() => togglePlayback(call)}
-                        disabled={!call.recordingUrl || call.recordingStatus === 'requested' || call.recordingStatus === 'processing'}
+                        disabled={!call.recordingUrl}
+                        title={recordingTooltip(call)}
                         className={cn(
-                          "flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold transition-all shadow-sm disabled:opacity-50",
+                          "flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold transition-all shadow-sm disabled:opacity-50 disabled:cursor-not-allowed",
                           playingCallId === call.id 
                             ? "bg-orange-500 text-white hover:bg-orange-600" 
                             : "bg-zinc-900 text-white hover:bg-zinc-800"
@@ -236,7 +243,7 @@ export default function Calls() {
                             AI Analysis Summary
                           </h5>
                           <p className="text-sm text-zinc-700 leading-relaxed font-medium">
-                            {call.summary || 'No summary available.'}
+                            {call.summary || summaryFallback(call)}
                           </p>
                         </div>
 

@@ -33,7 +33,10 @@ export interface CallRecord {
   analysisSummary?: string;
   summaryText?: string;
   callSummary?: string;
+  aiSummary?: string;
+  transcriptSummary?: string;
   transcript: string;
+  transcriptText?: string;
   leadName?: string;
   leadPhone?: string;
   recordingUrl?: string;

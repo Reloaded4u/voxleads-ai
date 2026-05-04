@@ -10,22 +10,39 @@ import { toast } from '../lib/toast';
 
 export const callsService = {
   subscribeToCalls(userId: string, callback: (calls: CallRecord[]) => void) {
-    const normalizeSummary = (data: any) => {
-      const candidates = [
-        { field: 'summary', value: data.summary },
-        { field: 'analysisSummary', value: data.analysisSummary },
-        { field: 'summaryText', value: data.summaryText },
-        { field: 'callSummary', value: data.callSummary },
-        { field: 'analysis.summary', value: data.analysis?.summary },
-      ];
-      const staleSummary = (value: unknown) =>
-        typeof value === 'string' &&
-        value.toLowerCase().includes('no transcript') &&
-        value.toLowerCase().includes('analysis');
+    const staleSummary = (value: unknown) =>
+      typeof value === 'string' &&
+      value.toLowerCase().includes('no transcript') &&
+      value.toLowerCase().includes('analysis');
+
+    const pickField = (data: any, candidates: { field: string; value: unknown }[], logLabel: string) => {
       const result = candidates.find(({ value }) => typeof value === 'string' && value.trim() && !staleSummary(value));
-      console.log('[CALL UI SUMMARY FIELD]', result?.field || 'none');
+      console.log(logLabel, result?.field || 'none');
       return typeof result?.value === 'string' ? result.value : '';
     };
+
+    const normalizeSummary = (data: any) => pickField(data, [
+      { field: 'summary', value: data.summary },
+      { field: 'aiSummary', value: data.aiSummary },
+      { field: 'analysisSummary', value: data.analysisSummary },
+      { field: 'callSummary', value: data.callSummary },
+      { field: 'transcriptSummary', value: data.transcriptSummary },
+    ], '[CALL SUMMARY FIELD USED]');
+
+    const normalizeTranscript = (data: any) => pickField(data, [
+      { field: 'transcriptText', value: data.transcriptText },
+      { field: 'transcript', value: data.transcript },
+    ], '[CALL TRANSCRIPT FIELD USED]');
+
+    const normalizeRecordingUrl = (data: any) => pickField(data, [
+      { field: 'recordingUrl', value: data.recordingUrl },
+      { field: 'recordingURL', value: data.recordingURL },
+      { field: 'RecordingUrl', value: data.RecordingUrl },
+      { field: 'RecordingURL', value: data.RecordingURL },
+      { field: 'record_url', value: data.record_url },
+      { field: 'recording_url', value: data.recording_url },
+      { field: 'url', value: data.url },
+    ], '[CALL RECORDING FIELD USED]');
 
     const q = firebase.query(
       firebase.collection(firebase.db, 'calls'),
@@ -36,10 +53,16 @@ export const callsService = {
     return firebase.onSnapshot(q, (snapshot) => {
       const calls = snapshot.docs.map(doc => {
         const data = doc.data();
+        console.log('[CALL LOG ITEM RAW]', doc.id, data);
+        if (doc.id === 'YFvSiCuTCJhKkTyEpfl1') {
+          console.log('[CALL LOG TARGET DOC FOUND]', doc.id);
+        }
         return {
           id: doc.id,
           ...data,
           summary: normalizeSummary(data),
+          transcript: normalizeTranscript(data),
+          recordingUrl: normalizeRecordingUrl(data),
           createdAt: data.createdAt?.toDate() || new Date(),
           updatedAt: data.updatedAt?.toDate() || new Date(),
         };

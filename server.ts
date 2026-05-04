@@ -693,6 +693,8 @@ async function finalizeCallSummaryFromTranscript(callId: string, transcriptTextF
     analysisSummary: result.summary,
     summaryText: result.summary,
     callSummary: result.summary,
+    aiSummary: result.summary,
+    transcriptSummary: result.summary,
     outcome: result.outcome,
     sentiment: result.sentiment,
     keyPoints: result.keyPoints,
