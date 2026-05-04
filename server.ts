@@ -128,6 +128,7 @@ async function generateAiResponse(
     conversationStage?: string;
     conversationHistory?: Array<{ role: string; text: string }>;
     detectedIntent?: string;
+    preferredLanguage?: string;
     maxWords?: number;
   } = {}
 ) {
@@ -178,8 +179,9 @@ Rules:
 - Do NOT repeat pitch unless user asks
 - Do NOT greet, introduce yourself, or say calling from; the greeting was already handled
 - Detect the language from User said and reply in the same language
+- If Preferred Language is set, continue in that language
 - KB can be any language; do not translate KB literally
-- If info not found in KB, say: 'I can arrange a callback for exact details.'
+- If info not found in KB, say: 'I don't have exact details right now, but our team can share them with you. Want a follow-up?'
 
 Knowledge Base:
 ${JSON.stringify(kbContext)}
@@ -192,6 +194,9 @@ ${options.conversationStage || "opening"}
 
 Intent:
 ${options.detectedIntent || "general"}
+
+Preferred Language:
+${options.preferredLanguage || "auto"}
 
 User said:
 ${userSpeech}
@@ -209,7 +214,7 @@ Reply:`;
     console.log("[KB USED SECTION]", kbUsedSection);
     console.log("[GEMINI PROMPT PREVIEW]", prompt.slice(0, 800));
     if (options.detectedIntent === "pricing" && !hasPricingInFaqs) {
-      const reply = "I don't have exact pricing here. I can arrange a callback.";
+      const reply = "I don't have exact details right now, but our team can share them with you. Want a follow-up?";
       console.log("[GEMINI FINAL REPLY]", reply);
       return reply;
     }
@@ -1200,6 +1205,7 @@ async function startServer() {
     ]);
 
     let savedCallbackTime = "";
+    let preferredLanguage = "en";
 
     const normalizeTimeTranscript = (value: string) =>
       value
@@ -1282,17 +1288,56 @@ async function startServer() {
     const isExplicitSchedulingRequest = (text: string) => {
       const t = normalizeTurnText(text);
       return (
-        /\b(schedule|book|call later|follow up|followup|appointment|site visit|not now|busy|arrange callback|call me later|i am busy|im busy)\b/i.test(t) ||
+        /\b(schedule|book|call later|follow up|followup|appointment|not now|busy|arrange callback|call me later|i am busy|im busy)\b/i.test(t) ||
         /\b(tomorrow at|today evening)\b/i.test(t) ||
         /\bat\s+\d{1,2}\s*(am|pm|a m|p m)\b/i.test(t)
       );
     };
 
+    const isLanguageRequest = (text: string) => {
+      const t = normalizeTurnText(text);
+      return /\b(hindi|english|marathi|tamil|telugu|kannada|malayalam|gujarati|punjabi|bengali|language)\b/i.test(t) &&
+        /\b(talk|speak|baat|bolo|bol|can you|could you)\b/i.test(t);
+    };
+
+    const getRequestedLanguage = (text: string) => {
+      const t = normalizeTurnText(text);
+      if (/\bhindi\b/i.test(t)) return "hi";
+      if (/\bmarathi\b/i.test(t)) return "mr";
+      if (/\benglish\b/i.test(t)) return "en";
+      if (/\btamil\b/i.test(t)) return "ta";
+      if (/\btelugu\b/i.test(t)) return "te";
+      if (/\bkannada\b/i.test(t)) return "kn";
+      if (/\bmalayalam\b/i.test(t)) return "ml";
+      if (/\bgujarati\b/i.test(t)) return "gu";
+      if (/\bpunjabi\b/i.test(t)) return "pa";
+      if (/\bbengali\b/i.test(t)) return "bn";
+      return preferredLanguage;
+    };
+
+    const isObjectionIntent = (text: string) => {
+      const t = normalizeTurnText(text);
+      return /\b(not interested|dont want|do not want|too expensive|already have|stop calling|remove my number|no need)\b/i.test(t);
+    };
+
+    const isMetaComment = (text: string) => {
+      const t = normalizeTurnText(text);
+      const laterStage = ["qualification", "post_qualification", "appointment"].includes(conversationStage);
+      return /\b(i am recording|im recording|recording this|i am testing|im testing|testing this|test call)\b/i.test(t) ||
+        (laterStage && ["okay", "ok", "hello", "hi"].includes(t));
+    };
+
+    const isIdentityQuestion = (text: string) => {
+      const t = normalizeTurnText(text);
+      return /\b(who is this|who are you|who is it|who am i speaking to|where are you calling from)\b/i.test(t);
+    };
+
     const isKbQuestionIntent = (text: string) => {
       const t = normalizeTurnText(text);
       return (
-        t.trim().endsWith("?") ||
-        /\b(offer|offers|price|pricing|cost|location|amenities|amenity|loan|features|feature|where|what|how|why|explain|details)\b/i.test(t)
+        isIdentityQuestion(text) ||
+        text.trim().endsWith("?") ||
+        /\b(offer|offers|price|pricing|cost|rate|rates|details|detail|options|available|feature|features|where|what|which|how|why|explain|product|service|business)\b/i.test(t)
       );
     };
 
@@ -1306,9 +1351,30 @@ async function startServer() {
       return /\b(ok|okay|sounds good|what next|interested|go ahead|next)\b/i.test(t);
     };
 
+    type RoutedIntent =
+      | "language_request"
+      | "direct_question"
+      | "objection"
+      | "scheduling_request"
+      | "meta_comment"
+      | "qualification_answer"
+      | "unclear"
+      | "scripted_next_step";
+
+    const classifyUserIntent = (text: string): RoutedIntent => {
+      if (isLanguageRequest(text)) return "language_request";
+      if (isKbQuestionIntent(text)) return "direct_question";
+      if (isObjectionIntent(text)) return "objection";
+      if (isExplicitSchedulingRequest(text)) return "scheduling_request";
+      if (isMetaComment(text)) return "meta_comment";
+      if (conversationStage === "qualification" && text.trim().split(/\s+/).filter(Boolean).length > 0) return "qualification_answer";
+      if (!text.trim()) return "unclear";
+      return "scripted_next_step";
+    };
+
     const detectIntent = (text: string) => {
       const t = text.toLowerCase();
-      if (t.includes("price") || t.includes("cost")) return "pricing";
+      if (t.includes("price") || t.includes("cost") || t.includes("rate")) return "pricing";
       if (isExplicitSchedulingRequest(text)) return "scheduling";
       if (t.includes("yes") || t.includes("ok")) return "confirmation";
       return "general";
@@ -1496,6 +1562,29 @@ async function startServer() {
     const buildClosingLine = (callData: any, kb: any) =>
       applyGreetingPlaceholders(getScriptField(kb, "closingLine", "Thanks for your time. We'll follow up shortly."), callData, kb);
 
+    const buildIdentityReply = (callData: any, kb: any) =>
+      `This is ${getAgentName(kb, callData)} from ${getKbBusinessName(kb)}.`;
+
+    const buildLanguageReply = () => {
+      if (preferredLanguage === "hi") return "Haan, main Hindi mein baat kar sakti hoon.";
+      return "Sure, I can continue in that language.";
+    };
+
+    const getCurrentPendingPrompt = (callData: any, kb: any) => {
+      if (conversationStage === "availability") return buildAvailabilityQuestion(callData, kb);
+      if (conversationStage === "permission") return buildPermissionQuestion(callData, kb);
+      if (conversationStage === "hook") return applyGreetingPlaceholders(getOpeningHook(kb), callData, kb);
+      if (conversationStage === "pitch") return applyGreetingPlaceholders(getMainPitch(kb), callData, kb);
+      if (conversationStage === "qualification") {
+        const questions = getQualificationQuestions(kb);
+        return questions[currentQuestionIndex]?.text
+          ? applyGreetingPlaceholders(questions[currentQuestionIndex].text, callData, kb)
+          : "";
+      }
+      if (conversationStage === "appointment" && !appointmentPromptDelivered) return buildSchedulingQuestion(callData, kb);
+      return "";
+    };
+
     const preQualificationStagesDelivered = () =>
       availabilityDelivered && permissionDelivered && hookDelivered && pitchDelivered;
 
@@ -1609,14 +1698,18 @@ async function startServer() {
     const getNextReply = async (transcript: string, callState: any, kb: any) => {
       const callData = callState.callData;
       const callContext = callState.callContext;
+      const routedIntent = classifyUserIntent(transcript);
       const intent =
-        isKbQuestionIntent(transcript) ? "kb_question" :
-        isExplicitSchedulingRequest(transcript) ? "appointment" :
+        routedIntent === "direct_question" ? "kb_question" :
+        routedIntent === "scheduling_request" ? "appointment" :
+        routedIntent === "objection" ? "negative" :
         isPermissionNegative(transcript) ? "negative" :
         isPositiveResponse(transcript) ? "positive" :
         callState.detectedIntent || "general";
 
       console.log("[STATE BEFORE]", conversationStage);
+      console.log("[INTENT ROUTER]", routedIntent);
+      console.log("[INTENT PRIORITY]", "language_request > direct_question > objection > scheduling_request > meta_comment > qualification_answer > scripted_next_step");
       console.log("[INTENT]", intent);
       console.log("[QUESTION INDEX]", currentQuestionIndex);
 
@@ -1629,11 +1722,30 @@ async function startServer() {
 
       if (conversationStage === "ended") return decision("", "ended", false);
 
+      if (routedIntent === "language_request") {
+        preferredLanguage = getRequestedLanguage(transcript);
+        console.log("[LANGUAGE SWITCH]", preferredLanguage);
+        console.log("[RETURNING TO STAGE]", conversationStage);
+        return decision(buildLanguageReply(), conversationStage, false, 14);
+      }
+
+      if (routedIntent === "meta_comment") {
+        console.log("[META COMMENT HANDLED]", transcript);
+        console.log("[RETURNING TO STAGE]", conversationStage);
+        const pendingPrompt = getCurrentPendingPrompt(callData, kb);
+        return decision(pendingPrompt, conversationStage, false, 14);
+      }
+
       if (intent === "kb_question") {
         if (conversationStage === "appointment") {
           console.log("[USER QUESTION OVERRIDES APPOINTMENT]");
         } else {
           console.log("[INTENT OVERRIDE] user question detected, skipping appointment");
+        }
+        if (isIdentityQuestion(transcript)) {
+          console.log("[DIRECT QUESTION HANDLED]");
+          console.log("[RETURNING TO STAGE]", conversationStage);
+          return decision(buildIdentityReply(callData, kb), conversationStage, false, 14);
         }
         const answer = await timedStep("Gemini", () => generateGeminiReply({
           transcript,
@@ -1641,11 +1753,29 @@ async function startServer() {
           callContext,
           conversationStage,
           conversationHistory,
-          detectedIntent: callState.detectedIntent,
+          detectedIntent: detectIntent(transcript),
+          preferredLanguage,
           maxWords: 14,
         }));
+        console.log("[DIRECT QUESTION HANDLED]");
         console.log("[FAQ ANSWERED]");
+        console.log("[RETURNING TO STAGE]", conversationStage);
         return decision(sanitizeAiReplyForStage(answer, "I can answer that from the details I have."), conversationStage, true, 14);
+      }
+
+      if (routedIntent === "objection") {
+        const answer = await timedStep("Gemini", () => generateGeminiReply({
+          transcript,
+          knowledgeBase: kb,
+          callContext,
+          conversationStage,
+          conversationHistory,
+          detectedIntent: "objection",
+          preferredLanguage,
+          maxWords: 14,
+        }));
+        console.log("[RETURNING TO STAGE]", conversationStage);
+        return decision(sanitizeAiReplyForStage(answer, buildClosingLine(callData, kb)), conversationStage, true, 14);
       }
 
       if (conversationStage === "post_qualification") {
@@ -1665,6 +1795,7 @@ async function startServer() {
           conversationStage,
           conversationHistory,
           detectedIntent: callState.detectedIntent,
+          preferredLanguage,
           maxWords: 14,
         }));
         console.log("[FAQ ANSWERED]");
