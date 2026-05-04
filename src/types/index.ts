@@ -35,7 +35,7 @@ export interface CallRecord {
   leadPhone?: string;
   recordingUrl?: string;
   recordingSid?: string;
-  recordingStatus?: 'requested' | 'processing' | 'completed' | 'failed';
+  recordingStatus?: 'requested' | 'processing' | 'completed' | 'available' | 'failed';
   recordingProvider?: 'twilio' | 'vobiz';
   recordingDuration?: number;
   recordingDurationMs?: number;

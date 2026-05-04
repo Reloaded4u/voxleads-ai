@@ -238,26 +238,6 @@ Reply:`;
     const maxWords = options.maxWords || 15;
 
     if (countWords(reply) > maxWords) {
-      const shortenResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{
-            parts: [{
-              text: `${prompt}\n\nPrevious reply:\n${reply}\n\nRewrite in ${maxWords} words or fewer. Keep one complete sentence. Reply:`
-            }]
-          }]
-        })
-      });
-      const shortenData = await shortenResponse.json();
-      console.log("[GEMINI RAW]", JSON.stringify(shortenData));
-      if (shortenResponse.ok && !shortenData?.error) {
-        const shorterReply = (shortenData?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
-        if (shorterReply) reply = shorterReply;
-      }
-    }
-
-    if (countWords(reply) > maxWords) {
       const sentenceCut = lastCompleteSentenceWithinLimit(reply, maxWords);
       if (sentenceCut) reply = sentenceCut;
     }
@@ -278,6 +258,7 @@ async function generateGeminiReply({
   conversationHistory,
   detectedIntent,
   maxWords,
+  preferredLanguage,
 }: {
   transcript: string;
   knowledgeBase: any;
@@ -285,12 +266,14 @@ async function generateGeminiReply({
   conversationStage?: string;
   conversationHistory?: Array<{ role: string; text: string }>;
   detectedIntent?: string;
+  preferredLanguage?: string;
   maxWords?: number;
 }) {
   return generateAiResponse(transcript, callContext, knowledgeBase, {
     conversationStage,
     conversationHistory,
     detectedIntent,
+    preferredLanguage,
     maxWords,
   });
 }
@@ -572,7 +555,10 @@ const liveCallTranscriptBuffers = new Map<string, TranscriptEntry[]>();
 function formatTranscriptEntries(entries: TranscriptEntry[]) {
   return entries
     .filter((entry) => entry.text && entry.text.trim())
-    .map((entry) => `[${entry.timestamp}] ${entry.role}: ${entry.text.trim()}`)
+    .map((entry) => {
+      const label = entry.role === "Lead" ? "User" : "AI";
+      return `[${entry.timestamp}] [${label}]: ${entry.text.trim()}`;
+    })
     .join("\n");
 }
 
@@ -673,7 +659,7 @@ async function finalizeCallSummaryFromTranscript(callId: string, transcriptTextF
   console.log("[SUMMARY INPUT LENGTH]", transcriptText.length);
 
   if (!transcriptText) {
-    console.log("[SUMMARY SKIPPED EMPTY TRANSCRIPT]");
+    console.log("[SUMMARY SKIPPED EMPTY]");
     await callRef.update(sanitizeForFirestore({
       transcript: "",
       transcriptText: "",
@@ -687,7 +673,7 @@ async function finalizeCallSummaryFromTranscript(callId: string, transcriptTextF
     transcriptText,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   }));
-  console.log("[TRANSCRIPT SAVE]", callId, "bytes=", transcriptText.length);
+  console.log("[TRANSCRIPT SAVE LENGTH]", callId, "bytes=", transcriptText.length);
 
   const existingSummary = String(callData.summary || "").trim();
   const hasUsableSummary =
@@ -699,6 +685,7 @@ async function finalizeCallSummaryFromTranscript(callId: string, transcriptTextF
 
   const analysis = await generateServerCallSummary(transcriptText, callData.knowledgeBaseSnapshot || {});
   const result = normalizeServerAnalysisResult(analysis);
+  console.log("[SUMMARY GENERATED]", result.summary);
 
   await callRef.update(sanitizeForFirestore({
     summary: result.summary,
@@ -1372,8 +1359,8 @@ async function startServer() {
           transcript: transcriptText,
           transcriptText,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        })).catch((error) => console.error("[TRANSCRIPT SAVE] update failed:", error));
-        console.log("[TRANSCRIPT SAVE]", callId, "bytes=", transcriptText.length);
+        })).catch((error) => console.error("[TRANSCRIPT SAVE LENGTH] update failed:", error));
+        console.log("[TRANSCRIPT SAVE LENGTH]", callId, "bytes=", transcriptText.length);
       }
     };
     const STT_WINDOW_FRAMES = 60; // 1.2 seconds at 20ms/frame
@@ -1382,7 +1369,20 @@ async function startServer() {
     ]);
 
     let savedCallbackTime = "";
-    let preferredLanguage = "en";
+    let preferredLanguage = "English";
+    const appointmentData: {
+      requested: boolean;
+      type: string | null;
+      date: string | null;
+      time: string | null;
+      confirmed: boolean;
+    } = {
+      requested: false,
+      type: null,
+      date: null,
+      time: null,
+      confirmed: false,
+    };
 
     const normalizeTimeTranscript = (value: string) =>
       value
@@ -1403,15 +1403,57 @@ async function startServer() {
 
     const extractCallbackTime = (value: string) => {
       const normalized = normalizeTimeTranscript(value);
-      const match = normalized.match(/\b(\d{1,2})(?::\d{2})?\s*(am|pm|a m|p m)?\b/i);
+      const match = normalized.match(/\b(\d{1,2})(?::\d{2})?\s*(am|pm|a m|p m)\b/i);
       if (!match) {
-        if (/\b(morning|afternoon|evening|tomorrow|today)\b/i.test(normalized)) return normalized;
-        return "";
+        const period = normalized.match(/\b(morning|afternoon|evening)\b/i)?.[1];
+        return period || "";
       }
 
       const hour = match[1];
       const suffix = (match[2] || "").replace(/\s+/g, "").toUpperCase();
-      return suffix ? `${hour} ${suffix}` : hour;
+      return `${hour} ${suffix}`;
+    };
+
+    const extractCallbackDate = (value: string) => {
+      const t = normalizeTurnText(value);
+      if (/\btomorrow\b/i.test(t)) return "tomorrow";
+      if (/\btoday\b/i.test(t)) return "today";
+      if (/\bnext week\b/i.test(t)) return "next week";
+      if (/\b(morning|afternoon|evening)\b/i.test(t)) return t.match(/\b(morning|afternoon|evening)\b/i)?.[1] || "";
+      return "";
+    };
+
+    const extractAppointmentType = (value: string) => {
+      const t = normalizeTurnText(value);
+      if (/\bsite visit\b/i.test(t)) return "site visit";
+      if (/\bfollow up|followup\b/i.test(t)) return "follow-up";
+      if (/\bcall back|callback|call later\b/i.test(t)) return "callback";
+      if (/\bappointment\b/i.test(t)) return "appointment";
+      if (/\bmeeting\b/i.test(t)) return "meeting";
+      return null;
+    };
+
+    const updateAppointmentData = (text: string) => {
+      const type = extractAppointmentType(text);
+      const date = extractCallbackDate(text);
+      const time = extractCallbackTime(text);
+
+      if (type || date || time || isExplicitSchedulingRequest(text)) appointmentData.requested = true;
+      if (type) appointmentData.type = type;
+      if (date) appointmentData.date = date;
+      if (time) {
+        appointmentData.time = time;
+        savedCallbackTime = time;
+      }
+
+      console.log("[APPOINTMENT DATA UPDATED]", JSON.stringify(appointmentData));
+      return { date, time, type };
+    };
+
+    const buildAppointmentMemoryConfirmation = () => {
+      const datePart = appointmentData.date || "the requested date";
+      const timePart = appointmentData.time || "the requested time";
+      return `Got it. I'll arrange that for ${datePart} at ${timePart}.`;
     };
 
     const getMaxWordsForStage = () => 14;
@@ -1465,8 +1507,9 @@ async function startServer() {
     const isExplicitSchedulingRequest = (text: string) => {
       const t = normalizeTurnText(text);
       return (
-        /\b(schedule|book|call later|follow up|followup|appointment|not now|busy|arrange callback|call me later|i am busy|im busy)\b/i.test(t) ||
-        /\b(tomorrow at|today evening)\b/i.test(t) ||
+        /\b(schedule|book|call later|follow up|followup|appointment|not now|busy|arrange callback|call me later|i am busy|im busy|site visit|callback|call back|meeting)\b/i.test(t) ||
+        /\b(tomorrow at|today evening|today|tomorrow|next week)\b/i.test(t) ||
+        /\b\d{1,2}\s*(am|pm|a m|p m)\b/i.test(t) ||
         /\bat\s+\d{1,2}\s*(am|pm|a m|p m)\b/i.test(t)
       );
     };
@@ -1479,16 +1522,16 @@ async function startServer() {
 
     const getRequestedLanguage = (text: string) => {
       const t = normalizeTurnText(text);
-      if (/\bhindi\b/i.test(t)) return "hi";
-      if (/\bmarathi\b/i.test(t)) return "mr";
-      if (/\benglish\b/i.test(t)) return "en";
-      if (/\btamil\b/i.test(t)) return "ta";
-      if (/\btelugu\b/i.test(t)) return "te";
-      if (/\bkannada\b/i.test(t)) return "kn";
-      if (/\bmalayalam\b/i.test(t)) return "ml";
-      if (/\bgujarati\b/i.test(t)) return "gu";
-      if (/\bpunjabi\b/i.test(t)) return "pa";
-      if (/\bbengali\b/i.test(t)) return "bn";
+      if (/\bhindi\b/i.test(t)) return "Hindi";
+      if (/\bmarathi\b/i.test(t)) return "Marathi";
+      if (/\benglish\b/i.test(t)) return "English";
+      if (/\btamil\b/i.test(t)) return "Tamil";
+      if (/\btelugu\b/i.test(t)) return "Telugu";
+      if (/\bkannada\b/i.test(t)) return "Kannada";
+      if (/\bmalayalam\b/i.test(t)) return "Malayalam";
+      if (/\bgujarati\b/i.test(t)) return "Gujarati";
+      if (/\bpunjabi\b/i.test(t)) return "Punjabi";
+      if (/\bbengali\b/i.test(t)) return "Bengali";
       return preferredLanguage;
     };
 
@@ -1743,8 +1786,8 @@ async function startServer() {
       `This is ${getAgentName(kb, callData)} from ${getKbBusinessName(kb)}.`;
 
     const buildLanguageReply = () => {
-      if (preferredLanguage === "hi") return "Haan, main Hindi mein baat kar sakti hoon.";
-      return "Sure, I can continue in that language.";
+      if (preferredLanguage === "Hindi") return "Haan, main Hindi mein baat kar sakti hoon.";
+      return `Sure, I can continue in ${preferredLanguage}.`;
     };
 
     const getCurrentPendingPrompt = (callData: any, kb: any) => {
@@ -1821,12 +1864,13 @@ async function startServer() {
 
     const timedStep = async <T>(label: string, fn: () => Promise<T>): Promise<T> => {
       const start = Date.now();
-      console.log(`[TIMING] ${label} start`);
+      const timingLabel = label === "getNextReply" ? "intent routing" : label;
+      console.log(`[TIMING] ${timingLabel} start`);
       try {
         return await fn();
       } finally {
         const duration = Date.now() - start;
-        console.log(`[TIMING] ${label} end duration=${duration}ms`);
+        console.log(`[TIMING] ${timingLabel} end duration=${duration}ms`);
       }
     };
 
@@ -1902,6 +1946,7 @@ async function startServer() {
       if (routedIntent === "language_request") {
         preferredLanguage = getRequestedLanguage(transcript);
         console.log("[LANGUAGE SWITCH]", preferredLanguage);
+        console.log("[GEMINI SKIPPED]");
         console.log("[RETURNING TO STAGE]", conversationStage);
         return decision(buildLanguageReply(), conversationStage, false, 14);
       }
@@ -1924,6 +1969,7 @@ async function startServer() {
           console.log("[RETURNING TO STAGE]", conversationStage);
           return decision(buildIdentityReply(callData, kb), conversationStage, false, 14);
         }
+        console.log("[GEMINI CALLED]");
         const answer = await timedStep("Gemini", () => generateGeminiReply({
           transcript,
           knowledgeBase: kb,
@@ -1941,6 +1987,7 @@ async function startServer() {
       }
 
       if (routedIntent === "objection") {
+        console.log("[GEMINI CALLED]");
         const answer = await timedStep("Gemini", () => generateGeminiReply({
           transcript,
           knowledgeBase: kb,
@@ -1962,9 +2009,11 @@ async function startServer() {
         }
         if (isAppointmentSuggestionIntent(transcript)) {
           console.log("[APPOINTMENT TRIGGERED]");
+          console.log("[GEMINI SKIPPED]");
           return decision(deliverAppointmentPrompt(callData, kb), "appointment", false);
         }
         console.log("[APPOINTMENT DEFERRED]");
+        console.log("[GEMINI CALLED]");
         const answer = await timedStep("Gemini", () => generateGeminiReply({
           transcript,
           knowledgeBase: kb,
@@ -1980,11 +2029,16 @@ async function startServer() {
       }
 
       if (conversationStage === "appointment") {
-        const normalizedTime = extractCallbackTime(transcript);
-        if (normalizedTime) {
-          savedCallbackTime = normalizedTime;
-          console.log("[SCHEDULING TIME DETECTED]", transcript, normalizedTime);
-          return decision(`Got it, I'll arrange a callback at ${normalizedTime}. ${buildClosingLine(callData, kb)}`, "closing", false, 30);
+        updateAppointmentData(transcript);
+        if (appointmentData.date && appointmentData.time) {
+          appointmentData.confirmed = true;
+          console.log("[APPOINTMENT TIME ALREADY KNOWN]");
+          console.log("[APPOINTMENT CONFIRMED]", JSON.stringify(appointmentData));
+          console.log("[GEMINI SKIPPED]");
+          return decision(buildAppointmentMemoryConfirmation(), "post_qualification", false, 12);
+        }
+        if (appointmentData.time || appointmentData.date) {
+          console.log("[APPOINTMENT DATA UPDATED]", JSON.stringify(appointmentData));
         }
         if (isContinueInfoRequest(transcript)) {
           console.log("[CONTINUE HANDLED AS INFO REQUEST]");
@@ -1994,18 +2048,31 @@ async function startServer() {
           console.log("[APPOINTMENT LOOP BLOCKED]");
           return decision("", "appointment", false);
         }
+        console.log("[GEMINI SKIPPED]");
         return decision(deliverAppointmentPrompt(callData, kb), "appointment", false);
       }
 
-      if (intent === "appointment") return decision(deliverAppointmentPrompt(callData, kb), "appointment", false);
+      if (intent === "appointment") {
+        updateAppointmentData(transcript);
+        if (appointmentData.date && appointmentData.time) {
+          appointmentData.confirmed = true;
+          console.log("[APPOINTMENT TIME ALREADY KNOWN]");
+          console.log("[APPOINTMENT CONFIRMED]", JSON.stringify(appointmentData));
+          return decision(buildAppointmentMemoryConfirmation(), "post_qualification", false, 12);
+        }
+        console.log("[GEMINI SKIPPED]");
+        return decision(deliverAppointmentPrompt(callData, kb), "appointment", false);
+      }
 
       if (conversationStage === "availability") {
         if (!availabilityDelivered) {
           leadData.nameConfirmed = leadData.nameConfirmed || isIdentityConfirmed(transcript);
           if (leadData.nameConfirmed) console.log("[NAME CONFIRMATION] accepted");
           availabilityDelivered = true;
+          console.log("[GEMINI SKIPPED]");
           return decision(buildAvailabilityQuestion(callData, kb), "permission", false);
         }
+        console.log("[GEMINI SKIPPED]");
         return decision(buildPermissionQuestion(callData, kb), "hook", false);
       }
 
@@ -2013,8 +2080,10 @@ async function startServer() {
         if (intent === "negative") return decision(buildClosingLine(callData, kb), "closing", false, 30);
         if (!permissionDelivered) {
           permissionDelivered = true;
+          console.log("[GEMINI SKIPPED]");
           return decision(buildPermissionQuestion(callData, kb), "hook", false);
         }
+        console.log("[GEMINI SKIPPED]");
         return decision(applyGreetingPlaceholders(getOpeningHook(kb), callData, kb), "pitch", false);
       }
 
@@ -2022,16 +2091,20 @@ async function startServer() {
         if (intent === "negative") return decision(buildClosingLine(callData, kb), "closing", false, 30);
         if (!hookDelivered) {
           hookDelivered = true;
+          console.log("[GEMINI SKIPPED]");
           return decision(applyGreetingPlaceholders(getOpeningHook(kb), callData, kb), "pitch", false);
         }
+        console.log("[GEMINI SKIPPED]");
         return decision(applyGreetingPlaceholders(getMainPitch(kb), callData, kb), "qualification", false);
       }
 
       if (conversationStage === "pitch") {
         if (!pitchDelivered) {
           pitchDelivered = true;
+          console.log("[GEMINI SKIPPED]");
           return decision(applyGreetingPlaceholders(getMainPitch(kb), callData, kb), "qualification", false);
         }
+        console.log("[GEMINI SKIPPED]");
         return decision(askNextQualificationQuestion(callData, kb), "qualification", false);
       }
 
@@ -2048,6 +2121,7 @@ async function startServer() {
 
       if (conversationStage === "closing") return decision(buildClosingLine(callData, kb), "ended", false, 30);
 
+      console.log("[GEMINI CALLED]");
       const answer = await timedStep("Gemini", () => generateGeminiReply({
         transcript,
         knowledgeBase: kb,
@@ -2055,6 +2129,7 @@ async function startServer() {
         conversationStage,
         conversationHistory,
         detectedIntent: callState.detectedIntent,
+        preferredLanguage,
         maxWords: 14,
       }));
       return decision(sanitizeAiReplyForStage(answer, buildAvailabilityQuestion(callData, kb)), conversationStage, true, 14);
@@ -2354,6 +2429,7 @@ async function startServer() {
 
         console.log("[GEMINI OUTPUT]", reply);
         console.log("[GEMINI FINAL REPLY]", reply);
+        console.log("[TTS TEXT]", reply);
         console.log("[CONVERSATION STAGE]", conversationStage);
         if (isEnded()) return;
 
@@ -2366,6 +2442,7 @@ async function startServer() {
         if (callId) {
           await db.collection("calls").doc(callId).update(sanitizeForFirestore({
             leadData,
+            appointmentData,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           }));
         }
@@ -2404,7 +2481,7 @@ async function startServer() {
         console.error("[Vobiz Turn] Error:", err);
         if (!isEnded()) state = "LISTENING";
       } finally {
-        console.log(`[TIMING] total turn duration=${Date.now() - totalTurnStart}ms`);
+        console.log("[TIMING TOTAL TURN]", Date.now() - totalTurnStart, "ms");
         if (turnInProgress) {
           turnInProgress = false;
           console.log("[TURN LOCK] released");
@@ -2915,6 +2992,7 @@ async function startServer() {
     const { callId } = req.query;
     const body = req.body || {};
 
+    console.log("[RECORDING WEBHOOK RECEIVED]", `callId=${callId} body=${JSON.stringify(body)}`);
     console.log(`[Vobiz Recording Webhook] callId=${callId} body=${JSON.stringify(body)}`);
 
     if (!callId) {
@@ -2923,13 +3001,22 @@ async function startServer() {
 
     try {
       console.log("[Vobiz Recording Webhook] Full body:", JSON.stringify(body));
-      const recordingUrl = body.RecordUrl || body.RecordFile || body.RecordingURL || body.recording_url || body.record_url || body.url;
-      const recordingSid = body.RecordingID || body.recording_id;
+      const recordingUrl = body.RecordUrl || body.RecordFile || body.RecordingURL || body.recording_url || body.record_url || body.url || body.URL || body.file || body.file_url || body.download_url;
+      const recordingSid = body.RecordingID || body.recording_id || body.recordingId || body.RecordID || body.id;
+      const recordingStatus = recordingUrl ? "available" : (recordingSid ? "processing" : "failed");
+      if (recordingUrl) {
+        console.log("[RECORDING URL SAVED]", recordingUrl);
+      } else {
+        console.log("[RECORDING PAYLOAD MISSING URL]", JSON.stringify(body));
+      }
+      console.log("[RECORDING STATUS UPDATED]", recordingStatus);
 
       await db.collection("calls").doc(callId as string).update(sanitizeForFirestore({
         recordingUrl,
         recordingSid,
-        recordingStatus: recordingUrl ? "completed" : "processing",
+        recordingProviderId: recordingSid,
+        recordingProvider: "vobiz",
+        recordingStatus,
         recordingDuration: body.recording_duration ? parseInt(String(body.recording_duration), 10) : undefined,
         recordingDurationMs: body.recording_duration_ms ? parseInt(String(body.recording_duration_ms), 10) : undefined,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
