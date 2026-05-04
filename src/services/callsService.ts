@@ -10,6 +10,23 @@ import { toast } from '../lib/toast';
 
 export const callsService = {
   subscribeToCalls(userId: string, callback: (calls: CallRecord[]) => void) {
+    const normalizeSummary = (data: any) => {
+      const candidates = [
+        { field: 'summary', value: data.summary },
+        { field: 'analysisSummary', value: data.analysisSummary },
+        { field: 'summaryText', value: data.summaryText },
+        { field: 'callSummary', value: data.callSummary },
+        { field: 'analysis.summary', value: data.analysis?.summary },
+      ];
+      const staleSummary = (value: unknown) =>
+        typeof value === 'string' &&
+        value.toLowerCase().includes('no transcript') &&
+        value.toLowerCase().includes('analysis');
+      const result = candidates.find(({ value }) => typeof value === 'string' && value.trim() && !staleSummary(value));
+      console.log('[CALL UI SUMMARY FIELD]', result?.field || 'none');
+      return typeof result?.value === 'string' ? result.value : '';
+    };
+
     const q = firebase.query(
       firebase.collection(firebase.db, 'calls'),
       firebase.where('ownerId', '==', userId),
@@ -17,12 +34,16 @@ export const callsService = {
     );
 
     return firebase.onSnapshot(q, (snapshot) => {
-      const calls = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data(),
-        createdAt: doc.data().createdAt?.toDate() || new Date(),
-        updatedAt: doc.data().updatedAt?.toDate() || new Date(),
-      })) as CallRecord[];
+      const calls = snapshot.docs.map(doc => {
+        const data = doc.data();
+        return {
+          id: doc.id,
+          ...data,
+          summary: normalizeSummary(data),
+          createdAt: data.createdAt?.toDate() || new Date(),
+          updatedAt: data.updatedAt?.toDate() || new Date(),
+        };
+      }) as CallRecord[];
       callback(calls);
     }, (error) => {
       errorHandler.handleFirestoreError(error, OperationType.LIST, 'calls');

@@ -25,6 +25,14 @@ import { CallRecord } from '../types';
 
 export default function Calls() {
   const { calls, loading } = useCalls();
+
+  useEffect(() => {
+    calls.forEach(call => {
+      if (call.summary) {
+        console.log('[CALL SUMMARY DISPLAYED]', call.id, call.summary);
+      }
+    });
+  }, [calls]);
   const [playingCallId, setPlayingCallId] = useState<string | null>(null);
   const [expandedCallId, setExpandedCallId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');

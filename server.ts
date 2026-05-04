@@ -690,6 +690,9 @@ async function finalizeCallSummaryFromTranscript(callId: string, transcriptTextF
 
   await callRef.update(sanitizeForFirestore({
     summary: result.summary,
+    analysisSummary: result.summary,
+    summaryText: result.summary,
+    callSummary: result.summary,
     outcome: result.outcome,
     sentiment: result.sentiment,
     keyPoints: result.keyPoints,

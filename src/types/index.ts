@@ -30,6 +30,9 @@ export interface CallRecord {
   endedAt?: any;
   cost?: number;
   summary: string;
+  analysisSummary?: string;
+  summaryText?: string;
+  callSummary?: string;
   transcript: string;
   leadName?: string;
   leadPhone?: string;
