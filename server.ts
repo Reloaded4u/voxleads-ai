@@ -673,6 +673,7 @@ async function finalizeCallSummaryFromTranscript(callId: string, transcriptTextF
     transcriptText,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   }));
+  console.log("[TRANSCRIPT SAVED]", callId);
   console.log("[TRANSCRIPT SAVE LENGTH]", callId, "bytes=", transcriptText.length);
 
   const existingSummary = String(callData.summary || "").trim();
@@ -696,6 +697,7 @@ async function finalizeCallSummaryFromTranscript(callId: string, transcriptTextF
     nextAction: result.nextAction,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   }));
+  console.log("[SUMMARY SAVED]", callId);
 
   if (callData.leadId) {
     await db.collection("leads").doc(callData.leadId).update(sanitizeForFirestore({
@@ -2490,6 +2492,8 @@ async function startServer() {
     };
 
     const endCall = () => {
+      console.log("[CALL END START]", callId);
+      console.log("[TRANSCRIPT BUFFER LENGTH]", transcriptBuffer.length);
       if (isEnded()) return;
       state = "ENDED";
       console.log("[Vobiz State] ENDED");
@@ -2993,6 +2997,7 @@ async function startServer() {
     const body = req.body || {};
 
     console.log("[RECORDING WEBHOOK RECEIVED]", `callId=${callId} body=${JSON.stringify(body)}`);
+    console.log("[RECORDING PAYLOAD]", JSON.stringify(body));
     console.log(`[Vobiz Recording Webhook] callId=${callId} body=${JSON.stringify(body)}`);
 
     if (!callId) {
@@ -3008,6 +3013,7 @@ async function startServer() {
         console.log("[RECORDING URL SAVED]", recordingUrl);
       } else {
         console.log("[RECORDING PAYLOAD MISSING URL]", JSON.stringify(body));
+        console.log("[RECORDING FAILED REASON]", recordingSid ? "recording id present but URL missing" : "recording URL and provider id missing");
       }
       console.log("[RECORDING STATUS UPDATED]", recordingStatus);
 
@@ -3023,6 +3029,7 @@ async function startServer() {
       }));
     } catch (error) {
       console.error("[Vobiz Recording Webhook] Update failed:", error);
+      console.log("[RECORDING FAILED REASON]", error instanceof Error ? error.message : String(error));
     }
 
     res.json({ ok: true });
@@ -3159,8 +3166,11 @@ ${speakXml}  </Gather>
       );
 
       if (isFinalStatus) {
+        const bufferEntries = liveCallTranscriptBuffers.get(callId as string) || [];
+        console.log("[CALL END START]", callId);
+        console.log("[TRANSCRIPT BUFFER LENGTH]", bufferEntries.length);
         const memoryTranscript = liveCallTranscriptBuffers.has(callId as string)
-          ? formatTranscriptEntries(liveCallTranscriptBuffers.get(callId as string) || [])
+          ? formatTranscriptEntries(bufferEntries)
           : "";
         await finalizeCallSummaryFromTranscript(callId as string, memoryTranscript);
         liveCallTranscriptBuffers.delete(callId as string);
