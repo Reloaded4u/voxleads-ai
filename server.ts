@@ -561,6 +561,163 @@ function sanitizeForFirestore(obj: any): any {
   return sanitized;
 }
 
+type TranscriptEntry = {
+  role: "Lead" | "AI";
+  text: string;
+  timestamp: string;
+};
+
+const liveCallTranscriptBuffers = new Map<string, TranscriptEntry[]>();
+
+function formatTranscriptEntries(entries: TranscriptEntry[]) {
+  return entries
+    .filter((entry) => entry.text && entry.text.trim())
+    .map((entry) => `[${entry.timestamp}] ${entry.role}: ${entry.text.trim()}`)
+    .join("\n");
+}
+
+function normalizeServerAnalysisResult(analysis: any) {
+  const fallback = {
+    summary: "Summary unavailable.",
+    outcome: "Contacted",
+    sentiment: "neutral",
+    keyPoints: [] as string[],
+    objectionsRaised: [] as string[],
+    nextAction: "Follow up with lead.",
+  };
+
+  if (!analysis || typeof analysis !== "object") return fallback;
+
+  const validSentiments = new Set(["positive", "neutral", "negative"]);
+  const validOutcomes = new Set(["New", "Contacted", "Interested", "Not Interested", "Follow-up", "Booked"]);
+
+  return {
+    summary: typeof analysis.summary === "string" && analysis.summary.trim() ? analysis.summary.trim() : fallback.summary,
+    outcome: validOutcomes.has(analysis.outcome) ? analysis.outcome : fallback.outcome,
+    sentiment: validSentiments.has(analysis.sentiment) ? analysis.sentiment : fallback.sentiment,
+    keyPoints: Array.isArray(analysis.keyPoints) ? analysis.keyPoints.filter((item: any) => typeof item === "string") : fallback.keyPoints,
+    objectionsRaised: Array.isArray(analysis.objectionsRaised) ? analysis.objectionsRaised.filter((item: any) => typeof item === "string") : fallback.objectionsRaised,
+    nextAction: typeof analysis.nextAction === "string" && analysis.nextAction.trim() ? analysis.nextAction.trim() : fallback.nextAction,
+  };
+}
+
+function buildServerSummaryPrompt(kb: any, transcriptText: string) {
+  const businessName =
+    kb?.businessProfile?.name ||
+    kb?.businessProfile?.businessName ||
+    kb?.profile?.name ||
+    "our business";
+
+  return `Analyze the following call transcript for ${businessName}.
+
+TRANSCRIPT:
+${transcriptText}
+
+Return a JSON object with:
+- summary: concise professional summary
+- keyPoints: array of key discussion points
+- objectionsRaised: array of objections raised by the lead
+- sentiment: one of "positive", "neutral", "negative"
+- outcome: one of "Interested", "Not Interested", "Follow-up", "Contacted", "Booked"
+- nextAction: recommended next action
+
+Return ONLY valid JSON.`;
+}
+
+async function generateServerCallSummary(transcriptText: string, kb: any) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+
+  const prompt = buildServerSummaryPrompt(kb, transcriptText);
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: "application/json" },
+    }),
+  });
+
+  const data = await response.json();
+  if (!response.ok || data?.error) {
+    console.error("[SUMMARY ERROR]", JSON.stringify(data?.error || data));
+    return null;
+  }
+
+  const text = (data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+  if (!text) return null;
+
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    console.error("[SUMMARY ERROR] JSON parse failed:", error);
+    return null;
+  }
+}
+
+async function finalizeCallSummaryFromTranscript(callId: string, transcriptTextFromMemory = "") {
+  if (!callId) return;
+
+  const callRef = db.collection("calls").doc(callId);
+  const callSnap = await callRef.get();
+  if (!callSnap.exists) return;
+
+  const callData = callSnap.data() || {};
+  const transcriptText = (
+    transcriptTextFromMemory ||
+    callData.transcriptText ||
+    callData.transcript ||
+    ""
+  ).trim();
+
+  console.log("[SUMMARY INPUT LENGTH]", transcriptText.length);
+
+  if (!transcriptText) {
+    console.log("[SUMMARY SKIPPED EMPTY TRANSCRIPT]");
+    await callRef.update(sanitizeForFirestore({
+      transcript: "",
+      transcriptText: "",
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }));
+    return;
+  }
+
+  await callRef.update(sanitizeForFirestore({
+    transcript: transcriptText,
+    transcriptText,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }));
+  console.log("[TRANSCRIPT SAVE]", callId, "bytes=", transcriptText.length);
+
+  const existingSummary = String(callData.summary || "").trim();
+  const hasUsableSummary =
+    existingSummary &&
+    existingSummary !== "Summary unavailable." &&
+    !existingSummary.toLowerCase().includes("analysis could not be completed");
+
+  if (hasUsableSummary) return;
+
+  const analysis = await generateServerCallSummary(transcriptText, callData.knowledgeBaseSnapshot || {});
+  const result = normalizeServerAnalysisResult(analysis);
+
+  await callRef.update(sanitizeForFirestore({
+    summary: result.summary,
+    outcome: result.outcome,
+    sentiment: result.sentiment,
+    keyPoints: result.keyPoints,
+    objectionsRaised: result.objectionsRaised,
+    nextAction: result.nextAction,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }));
+
+  if (callData.leadId) {
+    await db.collection("leads").doc(callData.leadId).update(sanitizeForFirestore({
+      status: result.outcome,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    })).catch((error) => console.error("[SUMMARY ERROR] Lead update failed:", error));
+  }
+}
+
 // Twilio Webhook Validation Middleware
 async function validateTwilioRequest(req: any, res: any, next: any) {
   if (process.env.NODE_ENV === 'test') return next();
@@ -1199,6 +1356,26 @@ async function startServer() {
     type ConversationStage = "greeting" | "availability" | "permission" | "hook" | "pitch" | "qualification" | "post_qualification" | "appointment" | "closing" | "ended";
     let conversationStage: ConversationStage = "greeting";
     const conversationHistory: Array<{ role: string; text: string }> = [];
+    const transcriptBuffer = callId ? (liveCallTranscriptBuffers.get(callId) || []) : [];
+    if (callId) liveCallTranscriptBuffers.set(callId, transcriptBuffer);
+
+    const appendTranscript = async (role: "Lead" | "AI", text: string) => {
+      const cleanText = String(text || "").trim();
+      if (!cleanText) return;
+
+      transcriptBuffer.push({ role, text: cleanText, timestamp: new Date().toISOString() });
+      const transcriptText = formatTranscriptEntries(transcriptBuffer);
+      console.log(role === "Lead" ? "[TRANSCRIPT APPEND USER]" : "[TRANSCRIPT APPEND AI]", cleanText);
+
+      if (callId) {
+        await db.collection("calls").doc(callId).update(sanitizeForFirestore({
+          transcript: transcriptText,
+          transcriptText,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        })).catch((error) => console.error("[TRANSCRIPT SAVE] update failed:", error));
+        console.log("[TRANSCRIPT SAVE]", callId, "bytes=", transcriptText.length);
+      }
+    };
     const STT_WINDOW_FRAMES = 60; // 1.2 seconds at 20ms/frame
     const NON_ACTIONABLE = new Set([
       "hi", "hello", "hmm", "uh", "um", "okay", "ok", "yeah", "yes", "silence"
@@ -2012,6 +2189,7 @@ async function startServer() {
 
       if (greetingAudio) {
         await timedStep("audio send", () => sendVobizAudio(ws, greetingAudio));
+        await appendTranscript("AI", greetingText);
         greetingDelivered = true;
         conversationStage = "availability";
         console.log("[STAGE FLOW]", conversationStage);
@@ -2140,15 +2318,15 @@ async function startServer() {
         }
 
         console.log("[TURN ACCEPTED]", transcript);
+        await appendTranscript("Lead", transcript);
         state = "PROCESSING";
         console.log("[Vobiz State] PROCESSING");
 
         const { callData, kb } = await loadCallContext();
         if (isEnded()) return;
 
-        const currentTranscript = callData?.transcript || "";
-        const transcriptWithLead = `${currentTranscript}\nLead: ${transcript}`;
-        const callContext = { ...callData, transcript: transcriptWithLead };
+        const transcriptTextForContext = formatTranscriptEntries(transcriptBuffer);
+        const callContext = { ...callData, transcript: transcriptTextForContext, transcriptText: transcriptTextForContext };
         let reply = "";
         let shouldTrimReply = true;
         let replyMaxWords = 10;
@@ -2187,7 +2365,6 @@ async function startServer() {
 
         if (callId) {
           await db.collection("calls").doc(callId).update(sanitizeForFirestore({
-            transcript: `${transcriptWithLead}\nAI: ${aiReply}`,
             leadData,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           }));
@@ -2211,6 +2388,7 @@ async function startServer() {
         state = "SPEAKING";
         console.log("[Vobiz State] SPEAKING reply");
         await timedStep("audio send", () => sendVobizAudio(ws, replyAudio));
+        await appendTranscript("AI", aiReply);
         mediaBuffers = [];
         if (conversationStage === "closing" || conversationStage === "ended") {
           console.log("[CALL ENDING AFTER COMPLETION]");
@@ -2243,6 +2421,11 @@ async function startServer() {
         console.log("[TURN LOCK] released");
       }
       mediaBuffers = [];
+      const transcriptText = formatTranscriptEntries(transcriptBuffer);
+      void finalizeCallSummaryFromTranscript(callId || "", transcriptText)
+        .finally(() => {
+          if (callId) liveCallTranscriptBuffers.delete(callId);
+        });
     };
 
     ws.on("message", async (message: any) => {
@@ -2887,6 +3070,14 @@ ${speakXml}  </Gather>
       await db.collection("calls").doc(callId as string).update(
         sanitizeForFirestore(updates)
       );
+
+      if (isFinalStatus) {
+        const memoryTranscript = liveCallTranscriptBuffers.has(callId as string)
+          ? formatTranscriptEntries(liveCallTranscriptBuffers.get(callId as string) || [])
+          : "";
+        await finalizeCallSummaryFromTranscript(callId as string, memoryTranscript);
+        liveCallTranscriptBuffers.delete(callId as string);
+      }
     } catch (error) {
       console.error("[Vobiz Webhook] Update failed:", error);
     }
