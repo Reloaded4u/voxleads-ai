@@ -1277,9 +1277,15 @@ async function startServer() {
     const isExplicitSchedulingRequest = (text: string) => {
       const t = normalizeTurnText(text);
       return (
-        /\b(call me later|schedule|book meeting|arrange callback|i am busy|im busy|not now|tomorrow at|today evening)\b/i.test(t) ||
+        /\b(schedule|book|call later|follow up|followup|appointment|site visit|not now|busy|arrange callback|call me later|i am busy|im busy)\b/i.test(t) ||
+        /\b(tomorrow at|today evening)\b/i.test(t) ||
         /\bat\s+\d{1,2}\s*(am|pm|a m|p m)\b/i.test(t)
       );
+    };
+
+    const isKbQuestionIntent = (text: string) => {
+      const t = normalizeTurnText(text);
+      return /\b(offer|price|pricing|cost|location|amenities|amenity|loan)\b/i.test(t);
     };
 
     const detectIntent = (text: string) => {
@@ -1335,11 +1341,8 @@ async function startServer() {
       const raw = getCallGuidance(kb)?.qualificationQuestions;
       const values = Array.isArray(raw) ? raw : raw ? [raw] : [];
       return values
-        .map((item, index) => {
-          const text = firstText(item);
-          return text ? { id: `q${index + 1}`, text } : null;
-        })
-        .filter(Boolean) as Array<{ id: string; text: string }>;
+        .flatMap((item) => firstText(item).split(/\r?\n+/).map((line) => line.trim()).filter(Boolean))
+        .map((text, index) => ({ id: `q${index + 1}`, text }));
     };
 
     const getFirstQualificationQuestion = (kb: any) => {
@@ -1488,7 +1491,7 @@ async function startServer() {
 
       const question = questions[currentQuestionIndex];
       if (!question) {
-        conversationStage = "appointment";
+        moveStage("appointment");
         console.log("[APPOINTMENT TRIGGERED]");
         console.log("[STAGE FLOW]", conversationStage);
         return buildSchedulingQuestion(callData, kb);
@@ -1507,13 +1510,32 @@ async function startServer() {
       currentQuestionIndex += 1;
     };
 
+    const stageOrder: ConversationStage[] = ["greeting", "availability", "permission", "hook", "pitch", "qualification", "appointment", "closing", "ended"];
+
+    const moveStage = (nextStage: ConversationStage) => {
+      if (stageOrder.indexOf(nextStage) < stageOrder.indexOf(conversationStage)) {
+        console.log("[BLOCKED BACKWARD TRANSITION]", conversationStage, "->", nextStage);
+        return conversationStage;
+      }
+      conversationStage = nextStage;
+      return conversationStage;
+    };
+
+    const buildCallState = (callData: any, callContext: any, detectedIntent: string, lowConfidenceWithoutTime: boolean) => ({
+      stage: conversationStage,
+      callData,
+      callContext,
+      detectedIntent,
+      lowConfidenceWithoutTime,
+    });
+
     const deliverMissingPreQualificationStage = (callData: any, kb: any) => {
       console.log("[FLOW GUARD] qualification blocked because previous KB stages missing");
 
       if (!availabilityDelivered) {
         const text = buildAvailabilityQuestion(callData, kb);
         availabilityDelivered = true;
-        conversationStage = "permission";
+        moveStage("permission");
         console.log("[FLOW STEP] delivered availabilityCheck");
         console.log("[STAGE FLOW]", conversationStage);
         return text;
@@ -1522,7 +1544,7 @@ async function startServer() {
       if (!permissionDelivered) {
         const text = buildPermissionQuestion(callData, kb);
         permissionDelivered = true;
-        conversationStage = "hook";
+        moveStage("hook");
         console.log("[FLOW STEP] delivered permissionLine");
         console.log("[STAGE FLOW]", conversationStage);
         return text;
@@ -1531,7 +1553,7 @@ async function startServer() {
       if (!hookDelivered) {
         const text = applyGreetingPlaceholders(getOpeningHook(kb), callData, kb);
         hookDelivered = true;
-        conversationStage = "pitch";
+        moveStage("pitch");
         console.log("[FLOW STEP] delivered hook");
         console.log("[STAGE FLOW]", conversationStage);
         return text;
@@ -1540,13 +1562,121 @@ async function startServer() {
       if (!pitchDelivered) {
         const text = applyGreetingPlaceholders(getMainPitch(kb), callData, kb);
         pitchDelivered = true;
-        conversationStage = "qualification";
+        moveStage("qualification");
         console.log("[FLOW STEP] delivered pitch");
         console.log("[STAGE FLOW]", conversationStage);
         return text;
       }
 
       return "";
+    };
+
+    const getNextReply = async (transcript: string, callState: any, kb: any) => {
+      const callData = callState.callData;
+      const callContext = callState.callContext;
+      const intent =
+        isExplicitSchedulingRequest(transcript) ? "appointment" :
+        isKbQuestionIntent(transcript) ? "kb_question" :
+        isPermissionNegative(transcript) ? "negative" :
+        isPositiveResponse(transcript) ? "positive" :
+        callState.detectedIntent || "general";
+
+      console.log("[STATE BEFORE]", conversationStage);
+      console.log("[INTENT]", intent);
+      console.log("[QUESTION INDEX]", currentQuestionIndex);
+
+      const decision = async (reply: string, nextStage: ConversationStage, needsGemini = false, maxWords = 10) => {
+        if (nextStage !== conversationStage) moveStage(nextStage);
+        console.log("[REPLY DECISION]", reply, "nextStage=", conversationStage, "gemini=", needsGemini);
+        console.log("[STATE AFTER]", conversationStage);
+        return { reply, needsGemini, maxWords };
+      };
+
+      if (conversationStage === "ended") return decision("", "ended", false);
+
+      if (intent === "kb_question") {
+        const answer = await generateGeminiReply({
+          transcript,
+          knowledgeBase: kb,
+          callContext,
+          conversationStage,
+          conversationHistory,
+          detectedIntent: callState.detectedIntent,
+          maxWords: 14,
+        });
+        return decision(sanitizeAiReplyForStage(answer, "I can answer that from the details I have."), conversationStage, true, 14);
+      }
+
+      if (conversationStage === "appointment") {
+        const normalizedTime = extractCallbackTime(transcript);
+        if (normalizedTime) {
+          savedCallbackTime = normalizedTime;
+          console.log("[SCHEDULING TIME DETECTED]", transcript, normalizedTime);
+          return decision(`Got it, I'll arrange a callback at ${normalizedTime}. ${buildClosingLine(callData, kb)}`, "closing", false, 30);
+        }
+        return decision(buildSchedulingQuestion(callData, kb), "appointment", false);
+      }
+
+      if (intent === "appointment") return decision(buildSchedulingQuestion(callData, kb), "appointment", false);
+
+      if (conversationStage === "availability") {
+        if (!availabilityDelivered) {
+          leadData.nameConfirmed = leadData.nameConfirmed || isIdentityConfirmed(transcript);
+          if (leadData.nameConfirmed) console.log("[NAME CONFIRMATION] accepted");
+          availabilityDelivered = true;
+          return decision(buildAvailabilityQuestion(callData, kb), "permission", false);
+        }
+        return decision(buildPermissionQuestion(callData, kb), "hook", false);
+      }
+
+      if (conversationStage === "permission") {
+        if (intent === "negative") return decision(buildClosingLine(callData, kb), "closing", false, 30);
+        if (!permissionDelivered) {
+          permissionDelivered = true;
+          return decision(buildPermissionQuestion(callData, kb), "hook", false);
+        }
+        return decision(applyGreetingPlaceholders(getOpeningHook(kb), callData, kb), "pitch", false);
+      }
+
+      if (conversationStage === "hook") {
+        if (intent === "negative") return decision(buildClosingLine(callData, kb), "closing", false, 30);
+        if (!hookDelivered) {
+          hookDelivered = true;
+          return decision(applyGreetingPlaceholders(getOpeningHook(kb), callData, kb), "pitch", false);
+        }
+        return decision(applyGreetingPlaceholders(getMainPitch(kb), callData, kb), "qualification", false);
+      }
+
+      if (conversationStage === "pitch") {
+        if (!pitchDelivered) {
+          pitchDelivered = true;
+          return decision(applyGreetingPlaceholders(getMainPitch(kb), callData, kb), "qualification", false);
+        }
+        return decision(askNextQualificationQuestion(callData, kb), "qualification", false);
+      }
+
+      if (conversationStage === "qualification") {
+        if (!preQualificationStagesDelivered()) return decision(deliverMissingPreQualificationStage(callData, kb), conversationStage, false);
+        if (callState.lowConfidenceWithoutTime) {
+          console.log("[TURN HELD] low confidence", transcript);
+          return decision("", conversationStage, false);
+        }
+        if (qualificationStarted) storeQualificationAnswer(transcript);
+        return decision(askNextQualificationQuestion(callData, kb), conversationStage, false);
+      }
+
+      if (conversationStage === "closing") return decision(buildClosingLine(callData, kb), "ended", false, 30);
+
+      const answer = await generateGeminiReply({
+        transcript,
+        knowledgeBase: kb,
+        callContext,
+        conversationStage,
+        conversationHistory,
+        detectedIntent: callState.detectedIntent,
+        maxWords: 14,
+      });
+      return decision(sanitizeAiReplyForStage(answer, buildAvailabilityQuestion(callData, kb)), conversationStage, true, 14);
     };
 
     console.log("[Vobiz State] GREETING");
@@ -1817,170 +1947,14 @@ async function startServer() {
         let shouldTrimReply = true;
         let replyMaxWords = 10;
 
-        const pendingStage = conversationStage;
-
-        if (conversationStage === "ended") {
-          reply = "";
-          shouldTrimReply = false;
-        } else if (conversationStage === "appointment") {
-          console.log("[STAGE GUARD] scheduling only");
-          const normalizedTime = extractCallbackTime(transcript);
-          if (normalizedTime) {
-            savedCallbackTime = normalizedTime;
-            conversationStage = "closing";
-            console.log("[STAGE FLOW]", conversationStage);
-            reply = `Got it, I'll arrange a callback at ${normalizedTime}. ${buildClosingLine(callData, kb)}`;
-            shouldTrimReply = false;
-            console.log("[SCHEDULING TIME DETECTED]", transcript, normalizedTime);
-            console.log("[DETERMINISTIC REPLY]", reply);
-          } else if (isBusyOrCallLater(transcript) || detectedIntent === "scheduling") {
-            reply = buildSchedulingQuestion(callData, kb);
-            console.log("[DETERMINISTIC REPLY]", reply);
-          } else {
-            if (lowConfidenceWithoutTime) {
-              console.log("[TURN HELD] low confidence", transcript, confidence);
-              reply = buildSchedulingQuestion(callData, kb);
-              console.log("[DETERMINISTIC REPLY]", reply);
-            } else {
-              replyMaxWords = 14;
-              console.log("[GEMINI INPUT]", transcript);
-              const answer = await generateGeminiReply({
-                transcript,
-                knowledgeBase: kb,
-                callContext,
-                conversationStage,
-                conversationHistory,
-                detectedIntent,
-                maxWords: 7,
-              });
-              const briefAnswer = trimReplyForStage(answer || "I can arrange a callback.", 7);
-              reply = `${briefAnswer} What time works?`;
-              shouldTrimReply = false;
-            }
-          }
-        } else if (conversationStage === "availability" && (isOpeningHello || isIdentityConfirmed(transcript))) {
-          nameConfirmed = true;
-          leadData.nameConfirmed = true;
-          console.log("[NAME CONFIRMATION] accepted");
-          console.log("[FLOW STEP] name confirmed");
-          conversationStage = "availability";
-          console.log("[STAGE FLOW]", conversationStage);
-          reply = buildAvailabilityQuestion(callData, kb);
-          availabilityDelivered = true;
-          conversationStage = "permission";
-          console.log("[FLOW STEP] delivered availabilityCheck");
-          console.log("[STAGE FLOW]", conversationStage);
-          console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "permission" && (isAvailabilityPositive(transcript) || wordCount <= 2)) {
-          reply = buildPermissionQuestion(callData, kb);
-          permissionDelivered = true;
-          conversationStage = "hook";
-          console.log("[FLOW STEP] availability -> permission");
-          console.log("[FLOW STEP] delivered permissionLine");
-          console.log("[STAGE FLOW]", conversationStage);
-          console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "permission" && isExplicitSchedulingRequest(transcript)) {
-          reply = buildSchedulingQuestion(callData, kb);
-          conversationStage = "appointment";
-          console.log("[STAGE FLOW]", conversationStage);
-          console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "permission" && isPermissionNegative(transcript)) {
-          reply = buildClosingLine(callData, kb);
-          conversationStage = "closing";
-          console.log("[STAGE FLOW]", conversationStage);
-          shouldTrimReply = false;
-          console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (isBusyOrCallLater(transcript)) {
-          reply = buildSchedulingQuestion(callData, kb);
-          conversationStage = "appointment";
-          console.log("[STAGE FLOW]", conversationStage);
-          console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "hook" && isOpeningHello) {
-          reply = buildPermissionQuestion(callData, kb);
-          console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "hook" && isPermissionPositive(transcript)) {
-          if (!availabilityDelivered || !permissionDelivered) {
-            reply = deliverMissingPreQualificationStage(callData, kb);
-          } else {
-            reply = applyGreetingPlaceholders(getOpeningHook(kb), callData, kb);
-            hookDelivered = true;
-            conversationStage = "pitch";
-            console.log("[FLOW STEP] delivered hook");
-            console.log("[STAGE FLOW]", conversationStage);
-          }
-          console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "hook" && isPermissionNegative(transcript)) {
-          reply = buildClosingLine(callData, kb);
-          conversationStage = "closing";
-          console.log("[STAGE FLOW]", conversationStage);
-          shouldTrimReply = false;
-          console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "pitch" && isPositiveResponse(transcript)) {
-          if (!availabilityDelivered || !permissionDelivered || !hookDelivered) {
-            reply = deliverMissingPreQualificationStage(callData, kb);
-          } else {
-            const pitch = applyGreetingPlaceholders(getMainPitch(kb), callData, kb);
-            reply = pitch;
-            pitchDelivered = true;
-            conversationStage = "qualification";
-            console.log("[FLOW STEP] delivered pitch");
-            console.log("[STAGE FLOW]", conversationStage);
-          }
-          console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "qualification") {
-          if (!preQualificationStagesDelivered()) {
-            reply = deliverMissingPreQualificationStage(callData, kb);
-            console.log("[DETERMINISTIC REPLY]", reply);
-          } else {
-            if (lowConfidenceWithoutTime) {
-              console.log("[TURN HELD] low confidence", transcript, confidence);
-              state = "LISTENING";
-              return;
-            }
-            if (qualificationStarted) {
-              storeQualificationAnswer(transcript);
-            }
-            reply = askNextQualificationQuestion(callData, kb);
-            console.log("[DETERMINISTIC REPLY]", reply);
-          }
-        } else {
-          if (lowConfidenceWithoutTime) {
-            console.log("[TURN HELD] low confidence", transcript, confidence);
-            state = "LISTENING";
-            return;
-          }
-          replyMaxWords = 14;
-          console.log("[GEMINI INPUT]", transcript);
-          reply = await generateGeminiReply({
-            transcript,
-            knowledgeBase: kb,
-            callContext,
-            conversationStage,
-            conversationHistory,
-            detectedIntent,
-            maxWords: getMaxWordsForStage(),
-          });
-          reply = sanitizeAiReplyForStage(reply, buildAvailabilityQuestion(callData, kb));
-          conversationStage = pendingStage;
-          console.log("[STAGE FLOW]", conversationStage);
-        }
-
-        if (
-          conversationStage !== "ended" &&
-          conversationStage !== "closing" &&
-          conversationStage !== "appointment" &&
-          isExplicitSchedulingRequest(transcript)
-        ) {
-          conversationStage = "appointment";
-          console.log("[STAGE FLOW]", conversationStage);
-        } else if (
-          conversationStage !== "ended" &&
-          conversationStage !== "closing" &&
-          conversationStage !== "appointment" &&
-          /\b(callback|call back|schedule|time)\b/i.test(reply)
-        ) {
-          console.log("[SCHEDULING GUARD] blocked false appointment jump");
-        }
+        const decision = await getNextReply(
+          transcript,
+          buildCallState(callData, callContext, detectedIntent, lowConfidenceWithoutTime),
+          kb
+        );
+        reply = decision.reply;
+        replyMaxWords = decision.maxWords;
+        shouldTrimReply = decision.maxWords <= 14;
 
         if (!reply || reply.trim().length === 0) {
           console.log("[GEMINI OUTPUT]", "");
@@ -2034,7 +2008,7 @@ async function startServer() {
         mediaBuffers = [];
         if (conversationStage === "closing" || conversationStage === "ended") {
           console.log("[CALL ENDING AFTER COMPLETION]");
-          conversationStage = "ended";
+          moveStage("ended");
           console.log("[STAGE FLOW]", conversationStage);
           state = "ENDING";
           if (ws.readyState === 1) ws.close();
