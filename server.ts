@@ -1190,6 +1190,7 @@ async function startServer() {
     let hookDelivered = false;
     let pitchDelivered = false;
     let qualificationStarted = false;
+    let appointmentPromptDelivered = false;
     type ConversationStage = "greeting" | "availability" | "permission" | "hook" | "pitch" | "qualification" | "post_qualification" | "appointment" | "closing" | "ended";
     let conversationStage: ConversationStage = "greeting";
     const conversationHistory: Array<{ role: string; text: string }> = [];
@@ -1289,12 +1290,20 @@ async function startServer() {
 
     const isKbQuestionIntent = (text: string) => {
       const t = normalizeTurnText(text);
-      return /\b(offer|offers|price|pricing|cost|location|amenities|amenity|loan|features|feature|where|what|how|why|explain|details)\b/i.test(t);
+      return (
+        t.trim().endsWith("?") ||
+        /\b(offer|offers|price|pricing|cost|location|amenities|amenity|loan|features|feature|where|what|how|why|explain|details)\b/i.test(t)
+      );
+    };
+
+    const isContinueInfoRequest = (text: string) => {
+      const t = normalizeTurnText(text);
+      return /\b(continue|tell me more|more details)\b/i.test(t);
     };
 
     const isAppointmentSuggestionIntent = (text: string) => {
       const t = normalizeTurnText(text);
-      return /\b(ok|okay|sounds good|what next|continue|tell me more|interested|go ahead|next)\b/i.test(t);
+      return /\b(ok|okay|sounds good|what next|interested|go ahead|next)\b/i.test(t);
     };
 
     const detectIntent = (text: string) => {
@@ -1490,6 +1499,12 @@ async function startServer() {
     const preQualificationStagesDelivered = () =>
       availabilityDelivered && permissionDelivered && hookDelivered && pitchDelivered;
 
+    const deliverAppointmentPrompt = (callData: any, kb: any) => {
+      appointmentPromptDelivered = true;
+      console.log("[APPOINTMENT PROMPT DELIVERED]");
+      return buildSchedulingQuestion(callData, kb);
+    };
+
     const askNextQualificationQuestion = (callData: any, kb: any) => {
       const questions = getQualificationQuestions(kb);
 
@@ -1595,8 +1610,8 @@ async function startServer() {
       const callData = callState.callData;
       const callContext = callState.callContext;
       const intent =
-        isExplicitSchedulingRequest(transcript) ? "appointment" :
         isKbQuestionIntent(transcript) ? "kb_question" :
+        isExplicitSchedulingRequest(transcript) ? "appointment" :
         isPermissionNegative(transcript) ? "negative" :
         isPositiveResponse(transcript) ? "positive" :
         callState.detectedIntent || "general";
@@ -1615,9 +1630,8 @@ async function startServer() {
       if (conversationStage === "ended") return decision("", "ended", false);
 
       if (intent === "kb_question") {
-        if (conversationStage === "appointment" && lastAiReply === buildSchedulingQuestion(callData, kb)) {
-          console.log("[INTENT OVERRIDE] user question detected, skipping appointment");
-          moveStage("post_qualification");
+        if (conversationStage === "appointment") {
+          console.log("[USER QUESTION OVERRIDES APPOINTMENT]");
         } else {
           console.log("[INTENT OVERRIDE] user question detected, skipping appointment");
         }
@@ -1635,9 +1649,13 @@ async function startServer() {
       }
 
       if (conversationStage === "post_qualification") {
+        if (isContinueInfoRequest(transcript)) {
+          console.log("[CONTINUE HANDLED AS INFO REQUEST]");
+          return decision("Sure, what would you like to know - location, amenities, pricing, or offers?", "post_qualification", false, 14);
+        }
         if (isAppointmentSuggestionIntent(transcript)) {
           console.log("[APPOINTMENT TRIGGERED]");
-          return decision(buildSchedulingQuestion(callData, kb), "appointment", false);
+          return decision(deliverAppointmentPrompt(callData, kb), "appointment", false);
         }
         console.log("[APPOINTMENT DEFERRED]");
         const answer = await timedStep("Gemini", () => generateGeminiReply({
@@ -1660,10 +1678,18 @@ async function startServer() {
           console.log("[SCHEDULING TIME DETECTED]", transcript, normalizedTime);
           return decision(`Got it, I'll arrange a callback at ${normalizedTime}. ${buildClosingLine(callData, kb)}`, "closing", false, 30);
         }
-        return decision(buildSchedulingQuestion(callData, kb), "appointment", false);
+        if (isContinueInfoRequest(transcript)) {
+          console.log("[CONTINUE HANDLED AS INFO REQUEST]");
+          return decision("Sure, what would you like to know - location, amenities, pricing, or offers?", "appointment", false, 14);
+        }
+        if (appointmentPromptDelivered) {
+          console.log("[APPOINTMENT LOOP BLOCKED]");
+          return decision("", "appointment", false);
+        }
+        return decision(deliverAppointmentPrompt(callData, kb), "appointment", false);
       }
 
-      if (intent === "appointment") return decision(buildSchedulingQuestion(callData, kb), "appointment", false);
+      if (intent === "appointment") return decision(deliverAppointmentPrompt(callData, kb), "appointment", false);
 
       if (conversationStage === "availability") {
         if (!availabilityDelivered) {
