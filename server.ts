@@ -1253,10 +1253,14 @@ async function startServer() {
     };
 
     const normalizeSttTranscript = (text: string) => {
-      const normalized = normalizeTurnText(text);
+      let result = text
+        .replace(/\bc\s*bhk\b/gi, "3 bhk")
+        .replace(/\bthree\s+bhk\b/gi, "3 bhk")
+        .replace(/\bfree\s+bhk\b/gi, "3 bhk");
+      const normalized = normalizeTurnText(result);
       if (normalized === "yesterday sir" || normalized === "yesterday") return "yes sudesh here";
       if (normalized === "yes sir" || normalized === "yeah sir") return "yes";
-      return text;
+      return result;
     };
 
     const isPositiveNameConfirmation = (text: string) => {
@@ -1529,6 +1533,17 @@ async function startServer() {
       lowConfidenceWithoutTime,
     });
 
+    const timedStep = async <T>(label: string, fn: () => Promise<T>): Promise<T> => {
+      const start = Date.now();
+      console.log(`[TIMING] ${label} start`);
+      try {
+        return await fn();
+      } finally {
+        const duration = Date.now() - start;
+        console.log(`[TIMING] ${label} end duration=${duration}ms`);
+      }
+    };
+
     const deliverMissingPreQualificationStage = (callData: any, kb: any) => {
       console.log("[FLOW GUARD] qualification blocked because previous KB stages missing");
 
@@ -1595,7 +1610,7 @@ async function startServer() {
       if (conversationStage === "ended") return decision("", "ended", false);
 
       if (intent === "kb_question") {
-        const answer = await generateGeminiReply({
+        const answer = await timedStep("Gemini", () => generateGeminiReply({
           transcript,
           knowledgeBase: kb,
           callContext,
@@ -1603,7 +1618,7 @@ async function startServer() {
           conversationHistory,
           detectedIntent: callState.detectedIntent,
           maxWords: 14,
-        });
+        }));
         return decision(sanitizeAiReplyForStage(answer, "I can answer that from the details I have."), conversationStage, true, 14);
       }
 
@@ -1667,7 +1682,7 @@ async function startServer() {
 
       if (conversationStage === "closing") return decision(buildClosingLine(callData, kb), "ended", false, 30);
 
-      const answer = await generateGeminiReply({
+      const answer = await timedStep("Gemini", () => generateGeminiReply({
         transcript,
         knowledgeBase: kb,
         callContext,
@@ -1675,7 +1690,7 @@ async function startServer() {
         conversationHistory,
         detectedIntent: callState.detectedIntent,
         maxWords: 14,
-      });
+      }));
       return decision(sanitizeAiReplyForStage(answer, buildAvailabilityQuestion(callData, kb)), conversationStage, true, 14);
     };
 
@@ -1803,11 +1818,11 @@ async function startServer() {
       console.log("[GREETING FINAL]", greetingText);
       conversationStage = "greeting";
       console.log("[STAGE FLOW]", conversationStage);
-      const greetingAudio = await fetchTtsAudio(greetingText, ownerId);
+      const greetingAudio = await timedStep("TTS", () => fetchTtsAudio(greetingText, ownerId));
       if (isEnded()) return;
 
       if (greetingAudio) {
-        await sendVobizAudio(ws, greetingAudio);
+        await timedStep("audio send", () => sendVobizAudio(ws, greetingAudio));
         greetingDelivered = true;
         conversationStage = "availability";
         console.log("[STAGE FLOW]", conversationStage);
@@ -1878,8 +1893,10 @@ async function startServer() {
       turnInProgress = true;
       console.log("[TURN LOCK] acquired");
 
+      const totalTurnStart = Date.now();
+
       try {
-        const stt = await transcribeBuffer(audioBuffer);
+        const stt = await timedStep("STT", () => transcribeBuffer(audioBuffer));
         let transcript = stt.transcript;
         const originalTranscript = transcript;
         transcript = normalizeSttTranscript(transcript);
@@ -1947,11 +1964,11 @@ async function startServer() {
         let shouldTrimReply = true;
         let replyMaxWords = 10;
 
-        const decision = await getNextReply(
+        const decision = await timedStep("getNextReply", () => getNextReply(
           transcript,
           buildCallState(callData, callContext, detectedIntent, lowConfidenceWithoutTime),
           kb
-        );
+        ));
         reply = decision.reply;
         replyMaxWords = decision.maxWords;
         shouldTrimReply = decision.maxWords <= 14;
@@ -1993,7 +2010,7 @@ async function startServer() {
           return;
         }
 
-        const replyAudio = await fetchTtsAudio(aiReply, ownerId);
+        const replyAudio = await timedStep("TTS", () => fetchTtsAudio(aiReply, ownerId));
         if (isEnded()) return;
 
         if (!replyAudio) {
@@ -2004,7 +2021,7 @@ async function startServer() {
 
         state = "SPEAKING";
         console.log("[Vobiz State] SPEAKING reply");
-        await sendVobizAudio(ws, replyAudio);
+        await timedStep("audio send", () => sendVobizAudio(ws, replyAudio));
         mediaBuffers = [];
         if (conversationStage === "closing" || conversationStage === "ended") {
           console.log("[CALL ENDING AFTER COMPLETION]");
@@ -2020,6 +2037,7 @@ async function startServer() {
         console.error("[Vobiz Turn] Error:", err);
         if (!isEnded()) state = "LISTENING";
       } finally {
+        console.log(`[TIMING] total turn duration=${Date.now() - totalTurnStart}ms`);
         if (turnInProgress) {
           turnInProgress = false;
           console.log("[TURN LOCK] released");
