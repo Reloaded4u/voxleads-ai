@@ -1176,6 +1176,14 @@ async function startServer() {
     let turnInProgress = false;
     let callCompletedLogged = false;
     let greetingDelivered = false;
+    let leadData: {
+      nameConfirmed: boolean;
+      answers: Record<number, string>;
+    } = {
+      nameConfirmed: false,
+      answers: {},
+    };
+    let currentQuestionIndex = 0;
     let nameConfirmed = false;
     let availabilityDelivered = false;
     let permissionDelivered = false;
@@ -1323,8 +1331,25 @@ async function startServer() {
     const getMainPitch = (kb: any) =>
       getScriptField(kb, "pitch", "I can share the key details briefly.", ["mainPitch"]);
 
-    const getFirstQualificationQuestion = (kb: any) =>
-      getScriptField(kb, "qualificationQuestions", "May I ask what you are looking for?");
+    const getQualificationQuestions = (kb: any) => {
+      const raw = getCallGuidance(kb)?.qualificationQuestions;
+      const values = Array.isArray(raw) ? raw : raw ? [raw] : [];
+      return values
+        .map((item, index) => {
+          const text = firstText(item);
+          return text ? { id: `q${index + 1}`, text } : null;
+        })
+        .filter(Boolean) as Array<{ id: string; text: string }>;
+    };
+
+    const getFirstQualificationQuestion = (kb: any) => {
+      const questions = getQualificationQuestions(kb);
+      if (questions[0]?.text) {
+        console.log("[KB SCRIPT FIELD USED]", "qualificationQuestions", "kb");
+        return questions[0].text;
+      }
+      return getScriptField(kb, "qualificationQuestions", "May I ask what you are looking for?");
+    };
 
     const isIncompletePhrase = (text: string) => {
       const words = text.toLowerCase().trim().split(/\s+/).filter(Boolean);
@@ -1444,14 +1469,43 @@ async function startServer() {
       );
       console.log("[KB SCRIPT FIELD USED]", text ? "appointmentPrompt" : "appointmentPrompt fallback", text ? "kb" : "fallback");
       if (!text) console.log("[KB SCRIPT FIELD MISSING]", "appointmentPrompt", "appointments/callGuidance fallback");
-      return applyGreetingPlaceholders(text || "Sure, when would be a better time?", callData, kb);
+      return applyGreetingPlaceholders(text || "Would you like to continue further or schedule a follow-up?", callData, kb);
     };
 
     const buildClosingLine = (callData: any, kb: any) =>
-      applyGreetingPlaceholders(getScriptField(kb, "closingLine", "Thank you for your time. Have a great day."), callData, kb);
+      applyGreetingPlaceholders(getScriptField(kb, "closingLine", "Thanks for your time. We'll follow up shortly."), callData, kb);
 
     const preQualificationStagesDelivered = () =>
       availabilityDelivered && permissionDelivered && hookDelivered && pitchDelivered;
+
+    const askNextQualificationQuestion = (callData: any, kb: any) => {
+      const questions = getQualificationQuestions(kb);
+
+      while (leadData.answers[currentQuestionIndex]) {
+        console.log("[QUESTION SKIPPED]", currentQuestionIndex);
+        currentQuestionIndex += 1;
+      }
+
+      const question = questions[currentQuestionIndex];
+      if (!question) {
+        conversationStage = "appointment";
+        console.log("[APPOINTMENT TRIGGERED]");
+        console.log("[STAGE FLOW]", conversationStage);
+        return buildSchedulingQuestion(callData, kb);
+      }
+
+      qualificationStarted = true;
+      console.log("[QUESTION ASKED]", currentQuestionIndex, question.id, question.text);
+      return applyGreetingPlaceholders(question.text, callData, kb);
+    };
+
+    const storeQualificationAnswer = (transcript: string) => {
+      if (!qualificationStarted) return;
+      if (leadData.answers[currentQuestionIndex]) return;
+      leadData.answers[currentQuestionIndex] = transcript;
+      console.log("[LEAD MEMORY UPDATED]", currentQuestionIndex, "→", transcript);
+      currentQuestionIndex += 1;
+    };
 
     const deliverMissingPreQualificationStage = (callData: any, kb: any) => {
       console.log("[FLOW GUARD] qualification blocked because previous KB stages missing");
@@ -1806,6 +1860,7 @@ async function startServer() {
           }
         } else if (conversationStage === "availability" && (isOpeningHello || isIdentityConfirmed(transcript))) {
           nameConfirmed = true;
+          leadData.nameConfirmed = true;
           console.log("[NAME CONFIRMATION] accepted");
           console.log("[FLOW STEP] name confirmed");
           conversationStage = "availability";
@@ -1872,17 +1927,6 @@ async function startServer() {
             console.log("[STAGE FLOW]", conversationStage);
           }
           console.log("[DETERMINISTIC REPLY]", reply);
-        } else if (conversationStage === "qualification" && isPositiveResponse(transcript)) {
-          if (!preQualificationStagesDelivered()) {
-            reply = deliverMissingPreQualificationStage(callData, kb);
-            console.log("[DETERMINISTIC REPLY]", reply);
-          } else {
-            const qualificationQuestion = applyGreetingPlaceholders(getFirstQualificationQuestion(kb), callData, kb);
-            reply = qualificationQuestion;
-            qualificationStarted = true;
-            console.log("[FLOW STEP] qualification started", qualificationStarted);
-            console.log("[DETERMINISTIC REPLY]", reply);
-          }
         } else if (conversationStage === "qualification") {
           if (!preQualificationStagesDelivered()) {
             reply = deliverMissingPreQualificationStage(callData, kb);
@@ -1893,20 +1937,11 @@ async function startServer() {
               state = "LISTENING";
               return;
             }
-            replyMaxWords = 14;
-            console.log("[GEMINI INPUT]", transcript);
-            reply = await generateGeminiReply({
-            transcript,
-            knowledgeBase: kb,
-            callContext,
-            conversationStage,
-            conversationHistory,
-            detectedIntent,
-            maxWords: getMaxWordsForStage(),
-          });
-            reply = sanitizeAiReplyForStage(reply, applyGreetingPlaceholders(getFirstQualificationQuestion(kb), callData, kb));
-            conversationStage = pendingStage;
-            console.log("[STAGE FLOW]", conversationStage);
+            if (qualificationStarted) {
+              storeQualificationAnswer(transcript);
+            }
+            reply = askNextQualificationQuestion(callData, kb);
+            console.log("[DETERMINISTIC REPLY]", reply);
           }
         } else {
           if (lowConfidenceWithoutTime) {
@@ -1973,6 +2008,7 @@ async function startServer() {
         if (callId) {
           await db.collection("calls").doc(callId).update(sanitizeForFirestore({
             transcript: `${transcriptWithLead}\nAI: ${aiReply}`,
+            leadData,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           }));
         }
