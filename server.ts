@@ -1190,7 +1190,7 @@ async function startServer() {
     let hookDelivered = false;
     let pitchDelivered = false;
     let qualificationStarted = false;
-    type ConversationStage = "greeting" | "availability" | "permission" | "hook" | "pitch" | "qualification" | "appointment" | "closing" | "ended";
+    type ConversationStage = "greeting" | "availability" | "permission" | "hook" | "pitch" | "qualification" | "post_qualification" | "appointment" | "closing" | "ended";
     let conversationStage: ConversationStage = "greeting";
     const conversationHistory: Array<{ role: string; text: string }> = [];
     const STT_WINDOW_FRAMES = 60; // 1.2 seconds at 20ms/frame
@@ -1289,7 +1289,12 @@ async function startServer() {
 
     const isKbQuestionIntent = (text: string) => {
       const t = normalizeTurnText(text);
-      return /\b(offer|price|pricing|cost|location|amenities|amenity|loan)\b/i.test(t);
+      return /\b(offer|offers|price|pricing|cost|location|amenities|amenity|loan|features|feature|where|what|how|why|explain|details)\b/i.test(t);
+    };
+
+    const isAppointmentSuggestionIntent = (text: string) => {
+      const t = normalizeTurnText(text);
+      return /\b(ok|okay|sounds good|what next|continue|tell me more|interested|go ahead|next)\b/i.test(t);
     };
 
     const detectIntent = (text: string) => {
@@ -1495,10 +1500,10 @@ async function startServer() {
 
       const question = questions[currentQuestionIndex];
       if (!question) {
-        moveStage("appointment");
-        console.log("[APPOINTMENT TRIGGERED]");
+        moveStage("post_qualification");
+        console.log("[APPOINTMENT DEFERRED]");
         console.log("[STAGE FLOW]", conversationStage);
-        return buildSchedulingQuestion(callData, kb);
+        return "Thanks, I have noted that.";
       }
 
       qualificationStarted = true;
@@ -1514,7 +1519,7 @@ async function startServer() {
       currentQuestionIndex += 1;
     };
 
-    const stageOrder: ConversationStage[] = ["greeting", "availability", "permission", "hook", "pitch", "qualification", "appointment", "closing", "ended"];
+    const stageOrder: ConversationStage[] = ["greeting", "availability", "permission", "hook", "pitch", "qualification", "post_qualification", "appointment", "closing", "ended"];
 
     const moveStage = (nextStage: ConversationStage) => {
       if (stageOrder.indexOf(nextStage) < stageOrder.indexOf(conversationStage)) {
@@ -1610,6 +1615,12 @@ async function startServer() {
       if (conversationStage === "ended") return decision("", "ended", false);
 
       if (intent === "kb_question") {
+        if (conversationStage === "appointment" && lastAiReply === buildSchedulingQuestion(callData, kb)) {
+          console.log("[INTENT OVERRIDE] user question detected, skipping appointment");
+          moveStage("post_qualification");
+        } else {
+          console.log("[INTENT OVERRIDE] user question detected, skipping appointment");
+        }
         const answer = await timedStep("Gemini", () => generateGeminiReply({
           transcript,
           knowledgeBase: kb,
@@ -1619,7 +1630,27 @@ async function startServer() {
           detectedIntent: callState.detectedIntent,
           maxWords: 14,
         }));
+        console.log("[FAQ ANSWERED]");
         return decision(sanitizeAiReplyForStage(answer, "I can answer that from the details I have."), conversationStage, true, 14);
+      }
+
+      if (conversationStage === "post_qualification") {
+        if (isAppointmentSuggestionIntent(transcript)) {
+          console.log("[APPOINTMENT TRIGGERED]");
+          return decision(buildSchedulingQuestion(callData, kb), "appointment", false);
+        }
+        console.log("[APPOINTMENT DEFERRED]");
+        const answer = await timedStep("Gemini", () => generateGeminiReply({
+          transcript,
+          knowledgeBase: kb,
+          callContext,
+          conversationStage,
+          conversationHistory,
+          detectedIntent: callState.detectedIntent,
+          maxWords: 14,
+        }));
+        console.log("[FAQ ANSWERED]");
+        return decision(sanitizeAiReplyForStage(answer, "I can answer that from the details I have."), "post_qualification", true, 14);
       }
 
       if (conversationStage === "appointment") {
@@ -1677,7 +1708,8 @@ async function startServer() {
           return decision("", conversationStage, false);
         }
         if (qualificationStarted) storeQualificationAnswer(transcript);
-        return decision(askNextQualificationQuestion(callData, kb), conversationStage, false);
+        const nextQuestionReply = askNextQualificationQuestion(callData, kb);
+        return decision(nextQuestionReply, conversationStage, false);
       }
 
       if (conversationStage === "closing") return decision(buildClosingLine(callData, kb), "ended", false, 30);
