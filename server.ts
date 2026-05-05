@@ -2160,15 +2160,25 @@ async function startServer() {
       return applyGreetingPlaceholders(question.text, callData, kb);
     };
 
+    function normalizeUserInput(text: string) {
+      const t = text.toLowerCase();
+
+      if (t.includes("selfie")) return "self-use";
+      if (t.includes("investment")) return "investment";
+
+      return text;
+    }
+
     const storeQualificationAnswer = (transcript: string) => {
       if (!qualificationStarted) return;
-      const normalizedAnswer = normalizeTurnText(transcript);
+      const clean = normalizeUserInput(transcript);
+      const normalizedAnswer = normalizeTurnText(clean);
       if (!normalizedAnswer) return;
 
       const duplicateIndex = Object.entries(leadData.answers)
         .find(([, answer]) => normalizeTurnText(String(answer)) === normalizedAnswer)?.[0];
       if (duplicateIndex !== undefined) {
-        console.log("[QUALIFICATION DUPLICATE BLOCKED]", duplicateIndex, transcript);
+        console.log("[QUALIFICATION DUPLICATE BLOCKED]", duplicateIndex, clean);
         if (leadData.answers[currentQuestionIndex]) {
           console.log("[QUALIFICATION QUESTION SKIPPED]", currentQuestionIndex);
           currentQuestionIndex += 1;
@@ -2181,9 +2191,9 @@ async function startServer() {
         console.log("[QUESTION SKIPPED]", currentQuestionIndex, "already answered");
         currentQuestionIndex += 1;
       }
-      leadData.answers[currentQuestionIndex] = transcript;
-      console.log("[ANSWER STORED]", currentQuestionIndex, transcript);
-      console.log("[LEAD MEMORY UPDATED]", currentQuestionIndex, "->", transcript);
+      leadData.answers[currentQuestionIndex] = clean;
+      console.log("[ANSWER STORED]", currentQuestionIndex, clean);
+      console.log("[LEAD MEMORY UPDATED]", currentQuestionIndex, "->", clean);
       currentQuestionIndex += 1;
     };
 
@@ -2310,6 +2320,14 @@ async function startServer() {
       console.log("[INTENT]", intent);
       console.log("[QUESTION INDEX]", currentQuestionIndex);
 
+      const repeatComplaintReply = (text: string) => {
+        const t = text.toLowerCase();
+        if (t.includes("already told") || t.includes("you said") || t.includes("again")) {
+          return "Sorry about that, let me not repeat. Moving ahead.";
+        }
+        return "";
+      };
+
       const decision = async (reply: string, nextStage: ConversationStage, needsGemini = false, maxWords = 10) => {
         let finalReply = reply;
         const currentQuestion = finalReply.trim();
@@ -2338,6 +2356,9 @@ async function startServer() {
         console.log("[DECISION: END_CALL]");
         return decision(buildClosingLine(callData, kb), "closing", false, 14);
       }
+
+      const repeatReply = repeatComplaintReply(transcript);
+      if (repeatReply) return decision(repeatReply, conversationStage, false, 10);
 
       if (conversationStage === "ended") return decision("", "ended", false);
 
