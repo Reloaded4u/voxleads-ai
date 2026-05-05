@@ -168,6 +168,7 @@ function normalizeKbForAgent(kb: any = {}) {
     faqs: firstPresentValue(findKbSection(source, ["faqs", "faq", "questions"])?.items, findKbSection(source, ["faqs", "faq", "questions"]), []),
     objections: firstPresentValue(findKbSection(source, ["objections", "objectionHandling", "objection handling"])?.items, findKbSection(source, ["objections", "objectionHandling", "objection handling"]), []),
     appointments: firstPresentValue(findKbSection(source, ["appointments", "appointment", "scheduling", "appointmentSettings", "appointment settings"]), {}),
+    answerBank: firstPresentValue(findKbSection(source, ["answerBank", "answer bank", "answers", "answerBankItems", "answer bank items"]), {}),
     tone: firstPresentValue(findKbSection(source, ["tone", "brandTone", "brand tone", "voiceTone", "voice tone"]), {}),
   };
 
@@ -283,7 +284,52 @@ function isWeakFillerInput(text: string) {
   return meaningfulWords.length > 0 && meaningfulWords.length < 3 && !/[?]/.test(text);
 }
 
+type IntentType = "pricing" | "location" | "amenities" | "configuration" | "offers" | "scheduling" | "language_request" | "general_question";
+
+function detectIntentType(userInput: string): IntentType {
+  const t = userInput.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
+  if (/\b(hindi|marathi|english|tamil|telugu|kannada|malayalam|gujarati|punjabi|bengali|language|speak|bolo|baat)\b/i.test(t)) return "language_request";
+  if (/\b(schedule|book|visit|meeting|appointment|callback|call back|follow up|followup)\b/i.test(t)) return "scheduling";
+  if (/\b(cost|price|pricing|rate|rates|fee|fees|charge|charges|amount|how much)\b/i.test(t)) return "pricing";
+  if (/\b(where|location|located|address|place|area)\b/i.test(t)) return "location";
+  if (/\b(amenity|amenities|facility|facilities|features|included|include)\b/i.test(t)) return "amenities";
+  if (/\b(configuration|configurations|config|options|types|available|variant|variants)\b/i.test(t)) return "configuration";
+  if (/\b(offer|offers|promotion|promotions|discount|deal|deals)\b/i.test(t)) return "offers";
+  return "general_question";
+}
+
+function getAnswerBankField(answerBank: any, intentType: IntentType) {
+  const fieldKeys: Partial<Record<IntentType, string[]>> = {
+    pricing: ["pricing", "price", "cost", "rates", "rate", "fees", "charges"],
+    location: ["location", "located", "address", "place", "area"],
+    amenities: ["amenities", "amenity", "facilities", "facility", "features"],
+    configuration: ["configurations", "configuration", "options", "types", "variants", "available"],
+    offers: ["offers", "offer", "promotions", "promotion", "discounts", "discount", "deals"],
+  };
+  const keys = fieldKeys[intentType];
+  if (!keys) return undefined;
+  return findKbSection(answerBank, keys);
+}
+
 function getKbDirectAnswer(userSpeech: string, kbContext: ReturnType<typeof normalizeKbForAgent>) {
+  const intentType = detectIntentType(userSpeech);
+  console.log("[INTENT TYPE]", intentType);
+
+  if (["pricing", "location", "amenities", "configuration", "offers"].includes(intentType)) {
+    const answerBankValue = getAnswerBankField((kbContext as any).answerBank, intentType);
+    console.log("[KB SECTION SELECTED]", `answerBank.${intentType}`);
+    const answerBankText = collectKbText(answerBankValue);
+    if (answerBankText.trim()) {
+      const answer = cleanDirectAnswer(answerBankText, 18);
+      console.log("[ANSWER SOURCE]", `answerBank.${intentType}`);
+      console.log("[KB DIRECT ANSWER]", `answerBank.${intentType}`, answer);
+      console.log("[GEMINI SKIPPED KB MATCH]");
+      return answer;
+    }
+    console.log("[WRONG MATCH BLOCKED]", `missing answerBank.${intentType}`);
+    return "";
+  }
+
   const normalizeTokens = (value: string) =>
     value
       .toLowerCase()
@@ -317,7 +363,10 @@ function getKbDirectAnswer(userSpeech: string, kbContext: ReturnType<typeof norm
   }).filter((entry) => entry.sectionText.trim());
 
   const best = entries.sort((a, b) => b.score - a.score)[0];
-  if (!best || best.score <= 0) return "";
+  if (!best || best.score <= 0) {
+    console.log("[WRONG MATCH BLOCKED]", "no reliable KB match");
+    return "";
+  }
 
   const answer = cleanDirectAnswer(best.sectionText, 18);
   console.log("[KB DIRECT ANSWER]", best.name, answer);
@@ -1827,7 +1876,10 @@ async function startServer() {
       | "scripted_next_step";
 
     const classifyUserIntent = (text: string): RoutedIntent => {
-      if (isLanguageRequest(text)) return "language_request";
+      const intentType = detectIntentType(text);
+      if (intentType === "language_request" || isLanguageRequest(text)) return "language_request";
+      if (intentType === "scheduling") return "scheduling_request";
+      if (["pricing", "location", "amenities", "configuration", "offers"].includes(intentType)) return "direct_question";
       if (hasIntentConflict(text)) {
         console.log("[INTENT CONFLICT BLOCKED]", "direct_question priority over scheduling");
         return "direct_question";
@@ -2057,13 +2109,8 @@ async function startServer() {
       `This is ${getAgentName(kb, callData)} from ${getKbBusinessName(kb)}.`;
 
     const buildLanguageReply = () => {
-      const supported: Record<string, string> = {
-        Hindi: "Haan, main Hindi mein baat kar sakti hoon. Should I continue from here?",
-        English: "Sure, I can continue in English. Should I continue from here?",
-      };
-      if (supported[preferredLanguage]) return supported[preferredLanguage];
-      console.log("[LANGUAGE FALLBACK USED]", preferredLanguage);
-      return `Sure, I can continue in ${preferredLanguage}. Should I continue from here?`;
+      console.log("[ANSWER SOURCE]", "language handler");
+      return "Yes, I can continue in that language.";
     };
 
     const getCurrentPendingPrompt = (callData: any, kb: any) => {
@@ -2271,6 +2318,7 @@ async function startServer() {
 
       const nextAction = decideNextAction(transcript, callState);
       console.log("[DECISION ACTION]", nextAction);
+      console.log("[INTENT TYPE]", detectIntentType(transcript));
       if (nextAction === "ask_next_question") console.log("[DECISION: ASK_NEXT]");
       if (nextAction === "clarify") console.log("[DECISION: CLARIFY]");
       if (nextAction === "fallback") console.log("[DECISION: FALLBACK]");
@@ -2337,6 +2385,13 @@ async function startServer() {
       }
 
       if (conversationStage === "post_qualification") {
+        if (routedIntent === "scheduling_request") {
+          updateAppointmentData(transcript);
+          console.log("[DECISION: ASK_NEXT]");
+          console.log("[APPOINTMENT TRIGGERED]");
+          console.log("[GEMINI SKIPPED]");
+          return decision("Sure, I can help with that. What day and time works for you?", "appointment", false, 14);
+        }
         if (isContinueInfoRequest(transcript)) {
           console.log("[DECISION: CLARIFY]");
           console.log("[CONTINUE HANDLED AS INFO REQUEST]");
@@ -2346,7 +2401,7 @@ async function startServer() {
           console.log("[DECISION: ASK_NEXT]");
           console.log("[APPOINTMENT TRIGGERED]");
           console.log("[GEMINI SKIPPED]");
-          return decision(deliverAppointmentPrompt(callData, kb), "appointment", false);
+          return decision("Sure, I can help with that. What day and time works for you?", "appointment", false, 14);
         }
         console.log("[DECISION: CLARIFY]");
         console.log("[APPOINTMENT DEFERRED]");
@@ -2375,7 +2430,7 @@ async function startServer() {
           return decision("Sure, what would you like to know?", "appointment", false, 14);
         }
         console.log("[GEMINI SKIPPED]");
-        return decision(deliverAppointmentPrompt(callData, kb), "appointment", false);
+        return decision("Sure, I can help with that. What day and time works for you?", "appointment", false, 14);
       }
 
       if (intent === "appointment") {
@@ -2388,7 +2443,7 @@ async function startServer() {
           return decision(buildAppointmentMemoryConfirmation(), "post_qualification", false, 12);
         }
         console.log("[GEMINI SKIPPED]");
-        return decision(deliverAppointmentPrompt(callData, kb), "appointment", false);
+        return decision("Sure, I can help with that. What day and time works for you?", "appointment", false, 14);
       }
 
       if (conversationStage === "availability") {
