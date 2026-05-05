@@ -181,7 +181,7 @@ Rules:
 - Detect the language from User said and reply in the same language
 - If Preferred Language is set, continue in that language
 - KB can be any language; do not translate KB literally
-- If info not found in KB, say: 'I don't have exact details right now, but our team can share them with you. Want a follow-up?'
+- If info not found in KB, say: 'I don't have exact details right now, but our team can share them with you.'
 
 Knowledge Base:
 ${JSON.stringify(kbContext)}
@@ -214,7 +214,7 @@ Reply:`;
     console.log("[KB USED SECTION]", kbUsedSection);
     console.log("[GEMINI PROMPT PREVIEW]", prompt.slice(0, 800));
     if (options.detectedIntent === "pricing" && !hasPricingInFaqs) {
-      const reply = "I don't have exact details right now, but our team can share them with you. Want a follow-up?";
+      const reply = "I don't have exact details right now, but our team can share them with you.";
       console.log("[GEMINI FINAL REPLY]", reply);
       return reply;
     }
@@ -1436,6 +1436,10 @@ async function startServer() {
       if (/\btomorrow\b/i.test(t)) return "tomorrow";
       if (/\btoday\b/i.test(t)) return "today";
       if (/\bnext week\b/i.test(t)) return "next week";
+      const weekday = t.match(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i)?.[1];
+      if (weekday) return weekday;
+      const explicitDate = t.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\b/i);
+      if (explicitDate) return explicitDate[0];
       if (/\b(morning|afternoon|evening)\b/i.test(t)) return t.match(/\b(morning|afternoon|evening)\b/i)?.[1] || "";
       return "";
     };
@@ -1456,21 +1460,23 @@ async function startServer() {
       const time = extractCallbackTime(text);
 
       if (type || date || time || isExplicitSchedulingRequest(text)) appointmentData.requested = true;
-      if (type) appointmentData.type = type;
+      if (type && !appointmentData.type) appointmentData.type = type;
       if (date) appointmentData.date = date;
       if (time) {
         appointmentData.time = time;
         savedCallbackTime = time;
       }
 
+      console.log("[SCHEDULING DATA UPDATED]", JSON.stringify(appointmentData));
       console.log("[APPOINTMENT DATA UPDATED]", JSON.stringify(appointmentData));
       return { date, time, type };
     };
 
     const buildAppointmentMemoryConfirmation = () => {
-      const datePart = appointmentData.date || "the requested date";
-      const timePart = appointmentData.time || "the requested time";
-      return `Got it. I'll arrange that for ${datePart} at ${timePart}.`;
+      if (appointmentData.date && appointmentData.time) return `Got it. I'll arrange that for ${appointmentData.date} at ${appointmentData.time}.`;
+      if (appointmentData.time) return `Got it. I'll arrange that at ${appointmentData.time}.`;
+      if (appointmentData.date) return `Got it. I'll arrange that for ${appointmentData.date}.`;
+      return "Got it. I'll arrange that.";
     };
 
     const getMaxWordsForStage = () => 14;
@@ -1521,13 +1527,16 @@ async function startServer() {
       );
     };
 
+    const hasTimeExpression = (text: string) => Boolean(extractCallbackTime(text));
+
+    const hasDateExpression = (text: string) => Boolean(extractCallbackDate(text));
+
     const isExplicitSchedulingRequest = (text: string) => {
       const t = normalizeTurnText(text);
       return (
-        /\b(schedule|book|call later|follow up|followup|appointment|not now|busy|arrange callback|call me later|i am busy|im busy|site visit|callback|call back|meeting)\b/i.test(t) ||
-        /\b(tomorrow at|today evening|today|tomorrow|next week)\b/i.test(t) ||
-        /\b\d{1,2}\s*(am|pm|a m|p m)\b/i.test(t) ||
-        /\bat\s+\d{1,2}\s*(am|pm|a m|p m)\b/i.test(t)
+        /\b(schedule|book|call later|follow up|followup|appointment|not now|busy|arrange callback|call me later|i am busy|im busy|callback|call back|meeting)\b/i.test(t) ||
+        hasTimeExpression(text) ||
+        hasDateExpression(text)
       );
     };
 
@@ -1574,7 +1583,7 @@ async function startServer() {
       return (
         isIdentityQuestion(text) ||
         text.trim().endsWith("?") ||
-        /\b(offer|offers|price|pricing|cost|rate|rates|details|detail|options|available|feature|features|where|what|which|how|why|explain|product|service|business)\b/i.test(t)
+        /\b(offer|offers|price|pricing|cost|rate|rates|details|detail|options|available|feature|features|where|what|which|how|why|explain|product|service|business|tell me|share|describe)\b/i.test(t)
       );
     };
 
@@ -1582,6 +1591,8 @@ async function startServer() {
       const t = normalizeTurnText(text);
       return /\b(continue|tell me more|more details)\b/i.test(t);
     };
+
+    const hasIntentConflict = (text: string) => isKbQuestionIntent(text) && isExplicitSchedulingRequest(text);
 
     const isAppointmentSuggestionIntent = (text: string) => {
       const t = normalizeTurnText(text);
@@ -1600,6 +1611,10 @@ async function startServer() {
 
     const classifyUserIntent = (text: string): RoutedIntent => {
       if (isLanguageRequest(text)) return "language_request";
+      if (hasIntentConflict(text)) {
+        console.log("[INTENT CONFLICT BLOCKED]", "direct_question priority over scheduling");
+        return "direct_question";
+      }
       if (isKbQuestionIntent(text)) return "direct_question";
       if (isObjectionIntent(text)) return "objection";
       if (isExplicitSchedulingRequest(text)) return "scheduling_request";
@@ -1662,7 +1677,10 @@ async function startServer() {
       const raw = getCallGuidance(kb)?.qualificationQuestions;
       const values = Array.isArray(raw) ? raw : raw ? [raw] : [];
       return values
-        .flatMap((item) => firstText(item).split(/\r?\n+/).map((line) => line.trim()).filter(Boolean))
+        .flatMap((item) => firstText(item)
+          .split(/\r?\n+|(?<=[?])\s+(?=[A-Z0-9])/)
+          .map((line) => line.trim())
+          .filter(Boolean))
         .map((text, index) => ({ id: `q${index + 1}`, text }));
     };
 
@@ -1835,7 +1853,7 @@ async function startServer() {
       const questions = getQualificationQuestions(kb);
 
       while (leadData.answers[currentQuestionIndex]) {
-        console.log("[QUESTION SKIPPED]", currentQuestionIndex);
+        console.log("[QUESTION SKIPPED]", currentQuestionIndex, questions[currentQuestionIndex]?.id || "unknown");
         currentQuestionIndex += 1;
       }
 
@@ -1854,9 +1872,21 @@ async function startServer() {
 
     const storeQualificationAnswer = (transcript: string) => {
       if (!qualificationStarted) return;
-      if (leadData.answers[currentQuestionIndex]) return;
+      const normalizedAnswer = normalizeTurnText(transcript);
+      if (!normalizedAnswer) return;
+      if (leadData.answers[currentQuestionIndex]) {
+        const previous = normalizeTurnText(leadData.answers[currentQuestionIndex]);
+        if (previous === normalizedAnswer) {
+          console.log("[ANSWER STORED]", currentQuestionIndex, "repeat-confirmation", transcript);
+          currentQuestionIndex += 1;
+          return;
+        }
+        console.log("[QUESTION SKIPPED]", currentQuestionIndex, "already answered");
+        currentQuestionIndex += 1;
+      }
       leadData.answers[currentQuestionIndex] = transcript;
-      console.log("[LEAD MEMORY UPDATED]", currentQuestionIndex, "→", transcript);
+      console.log("[ANSWER STORED]", currentQuestionIndex, transcript);
+      console.log("[LEAD MEMORY UPDATED]", currentQuestionIndex, "->", transcript);
       currentQuestionIndex += 1;
     };
 
@@ -1947,7 +1977,8 @@ async function startServer() {
 
       console.log("[STATE BEFORE]", conversationStage);
       console.log("[INTENT ROUTER]", routedIntent);
-      console.log("[INTENT PRIORITY]", "language_request > direct_question > objection > scheduling_request > meta_comment > qualification_answer > scripted_next_step");
+      console.log("[INTENT PRIORITY]", "direct_question > scheduling_request > general_response > scripted_flow");
+      console.log("[INTENT DETECTED]", routedIntent);
       console.log("[INTENT]", intent);
       console.log("[QUESTION INDEX]", currentQuestionIndex);
 
@@ -2022,7 +2053,7 @@ async function startServer() {
       if (conversationStage === "post_qualification") {
         if (isContinueInfoRequest(transcript)) {
           console.log("[CONTINUE HANDLED AS INFO REQUEST]");
-          return decision("Sure, what would you like to know - location, amenities, pricing, or offers?", "post_qualification", false, 14);
+          return decision("Sure, what would you like to know?", "post_qualification", false, 14);
         }
         if (isAppointmentSuggestionIntent(transcript)) {
           console.log("[APPOINTMENT TRIGGERED]");
@@ -2050,6 +2081,7 @@ async function startServer() {
         if (appointmentData.date && appointmentData.time) {
           appointmentData.confirmed = true;
           console.log("[APPOINTMENT TIME ALREADY KNOWN]");
+          console.log("[SCHEDULING CONFIRMED]", JSON.stringify(appointmentData));
           console.log("[APPOINTMENT CONFIRMED]", JSON.stringify(appointmentData));
           console.log("[GEMINI SKIPPED]");
           return decision(buildAppointmentMemoryConfirmation(), "post_qualification", false, 12);
@@ -2059,7 +2091,7 @@ async function startServer() {
         }
         if (isContinueInfoRequest(transcript)) {
           console.log("[CONTINUE HANDLED AS INFO REQUEST]");
-          return decision("Sure, what would you like to know - location, amenities, pricing, or offers?", "appointment", false, 14);
+          return decision("Sure, what would you like to know?", "appointment", false, 14);
         }
         if (appointmentPromptDelivered) {
           console.log("[APPOINTMENT LOOP BLOCKED]");
@@ -2074,6 +2106,7 @@ async function startServer() {
         if (appointmentData.date && appointmentData.time) {
           appointmentData.confirmed = true;
           console.log("[APPOINTMENT TIME ALREADY KNOWN]");
+          console.log("[SCHEDULING CONFIRMED]", JSON.stringify(appointmentData));
           console.log("[APPOINTMENT CONFIRMED]", JSON.stringify(appointmentData));
           return decision(buildAppointmentMemoryConfirmation(), "post_qualification", false, 12);
         }
