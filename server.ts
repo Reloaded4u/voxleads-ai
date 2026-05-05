@@ -2150,6 +2150,37 @@ async function startServer() {
       return conversationStage;
     };
 
+    const missingKbAnswerFallback = "I don't have exact details right now, but our team can share that with you.";
+
+    type NextAction = "answer_from_kb" | "ask_next_question" | "clarify" | "fallback" | "end_call";
+
+    const isEchoReply = (reply: string, userInput: string) => {
+      const replyText = normalizeTurnText(reply);
+      const userText = normalizeTurnText(userInput);
+      if (!replyText || !userText) return false;
+      return replyText === userText || replyText.startsWith(userText) || userText.startsWith(replyText);
+    };
+
+    const findKbAnswerForTurn = (userInput: string, kb: any) => {
+      const answer = getKbDirectAnswer(userInput, normalizeKbForAgent(kb));
+      if (answer && isEchoReply(answer, userInput)) {
+        console.log("[ECHO BLOCKED]", userInput);
+        return "";
+      }
+      return answer;
+    };
+
+    const decideNextAction = (userInput: string, state: any): NextAction => {
+      const routed = classifyUserIntent(userInput);
+      if (state?.stage === "ended" || conversationStage === "ended") return "end_call";
+      if (routed === "objection" || isPermissionNegative(userInput)) return "end_call";
+      if (routed === "direct_question") return "answer_from_kb";
+      if (routed === "scheduling_request") return "ask_next_question";
+      if (routed === "unclear" || isWeakFillerInput(userInput)) return "clarify";
+      if (routed === "qualification_answer" || routed === "scripted_next_step") return "ask_next_question";
+      return "clarify";
+    };
+
     const buildCallState = (callData: any, callContext: any, detectedIntent: string, lowConfidenceWithoutTime: boolean) => ({
       stage: conversationStage,
       callData,
@@ -2238,6 +2269,17 @@ async function startServer() {
         return { reply, needsGemini, maxWords };
       };
 
+      const nextAction = decideNextAction(transcript, callState);
+      console.log("[DECISION ACTION]", nextAction);
+      if (nextAction === "ask_next_question") console.log("[DECISION: ASK_NEXT]");
+      if (nextAction === "clarify") console.log("[DECISION: CLARIFY]");
+      if (nextAction === "fallback") console.log("[DECISION: FALLBACK]");
+
+      if (nextAction === "end_call") {
+        console.log("[DECISION: END_CALL]");
+        return decision(buildClosingLine(callData, kb), "closing", false, 14);
+      }
+
       if (conversationStage === "ended") return decision("", "ended", false);
 
       if (["post_qualification", "appointment"].includes(conversationStage) && routedIntent !== "direct_question" && routedIntent !== "scheduling_request" && isWeakFillerInput(transcript)) {
@@ -2263,32 +2305,30 @@ async function startServer() {
         return decision(pendingPrompt, conversationStage, false, 14);
       }
 
-      if (intent === "kb_question") {
+      if (nextAction === "answer_from_kb") {
         if (conversationStage === "appointment") {
           console.log("[USER QUESTION OVERRIDES APPOINTMENT]");
         } else {
           console.log("[INTENT OVERRIDE] user question detected, skipping appointment");
         }
         if (isIdentityQuestion(transcript)) {
+          console.log("[DECISION: ANSWER]");
           console.log("[DIRECT QUESTION HANDLED]");
           console.log("[RETURNING TO STAGE]", conversationStage);
           return decision(buildIdentityReply(callData, kb), conversationStage, false, 14);
         }
-        console.log("[GEMINI CALLED]");
-        const answer = await timedStep("Gemini", () => generateGeminiReply({
-          transcript,
-          knowledgeBase: kb,
-          callContext,
-          conversationStage,
-          conversationHistory,
-          detectedIntent: detectIntent(transcript),
-          preferredLanguage,
-          maxWords: 14,
-        }));
+        const answer = findKbAnswerForTurn(transcript, kb);
+        if (answer) {
+          console.log("[DECISION: ANSWER]");
+          console.log("[DIRECT QUESTION HANDLED]");
+          console.log("[FAQ ANSWERED]");
+          console.log("[RETURNING TO STAGE]", conversationStage);
+          return decision(sanitizeAiReplyForStage(answer, missingKbAnswerFallback), conversationStage, false, 14);
+        }
+        console.log("[DECISION: FALLBACK]");
         console.log("[DIRECT QUESTION HANDLED]");
-        console.log("[FAQ ANSWERED]");
         console.log("[RETURNING TO STAGE]", conversationStage);
-        return decision(sanitizeAiReplyForStage(answer, "I don't have exact details right now, but our team can share that with you."), conversationStage, true, 14);
+        return decision(missingKbAnswerFallback, conversationStage, false, 14);
       }
 
       if (routedIntent === "objection") {
@@ -2298,28 +2338,19 @@ async function startServer() {
 
       if (conversationStage === "post_qualification") {
         if (isContinueInfoRequest(transcript)) {
+          console.log("[DECISION: CLARIFY]");
           console.log("[CONTINUE HANDLED AS INFO REQUEST]");
           return decision("Sure, what would you like to know?", "post_qualification", false, 14);
         }
         if (isAppointmentSuggestionIntent(transcript)) {
+          console.log("[DECISION: ASK_NEXT]");
           console.log("[APPOINTMENT TRIGGERED]");
           console.log("[GEMINI SKIPPED]");
           return decision(deliverAppointmentPrompt(callData, kb), "appointment", false);
         }
+        console.log("[DECISION: CLARIFY]");
         console.log("[APPOINTMENT DEFERRED]");
-        console.log("[GEMINI CALLED]");
-        const answer = await timedStep("Gemini", () => generateGeminiReply({
-          transcript,
-          knowledgeBase: kb,
-          callContext,
-          conversationStage,
-          conversationHistory,
-          detectedIntent: callState.detectedIntent,
-          preferredLanguage,
-          maxWords: 14,
-        }));
-        console.log("[FAQ ANSWERED]");
-        return decision(sanitizeAiReplyForStage(answer, "I don't have exact details right now, but our team can share that with you."), "post_qualification", true, 14);
+        return decision("Sure, what would you like to know?", "post_qualification", false, 14);
       }
 
       if (conversationStage === "appointment") {
