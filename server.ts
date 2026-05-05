@@ -1646,6 +1646,7 @@ async function startServer() {
 
     let savedCallbackTime = "";
     let preferredLanguage = "English";
+    let lastQuestion = "";
     let playbackInterrupted = false;
     let bargeInBuffers: Buffer[] = [];
     let pendingBargeInAudio: Buffer | null = null;
@@ -2310,10 +2311,20 @@ async function startServer() {
       console.log("[QUESTION INDEX]", currentQuestionIndex);
 
       const decision = async (reply: string, nextStage: ConversationStage, needsGemini = false, maxWords = 10) => {
+        let finalReply = reply;
+        const currentQuestion = finalReply.trim();
+        if (currentQuestion.endsWith("?")) {
+          if (lastQuestion === currentQuestion) {
+            console.log("[LOOP BLOCKED] same question detected");
+            finalReply = "Got it, no worries. Let me move ahead.";
+          } else {
+            lastQuestion = currentQuestion;
+          }
+        }
         if (nextStage !== conversationStage) moveStage(nextStage);
-        console.log("[REPLY DECISION]", reply, "nextStage=", conversationStage, "gemini=", needsGemini);
+        console.log("[REPLY DECISION]", finalReply, "nextStage=", conversationStage, "gemini=", needsGemini);
         console.log("[STATE AFTER]", conversationStage);
-        return { reply, needsGemini, maxWords };
+        return { reply: finalReply, needsGemini, maxWords };
       };
 
       const nextAction = decideNextAction(transcript, callState);
