@@ -120,6 +120,113 @@ function normalizePhoneNumber(phone: string) {
   return cleaned;
 }
 
+function firstPresentValue(...values: any[]) {
+  for (const value of values) {
+    if (value === undefined || value === null) continue;
+    if (Array.isArray(value) && value.length === 0) continue;
+    if (typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0) continue;
+    if (typeof value === "string" && !value.trim()) continue;
+    return value;
+  }
+  return undefined;
+}
+
+function normalizeKbForAgent(kb: any = {}) {
+  const structured = kb?.structuredKnowledge || kb?.structured || {};
+  const source = { ...structured, ...kb };
+  const normalized = {
+    businessProfile: firstPresentValue(source.businessProfile, source.business, source.profile, source.companyProfile, source.businessInfo, {}),
+    productsServices: firstPresentValue(source.productsServices, source.products, source.services, source.offerings, source.productServices, source.productsAndServices, {}),
+    uniqueSellingPoints: firstPresentValue(source.uniqueSellingPoints, source.usps, source.usp, source.benefits, source.whyChooseUs, source.valueProposition, {}),
+    offersPromotions: firstPresentValue(source.offersPromotions, source.offers, source.promotions, source.discounts, source.deals, source.specialOffers, {}),
+    callGuidance: firstPresentValue(source.callGuidance, source.guidance, source.script, {}),
+    faqs: firstPresentValue(source.faqs?.items, source.faqs, source.questions, []),
+    objections: firstPresentValue(source.objections?.items, source.objections, source.objectionHandling, []),
+    appointments: firstPresentValue(source.appointments, source.scheduling, source.appointmentSettings, {}),
+    tone: firstPresentValue(source.tone, source.brandTone, source.voiceTone, {}),
+  };
+
+  console.log("[KB NORMALIZED KEYS]", Object.keys(normalized).filter((key) => {
+    const value = (normalized as any)[key];
+    return typeof value === "string" ? value.trim() : Array.isArray(value) ? value.length : Object.keys(value || {}).length;
+  }).join(","));
+
+  for (const [key, value] of Object.entries(normalized)) {
+    console.log("[KB FIELD LENGTH]", key, collectKbText(value).length);
+  }
+
+  return normalized;
+}
+
+function collectKbText(value: any): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return value.map(collectKbText).filter(Boolean).join(" ");
+  if (typeof value === "object") {
+    return Object.values(value)
+      .map(collectKbText)
+      .filter((item) => item.trim())
+      .join(" ");
+  }
+  return "";
+}
+
+function countWords(value: string) {
+  return value.split(/\s+/).filter(Boolean).length;
+}
+
+function trimToSentenceOrWords(value: string, maxWords: number) {
+  const clean = value.replace(/\s+/g, " ").trim();
+  if (countWords(clean) <= maxWords) return clean;
+
+  const sentences = clean.match(/[^.!?]+[.!?]+/g) || [];
+  let result = "";
+  for (const sentence of sentences) {
+    const candidate = `${result} ${sentence.trim()}`.trim();
+    if (countWords(candidate) > maxWords) break;
+    result = candidate;
+  }
+  if (result) return result;
+  return clean.split(/\s+/).slice(0, maxWords).join(" ").replace(/[,:;\-]+$/, "") + ".";
+}
+
+function isWeakFillerInput(text: string) {
+  const normalized = text
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .replace(/\s+/g, " ");
+  const filler = new Set(["hello", "hi", "hey", "yeah", "yes", "okay", "ok", "hmm", "uh", "um", "go ahead", "continue", "yeah hey", "hello first"]);
+  if (filler.has(normalized)) return true;
+  const meaningfulWords = normalized.split(" ").filter((word) => word && !["hello", "hi", "hey", "yeah", "yes", "okay", "ok", "hmm", "uh", "um", "please"].includes(word));
+  return meaningfulWords.length > 0 && meaningfulWords.length < 3 && !/[?]/.test(text);
+}
+
+function getKbDirectAnswer(userSpeech: string, kbContext: ReturnType<typeof normalizeKbForAgent>) {
+  const t = userSpeech.toLowerCase();
+  const categories: Array<{ name: string; match: RegExp; section: any }> = [
+    { name: "offersPromotions", match: /\b(offer|offers|promotion|promotions|discount|discounts|deal|deals|coupon|sale)\b/i, section: kbContext.offersPromotions },
+    { name: "productsServices", match: /\b(product|products|service|services|option|options|available|provide|offering|offerings)\b/i, section: kbContext.productsServices },
+    { name: "uniqueSellingPoints", match: /\b(why|benefit|benefits|usp|unique|advantage|choose|special|best)\b/i, section: kbContext.uniqueSellingPoints },
+    { name: "businessProfile", match: /\b(about|business|company|who are you|who is this|service area|location|where)\b/i, section: kbContext.businessProfile },
+    { name: "faqs", match: /\b(faq|question|questions|price|pricing|cost|rate|details|detail|how|what|which)\b/i, section: kbContext.faqs },
+    { name: "objections", match: /\b(not interested|expensive|already|concern|problem|issue|objection)\b/i, section: kbContext.objections },
+  ];
+
+  for (const category of categories) {
+    if (!category.match.test(t)) continue;
+    const text = collectKbText(category.section);
+    if (!text.trim()) continue;
+    const answer = trimToSentenceOrWords(text, 18);
+    console.log("[KB DIRECT ANSWER]", category.name, answer);
+    console.log("[GEMINI SKIPPED KB MATCH]");
+    return answer;
+  }
+
+  return "";
+}
+
 async function generateAiResponse(
   userSpeech: string,
   callData: any,
@@ -136,31 +243,12 @@ async function generateAiResponse(
 
   if (!apiKey) return "";
 
-  const kbContext = {
-    businessProfile: kb?.businessProfile || kb?.business || {},
-    callGuidance: kb?.callGuidance || kb?.guidance || {},
-    faqs: kb?.faqs?.items || kb?.faqs || [],
-    objections: kb?.objections?.items || kb?.objections || [],
-    appointments: kb?.appointments || {},
-    tone: kb?.tone || {},
-  };
+  const kbContext = normalizeKbForAgent(kb);
   const conversationText = (options.conversationHistory || [])
     .slice(-8)
     .map((item) => `${item.role}: ${item.text}`)
     .join("\n");
-  const countWords = (value: string) => value.split(/\s+/).filter(Boolean).length;
-  const lastCompleteSentenceWithinLimit = (value: string, maxWords: number) => {
-    const sentences = value.match(/[^.!?]+[.!?]+/g) || [];
-    let result = "";
-
-    for (const sentence of sentences) {
-      const candidate = `${result} ${sentence.trim()}`.trim();
-      if (countWords(candidate) > maxWords) break;
-      result = candidate;
-    }
-
-    return result.trim();
-  };
+  const lastCompleteSentenceWithinLimit = (value: string, maxWords: number) => trimToSentenceOrWords(value, maxWords);
   const kbUsedSection =
     options.detectedIntent === "pricing" ? "faqs" :
     options.detectedIntent === "scheduling" ? "appointments" :
@@ -204,14 +292,26 @@ ${userSpeech}
 Reply:`;
 
   try {
-    console.log("[KB SECTIONS PASSED] businessProfile, callGuidance, faqs, objections, appointments, tone");
-    console.log("[KB DIAG] businessProfile=", Object.keys(kbContext.businessProfile || {}).length > 0);
-    console.log("[KB DIAG] callGuidance=", Object.keys(kbContext.callGuidance || {}).length > 0);
+    console.log("[KB SECTIONS PASSED] businessProfile, productsServices, uniqueSellingPoints, offersPromotions, callGuidance, faqs, objections, appointments, tone");
+    console.log("[KB DIAG] businessProfile=", collectKbText(kbContext.businessProfile).length > 0);
+    console.log("[KB DIAG] productsServices=", collectKbText(kbContext.productsServices).length > 0);
+    console.log("[KB DIAG] uniqueSellingPoints=", collectKbText(kbContext.uniqueSellingPoints).length > 0);
+    console.log("[KB DIAG] offersPromotions=", collectKbText(kbContext.offersPromotions).length > 0);
+    console.log("[KB DIAG] callGuidance=", collectKbText(kbContext.callGuidance).length > 0);
     console.log("[KB DIAG] faqsCount=", Array.isArray(kbContext.faqs) ? kbContext.faqs.length : 0);
     console.log("[KB DIAG] objectionsCount=", Array.isArray(kbContext.objections) ? kbContext.objections.length : 0);
     console.log("[KB DIAG] appointments=", Object.keys(kbContext.appointments || {}).length > 0);
     console.log("[KB DIAG] tone=", Object.keys(kbContext.tone || {}).length > 0);
     console.log("[KB USED SECTION]", kbUsedSection);
+    const directAnswer = getKbDirectAnswer(userSpeech, kbContext);
+    if (directAnswer) {
+      console.log("[GEMINI FINAL REPLY]", directAnswer);
+      return directAnswer;
+    }
+    if (isWeakFillerInput(userSpeech)) {
+      console.log("[GEMINI SKIPPED FILLER]", userSpeech);
+      return "";
+    }
     console.log("[GEMINI PROMPT PREVIEW]", prompt.slice(0, 800));
     if (options.detectedIntent === "pricing" && !hasPricingInFaqs) {
       const reply = "I don't have exact details right now, but our team can share them with you.";
@@ -235,7 +335,7 @@ Reply:`;
     }
 
     let reply = (data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
-    const maxWords = options.maxWords || 15;
+    const maxWords = options.maxWords || 12;
 
     if (countWords(reply) > maxWords) {
       const sentenceCut = lastCompleteSentenceWithinLimit(reply, maxWords);
@@ -363,7 +463,7 @@ function pcm16ToMulaw(pcmBuffer: Buffer): Buffer {
  * Returns raw mulaw 8kHz mono bytes ready for Vobiz, or null on failure.
  * Requests mulaw/PCM directly from the provider — no ffmpeg needed.
  */
-async function fetchTtsAudio(message: string, ownerId: string): Promise<Buffer | null> {
+async function fetchTtsAudio(message: string, ownerId: string, fallbackAttempt = false): Promise<Buffer | null> {
   try {
     const userDoc = await db.collection("users").doc(ownerId).get();
     const integrations = userDoc.data()?.integrations || {};
@@ -397,6 +497,11 @@ async function fetchTtsAudio(message: string, ownerId: string): Promise<Buffer |
       // Response is already 8kHz mulaw — send directly
       const buf = Buffer.from(await res.arrayBuffer());
       console.log(`[Vobiz TTS] returned bytes=${buf.length}`);
+      if (buf.length === 0) {
+        console.log("[TTS ZERO BYTES FALLBACK]");
+        if (!fallbackAttempt) return fetchTtsAudio("Haan, main Hindi mein baat kar sakti hoon.", ownerId, true);
+        return null;
+      }
       return buf;
     }
 
@@ -423,6 +528,11 @@ async function fetchTtsAudio(message: string, ownerId: string): Promise<Buffer |
       // Response is already 8kHz mulaw — send directly
       const buf = Buffer.from(await res.arrayBuffer());
       console.log(`[Vobiz TTS] returned bytes=${buf.length}`);
+      if (buf.length === 0) {
+        console.log("[TTS ZERO BYTES FALLBACK]");
+        if (!fallbackAttempt) return fetchTtsAudio("Haan, main Hindi mein baat kar sakti hoon.", ownerId, true);
+        return null;
+      }
       return buf;
     }
 
@@ -1654,18 +1764,26 @@ async function startServer() {
     };
 
     const getCallGuidance = (kb: any) => kb?.callGuidance || kb?.guidance || {};
+    const prepareScriptField = (text: string) => {
+      const words = text.split(/\s+/).filter(Boolean);
+      console.log("[SCRIPT FULL FIELD USED]", words.length);
+      if (words.length <= 35) return text;
+      const trimmed = trimReplyForStage(text, 35);
+      console.log("[SCRIPT TRIMMED AT SENTENCE]", trimmed);
+      return trimmed;
+    };
     const getScriptField = (kb: any, field: string, fallback: string, aliases: string[] = []) => {
       const guidance = getCallGuidance(kb);
       for (const key of [field, ...aliases]) {
         const text = firstText(guidance?.[key]);
         if (text) {
           console.log("[KB SCRIPT FIELD USED]", key, "kb");
-          return text;
+          return prepareScriptField(text);
         }
       }
       console.log("[KB SCRIPT FIELD MISSING]", field, aliases.length ? aliases.join(",") : "no-aliases");
       console.log("[KB SCRIPT FIELD USED]", field, "fallback");
-      return fallback;
+      return prepareScriptField(fallback);
     };
     const getOpeningHook = (kb: any) =>
       getScriptField(kb, "hook", "May I take 30 seconds to explain?", ["openingLine"]);
@@ -1991,6 +2109,12 @@ async function startServer() {
 
       if (conversationStage === "ended") return decision("", "ended", false);
 
+      if (["post_qualification", "appointment"].includes(conversationStage) && routedIntent !== "direct_question" && routedIntent !== "scheduling_request" && isWeakFillerInput(transcript)) {
+        console.log("[GEMINI SKIPPED FILLER]", transcript);
+        const pendingPrompt = getCurrentPendingPrompt(callData, kb);
+        return decision(pendingPrompt || "Sure, what would you like to know?", conversationStage, false, 14);
+      }
+
       if (routedIntent === "language_request") {
         preferredLanguage = getRequestedLanguage(transcript);
         console.log("[LANGUAGE SWITCH]", preferredLanguage);
@@ -2134,7 +2258,7 @@ async function startServer() {
           return decision(buildPermissionQuestion(callData, kb), "hook", false);
         }
         console.log("[GEMINI SKIPPED]");
-        return decision(applyGreetingPlaceholders(getOpeningHook(kb), callData, kb), "pitch", false);
+        return decision(applyGreetingPlaceholders(getOpeningHook(kb), callData, kb), "pitch", false, 35);
       }
 
       if (conversationStage === "hook") {
@@ -2142,20 +2266,20 @@ async function startServer() {
         if (!hookDelivered) {
           hookDelivered = true;
           console.log("[GEMINI SKIPPED]");
-          return decision(applyGreetingPlaceholders(getOpeningHook(kb), callData, kb), "pitch", false);
+          return decision(applyGreetingPlaceholders(getOpeningHook(kb), callData, kb), "pitch", false, 35);
         }
         console.log("[GEMINI SKIPPED]");
-        return decision(applyGreetingPlaceholders(getMainPitch(kb), callData, kb), "qualification", false);
+        return decision(applyGreetingPlaceholders(getMainPitch(kb), callData, kb), "qualification", false, 35);
       }
 
       if (conversationStage === "pitch") {
         if (!pitchDelivered) {
           pitchDelivered = true;
           console.log("[GEMINI SKIPPED]");
-          return decision(applyGreetingPlaceholders(getMainPitch(kb), callData, kb), "qualification", false);
+          return decision(applyGreetingPlaceholders(getMainPitch(kb), callData, kb), "qualification", false, 35);
         }
         console.log("[GEMINI SKIPPED]");
-        return decision(askNextQualificationQuestion(callData, kb), "qualification", false);
+        return decision(askNextQualificationQuestion(callData, kb), "qualification", false, 18);
       }
 
       if (conversationStage === "qualification") {
