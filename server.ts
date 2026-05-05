@@ -216,6 +216,31 @@ function trimToSentenceOrWords(value: string, maxWords: number) {
   return clean.split(/\s+/).slice(0, maxWords).join(" ").replace(/[,:;\-]+$/, "") + ".";
 }
 
+function cleanFinalResponse(value: string, fallback = "Sure, what would you like to know?", maxWords = 15) {
+  let clean = value
+    .replace(/\b\d{8,}\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!clean) {
+    console.log("[EMPTY REPLY FALLBACK USED]");
+    clean = fallback;
+  }
+  clean = trimToSentenceOrWords(clean, maxWords).replace(/[,;:\-]+$/g, "").trim();
+  const incompleteEnding = /\b(to|and|with|for|in|on|at|by|of|the|a|an)$/i;
+  while (incompleteEnding.test(clean)) {
+    const previous = clean;
+    clean = clean.replace(/\s+\S+$/g, "").replace(/[,;:\-]+$/g, "").trim();
+    if (clean === previous) break;
+  }
+  if (!clean) clean = fallback;
+  if (!/[.!?]$/.test(clean)) {
+    console.log("[INCOMPLETE SENTENCE FIXED]", clean);
+    clean += ".";
+  }
+  console.log("[FINAL CLEAN RESPONSE]", clean);
+  return clean;
+}
+
 function cleanDirectAnswer(value: string, maxWords = 18) {
   let clean = value.replace(/\s+/g, " ").trim();
   const withoutArtifacts = clean
@@ -241,6 +266,7 @@ function cleanDirectAnswer(value: string, maxWords = 18) {
   if (phraseBoundary) answer = phraseBoundary[1].trim();
   if (!/[.!?]$/.test(answer)) answer += ".";
 
+  answer = cleanFinalResponse(answer, "I can share those details from the knowledge base.", maxWords);
   console.log("[DIRECT ANSWER CLEANED]", answer);
   return answer;
 }
@@ -251,7 +277,7 @@ function isWeakFillerInput(text: string) {
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s]/gu, "")
     .replace(/\s+/g, " ");
-  const filler = new Set(["hello", "hi", "hey", "yeah", "yes", "okay", "ok", "hmm", "uh", "um", "go ahead", "continue", "yeah hey", "hello first"]);
+  const filler = new Set(["hello", "hi", "hey", "yeah", "yes", "okay", "ok", "hmm", "uh", "um", "go ahead", "continue", "awesome", "yeah hey", "hello first"]);
   if (filler.has(normalized)) return true;
   const meaningfulWords = normalized.split(" ").filter((word) => word && !["hello", "hi", "hey", "yeah", "yes", "okay", "ok", "hmm", "uh", "um", "please"].includes(word));
   return meaningfulWords.length > 0 && meaningfulWords.length < 3 && !/[?]/.test(text);
@@ -295,7 +321,10 @@ async function generateAiResponse(
 ) {
   const apiKey = process.env.GEMINI_API_KEY;
 
-  if (!apiKey) return "";
+  if (!apiKey) {
+    console.log("[EMPTY REPLY FALLBACK USED]");
+    return "I can share that from the details I have.";
+  }
 
   const kbContext = normalizeKbForAgent(kb);
   const conversationText = (options.conversationHistory || [])
@@ -372,6 +401,7 @@ Reply:`;
       console.log("[GEMINI FINAL REPLY]", reply);
       return reply;
     }
+    console.log("[GEMINI CALLED]");
     console.log("[GEMINI ROUTE] Gemini question handling", userSpeech);
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
       method: "POST",
@@ -396,11 +426,13 @@ Reply:`;
       if (sentenceCut) reply = sentenceCut;
     }
 
+    reply = cleanFinalResponse(reply, "I can share that from the details I have.", maxWords);
     console.log("[GEMINI FINAL REPLY]", reply);
     return reply;
   } catch (error) {
     console.error("[GEMINI ERROR]", error);
-    return "";
+    console.log("[EMPTY REPLY FALLBACK USED]");
+    return "I can share that from the details I have.";
   }
 }
 
@@ -438,16 +470,20 @@ async function generateGeminiReply({
 const VOBIZ_CHUNK_BYTES = 160;  // 8000 Hz * 1 byte/sample * 0.020 s = 160
 const VOBIZ_CHUNK_MS    = 20;
 
-async function sendVobizAudio(ws: any, audioBuffer: Buffer): Promise<void> {
+async function sendVobizAudio(ws: any, audioBuffer: Buffer, shouldContinue?: () => boolean): Promise<void> {
   if (!audioBuffer || audioBuffer.length === 0) return;
 
   const totalChunks = Math.ceil(audioBuffer.length / VOBIZ_CHUNK_BYTES);
   console.log(`[Vobiz Outbound Audio] totalBytes=${audioBuffer.length} chunks=${totalChunks}`);
 
   for (let i = 0; i < totalChunks; i++) {
-    // Guard: abort if the socket has closed mid-playback
+    // Guard: abort if the socket has closed or playback was interrupted.
     if (!ws || ws.readyState !== 1) {
       console.warn(`[Vobiz playAudio] WS closed at chunk ${i}/${totalChunks}, aborting`);
+      break;
+    }
+    if (shouldContinue && !shouldContinue()) {
+      console.log("[AUDIO INTERRUPTED]");
       break;
     }
 
@@ -1551,6 +1587,10 @@ async function startServer() {
 
     let savedCallbackTime = "";
     let preferredLanguage = "English";
+    let playbackInterrupted = false;
+    let bargeInBuffers: Buffer[] = [];
+    let pendingBargeInAudio: Buffer | null = null;
+    const BARGE_IN_WINDOW_FRAMES = 35;
     const appointmentData: {
       requested: boolean;
       type: string | null;
@@ -1706,8 +1746,10 @@ async function startServer() {
 
     const isLanguageRequest = (text: string) => {
       const t = normalizeTurnText(text);
-      return /\b(hindi|english|marathi|tamil|telugu|kannada|malayalam|gujarati|punjabi|bengali|language)\b/i.test(t) &&
-        /\b(talk|speak|baat|bolo|bol|can you|could you)\b/i.test(t);
+      return (
+        /\b(hindi|english|marathi|tamil|telugu|kannada|malayalam|gujarati|punjabi|bengali|language)\b/i.test(t) &&
+        /\b(talk|speak|baat|bolo|bol|can you|could you|nahi aati|mein|me)\b/i.test(t)
+      ) || /\bmujhe english nahi aati\b/i.test(t);
     };
 
     const getRequestedLanguage = (text: string) => {
@@ -1747,8 +1789,13 @@ async function startServer() {
       return (
         isIdentityQuestion(text) ||
         text.trim().endsWith("?") ||
-        /\b(offer|offers|price|pricing|cost|rate|rates|details|detail|options|available|feature|features|where|what|which|how|why|explain|product|service|business|tell me|share|describe)\b/i.test(t)
+        /\b(offer|offers|price|pricing|cost|rate|rates|details|detail|options|available|feature|features|where|what|which|how|why|explain|product|service|business|tell me|share|describe|can you|i want to ask)\b/i.test(t)
       );
+    };
+
+    const isBargeInPhrase = (text: string) => {
+      const t = normalizeTurnText(text);
+      return /\b(no no|wait|stop|listen|one second|hello|can you|i want to ask)\b/i.test(t) || isKbQuestionIntent(text);
     };
 
     const isContinueInfoRequest = (text: string) => {
@@ -1821,8 +1868,20 @@ async function startServer() {
     const prepareScriptField = (text: string) => {
       const words = text.split(/\s+/).filter(Boolean);
       console.log("[SCRIPT FULL FIELD USED]", words.length);
-      if (words.length <= 35) return text;
-      const trimmed = trimReplyForStage(text, 35);
+      if (words.length <= 60) {
+        console.log("[TRIM SKIPPED SHORT SCRIPT]");
+        return cleanFinalResponse(text, text, 60);
+      }
+
+      const sentences = text.match(/[^.!?]+[.!?]+/g) || [];
+      let trimmed = "";
+      for (const sentence of sentences) {
+        const candidate = `${trimmed} ${sentence.trim()}`.trim();
+        if (candidate.split(/\s+/).filter(Boolean).length > 60) break;
+        trimmed = candidate;
+      }
+      if (!trimmed) trimmed = sentences[0]?.trim() || text.trim();
+      trimmed = cleanFinalResponse(trimmed, trimmed, 1000);
       console.log("[SCRIPT TRIMMED AT SENTENCE]", trimmed);
       return trimmed;
     };
@@ -1993,8 +2052,13 @@ async function startServer() {
       `This is ${getAgentName(kb, callData)} from ${getKbBusinessName(kb)}.`;
 
     const buildLanguageReply = () => {
-      if (preferredLanguage === "Hindi") return "Haan, main Hindi mein baat kar sakti hoon.";
-      return `Sure, I can continue in ${preferredLanguage}.`;
+      const supported: Record<string, string> = {
+        Hindi: "Haan, main Hindi mein baat kar sakti hoon. Should I continue from here?",
+        English: "Sure, I can continue in English. Should I continue from here?",
+      };
+      if (supported[preferredLanguage]) return supported[preferredLanguage];
+      console.log("[LANGUAGE FALLBACK USED]", preferredLanguage);
+      return `Sure, I can continue in ${preferredLanguage}. Should I continue from here?`;
     };
 
     const getCurrentPendingPrompt = (callData: any, kb: any) => {
@@ -2157,7 +2221,7 @@ async function startServer() {
 
       console.log("[STATE BEFORE]", conversationStage);
       console.log("[INTENT ROUTER]", routedIntent);
-      console.log("[INTENT PRIORITY]", "direct_question > scheduling_request > general_response > scripted_flow");
+      console.log("[INTENT PRIORITY]", "language_request > direct_question > scheduling_request > general_response > scripted_flow");
       console.log("[INTENT DETECTED]", routedIntent);
       console.log("[INTENT]", intent);
       console.log("[QUESTION INDEX]", currentQuestionIndex);
@@ -2178,7 +2242,9 @@ async function startServer() {
       }
 
       if (routedIntent === "language_request") {
+        console.log("[LANGUAGE REQUEST DETECTED]", transcript);
         preferredLanguage = getRequestedLanguage(transcript);
+        console.log("[PREFERRED LANGUAGE SET]", preferredLanguage);
         console.log("[LANGUAGE SWITCH]", preferredLanguage);
         console.log("[GEMINI SKIPPED]");
         console.log("[RETURNING TO STAGE]", conversationStage);
@@ -2281,7 +2347,7 @@ async function startServer() {
         }
         if (appointmentPromptDelivered) {
           console.log("[APPOINTMENT LOOP BLOCKED]");
-          return decision("", "appointment", false);
+          return decision("Sure, what would you like to know?", "appointment", false, 14);
         }
         console.log("[GEMINI SKIPPED]");
         return decision(deliverAppointmentPrompt(callData, kb), "appointment", false);
@@ -2320,7 +2386,7 @@ async function startServer() {
           return decision(buildPermissionQuestion(callData, kb), "hook", false);
         }
         console.log("[GEMINI SKIPPED]");
-        return decision(applyGreetingPlaceholders(getOpeningHook(kb), callData, kb), "pitch", false, 35);
+        return decision(applyGreetingPlaceholders(getOpeningHook(kb), callData, kb), "pitch", false, 60);
       }
 
       if (conversationStage === "hook") {
@@ -2328,17 +2394,17 @@ async function startServer() {
         if (!hookDelivered) {
           hookDelivered = true;
           console.log("[GEMINI SKIPPED]");
-          return decision(applyGreetingPlaceholders(getOpeningHook(kb), callData, kb), "pitch", false, 35);
+          return decision(applyGreetingPlaceholders(getOpeningHook(kb), callData, kb), "pitch", false, 60);
         }
         console.log("[GEMINI SKIPPED]");
-        return decision(applyGreetingPlaceholders(getMainPitch(kb), callData, kb), "qualification", false, 35);
+        return decision(applyGreetingPlaceholders(getMainPitch(kb), callData, kb), "qualification", false, 60);
       }
 
       if (conversationStage === "pitch") {
         if (!pitchDelivered) {
           pitchDelivered = true;
           console.log("[GEMINI SKIPPED]");
-          return decision(applyGreetingPlaceholders(getMainPitch(kb), callData, kb), "qualification", false, 35);
+          return decision(applyGreetingPlaceholders(getMainPitch(kb), callData, kb), "qualification", false, 60);
         }
         console.log("[GEMINI SKIPPED]");
         return decision(askNextQualificationQuestion(callData, kb), "qualification", false, 18);
@@ -2348,7 +2414,7 @@ async function startServer() {
         if (!preQualificationStagesDelivered()) return decision(deliverMissingPreQualificationStage(callData, kb), conversationStage, false);
         if (callState.lowConfidenceWithoutTime) {
           console.log("[TURN HELD] low confidence", transcript);
-          return decision("", conversationStage, false);
+          return decision("Sure, what would you like to know?", conversationStage, false, 14);
         }
         if (qualificationStarted) storeQualificationAnswer(transcript);
         const nextQuestionReply = askNextQualificationQuestion(callData, kb);
@@ -2499,7 +2565,8 @@ async function startServer() {
       if (isEnded()) return;
 
       if (greetingAudio) {
-        await timedStep("audio send", () => sendVobizAudio(ws, greetingAudio));
+        playbackInterrupted = false;
+        await timedStep("audio send", () => sendVobizAudio(ws, greetingAudio, () => !playbackInterrupted));
         await appendTranscript("AI", greetingText);
         greetingDelivered = true;
         conversationStage = "availability";
@@ -2541,6 +2608,19 @@ async function startServer() {
         console.error(`[Deepgram STT] Error:`, err);
         return { transcript: "", confidence: undefined, words: [] };
       }
+    };
+
+    const processBargeInAudio = async (audioBuffer: Buffer) => {
+      const vadWindow = analyzeMulawWindow(audioBuffer);
+      if (vadWindow.isSilent) return;
+      const stt = await timedStep("STT", () => transcribeBuffer(audioBuffer));
+      const transcript = normalizeSttTranscript(stt.transcript || "");
+      if (!transcript || !isBargeInPhrase(transcript)) return;
+      console.log("[BARGE IN DETECTED]", transcript);
+      playbackInterrupted = true;
+      pendingBargeInAudio = audioBuffer;
+      state = "LISTENING";
+      console.log("[INTERRUPTION HANDLED]", transcript);
     };
 
     const processListeningAudio = async (audioBuffer: Buffer) => {
@@ -2653,8 +2733,8 @@ async function startServer() {
 
         if (!reply || reply.trim().length === 0) {
           console.log("[GEMINI OUTPUT]", "");
-          state = "LISTENING";
-          return;
+          console.log("[EMPTY REPLY FALLBACK USED]");
+          reply = "Sure, what would you like to know?";
         }
 
         if (shouldTrimReply) {
@@ -2662,6 +2742,7 @@ async function startServer() {
         } else {
           console.log("[REPLY WORD COUNT]", reply.split(/\s+/).filter(Boolean).length);
         }
+        reply = cleanFinalResponse(reply, "Sure, what would you like to know?", shouldTrimReply ? replyMaxWords : 60);
 
         console.log("[GEMINI OUTPUT]", reply);
         console.log("[GEMINI FINAL REPLY]", reply);
@@ -2689,6 +2770,7 @@ async function startServer() {
           return;
         }
 
+        playbackInterrupted = false;
         const replyAudio = await timedStep("TTS", () => fetchTtsAudio(aiReply, ownerId));
         if (isEnded()) return;
 
@@ -2700,7 +2782,12 @@ async function startServer() {
 
         state = "SPEAKING";
         console.log("[Vobiz State] SPEAKING reply");
-        await timedStep("audio send", () => sendVobizAudio(ws, replyAudio));
+        await timedStep("audio send", () => sendVobizAudio(ws, replyAudio, () => !playbackInterrupted));
+        if (playbackInterrupted) {
+          console.log("[INTERRUPTION HANDLED]", "reply playback stopped");
+          returnToListening();
+          return;
+        }
         await appendTranscript("AI", aiReply);
         mediaBuffers = [];
         if (conversationStage === "closing" || conversationStage === "ended") {
@@ -2721,6 +2808,11 @@ async function startServer() {
         if (turnInProgress) {
           turnInProgress = false;
           console.log("[TURN LOCK] released");
+        }
+        if (pendingBargeInAudio && state === "LISTENING" && !turnInProgress) {
+          const pending = pendingBargeInAudio;
+          pendingBargeInAudio = null;
+          void processListeningAudio(pending);
         }
       }
     };
@@ -2820,7 +2912,17 @@ async function startServer() {
         return;
       }
 
-      if (state === "SPEAKING" || state === "PROCESSING" || state === "COOLDOWN" || isEnded()) {
+      if (state === "SPEAKING") {
+        bargeInBuffers.push(decoded);
+        if (bargeInBuffers.length >= BARGE_IN_WINDOW_FRAMES) {
+          const combined = Buffer.concat(bargeInBuffers);
+          bargeInBuffers = [];
+          void processBargeInAudio(combined);
+        }
+        return;
+      }
+
+      if (state === "PROCESSING" || state === "COOLDOWN" || isEnded()) {
         return;
       }
 
