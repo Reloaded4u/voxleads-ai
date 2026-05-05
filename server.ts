@@ -2301,19 +2301,27 @@ async function startServer() {
       const callData = callState.callData;
       const callContext = callState.callContext;
       const routedIntent = classifyUserIntent(transcript);
+      const turnIntent =
+        routedIntent === "direct_question" ? "direct_question" :
+        routedIntent === "scheduling_request" ? "scheduling_request" :
+        routedIntent === "objection" ? "frustration" :
+        isPermissionNegative(transcript) ? "frustration" :
+        routedIntent === "qualification_answer" ? "answer" :
+        routedIntent === "meta_comment" ? "unrelated" :
+        isPositiveResponse(transcript) ? "answer" :
+        callState.detectedIntent || "unrelated";
       const intent =
-        routedIntent === "direct_question" ? "kb_question" :
-        routedIntent === "scheduling_request" ? "appointment" :
-        routedIntent === "objection" ? "negative" :
-        isPermissionNegative(transcript) ? "negative" :
-        isPositiveResponse(transcript) ? "positive" :
-        callState.detectedIntent || "general";
+        turnIntent === "scheduling_request" ? "appointment" :
+        turnIntent === "frustration" ? "negative" :
+        turnIntent === "answer" ? "positive" :
+        turnIntent;
 
       console.log("[STATE BEFORE]", conversationStage);
       console.log("[INTENT ROUTER]", routedIntent);
       console.log("[INTENT PRIORITY]", "language_request > direct_question > scheduling_request > general_response > scripted_flow");
       console.log("[INTENT DETECTED]", routedIntent);
       console.log("[INTENT]", intent);
+      console.log("[TURN INTENT]", turnIntent);
       console.log("[QUESTION INDEX]", currentQuestionIndex);
 
       const repeatComplaintReply = (text: string) => {
@@ -2322,6 +2330,32 @@ async function startServer() {
           return "Sorry about that, let me not repeat. Moving ahead.";
         }
         return "";
+      };
+
+      const answerFromKB = async () => {
+        if (conversationStage === "appointment") {
+          console.log("[USER QUESTION OVERRIDES APPOINTMENT]");
+        } else {
+          console.log("[INTENT OVERRIDE] user question detected, skipping appointment");
+        }
+        if (isIdentityQuestion(transcript)) {
+          console.log("[DECISION: ANSWER]");
+          console.log("[DIRECT QUESTION HANDLED]");
+          console.log("[RETURNING TO STAGE]", conversationStage);
+          return decision(buildIdentityReply(callData, kb), conversationStage, false, 14);
+        }
+        const answer = findKbAnswerForTurn(transcript, kb);
+        if (answer) {
+          console.log("[DECISION: ANSWER]");
+          console.log("[DIRECT QUESTION HANDLED]");
+          console.log("[FAQ ANSWERED]");
+          console.log("[RETURNING TO STAGE]", conversationStage);
+          return decision(sanitizeAiReplyForStage(answer, missingKbAnswerFallback), conversationStage, false, 14);
+        }
+        console.log("[DECISION: FALLBACK]");
+        console.log("[DIRECT QUESTION HANDLED]");
+        console.log("[RETURNING TO STAGE]", conversationStage);
+        return decision(missingKbAnswerFallback, conversationStage, false, 14);
       };
 
       const decision = async (reply: string, nextStage: ConversationStage, needsGemini = false, maxWords = 10) => {
@@ -2381,30 +2415,12 @@ async function startServer() {
         return decision(pendingPrompt, conversationStage, false, 14);
       }
 
+      if (intent === "direct_question") {
+        return answerFromKB();
+      }
+
       if (nextAction === "answer_from_kb") {
-        if (conversationStage === "appointment") {
-          console.log("[USER QUESTION OVERRIDES APPOINTMENT]");
-        } else {
-          console.log("[INTENT OVERRIDE] user question detected, skipping appointment");
-        }
-        if (isIdentityQuestion(transcript)) {
-          console.log("[DECISION: ANSWER]");
-          console.log("[DIRECT QUESTION HANDLED]");
-          console.log("[RETURNING TO STAGE]", conversationStage);
-          return decision(buildIdentityReply(callData, kb), conversationStage, false, 14);
-        }
-        const answer = findKbAnswerForTurn(transcript, kb);
-        if (answer) {
-          console.log("[DECISION: ANSWER]");
-          console.log("[DIRECT QUESTION HANDLED]");
-          console.log("[FAQ ANSWERED]");
-          console.log("[RETURNING TO STAGE]", conversationStage);
-          return decision(sanitizeAiReplyForStage(answer, missingKbAnswerFallback), conversationStage, false, 14);
-        }
-        console.log("[DECISION: FALLBACK]");
-        console.log("[DIRECT QUESTION HANDLED]");
-        console.log("[RETURNING TO STAGE]", conversationStage);
-        return decision(missingKbAnswerFallback, conversationStage, false, 14);
+        return answerFromKB();
       }
 
       if (routedIntent === "objection") {
