@@ -298,35 +298,31 @@ function detectIntentType(userInput: string): IntentType {
   return "general_question";
 }
 
-function getAnswerBankField(answerBank: any, intentType: IntentType) {
-  const fieldKeys: Partial<Record<IntentType, string[]>> = {
-    pricing: ["pricing", "price", "cost", "rates", "rate", "fees", "charges"],
-    location: ["location", "located", "address", "place", "area"],
-    amenities: ["amenities", "amenity", "facilities", "facility", "features"],
-    configuration: ["configurations", "configuration", "options", "types", "variants", "available"],
-    offers: ["offers", "offer", "promotions", "promotion", "discounts", "discount", "deals"],
-  };
-  const keys = fieldKeys[intentType];
-  if (!keys) return undefined;
-  return findKbSection(answerBank, keys);
-}
+const intentToKBMap: Partial<Record<IntentType, keyof ReturnType<typeof normalizeKbForAgent>>> = {
+  configuration: "productsServices",
+  amenities: "uniqueSellingPoints",
+  offers: "offersPromotions",
+  pricing: "offersPromotions",
+  location: "businessProfile",
+};
 
 function getKbDirectAnswer(userSpeech: string, kbContext: ReturnType<typeof normalizeKbForAgent>) {
   const intentType = detectIntentType(userSpeech);
   console.log("[INTENT TYPE]", intentType);
 
   if (["pricing", "location", "amenities", "configuration", "offers"].includes(intentType)) {
-    const answerBankValue = getAnswerBankField((kbContext as any).answerBank, intentType);
-    console.log("[KB SECTION SELECTED]", `answerBank.${intentType}`);
-    const answerBankText = collectKbText(answerBankValue);
-    if (answerBankText.trim()) {
-      const answer = cleanDirectAnswer(answerBankText, 18);
-      console.log("[ANSWER SOURCE]", `answerBank.${intentType}`);
-      console.log("[KB DIRECT ANSWER]", `answerBank.${intentType}`, answer);
+    const sectionName = intentToKBMap[intentType];
+    const sectionValue = sectionName ? kbContext[sectionName] : undefined;
+    console.log("[KB SECTION SELECTED]", sectionName || intentType);
+    const sectionText = collectKbText(sectionValue);
+    if (sectionText.trim()) {
+      const answer = cleanDirectAnswer(sectionText, 18);
+      console.log("[ANSWER SOURCE]", sectionName);
+      console.log("[KB DIRECT ANSWER]", sectionName, answer);
       console.log("[GEMINI SKIPPED KB MATCH]");
       return answer;
     }
-    console.log("[WRONG MATCH BLOCKED]", `missing answerBank.${intentType}`);
+    console.log("[WRONG MATCH BLOCKED]", `missing ${sectionName || intentType}`);
     return "";
   }
 
