@@ -657,6 +657,7 @@ async function finalizeCallSummaryFromTranscript(callId: string, transcriptTextF
   ).trim();
 
   console.log("[SUMMARY INPUT LENGTH]", transcriptText.length);
+  console.log("[ANALYSIS INPUT LENGTH]", transcriptText.length);
 
   if (!transcriptText) {
     console.log("[SUMMARY SKIPPED EMPTY]");
@@ -680,9 +681,14 @@ async function finalizeCallSummaryFromTranscript(callId: string, transcriptTextF
   const hasUsableSummary =
     existingSummary &&
     existingSummary !== "Summary unavailable." &&
-    !existingSummary.toLowerCase().includes("analysis could not be completed");
+    !existingSummary.toLowerCase().includes("analysis could not be completed") &&
+    !existingSummary.toLowerCase().includes("input transcript is empty") &&
+    !existingSummary.toLowerCase().includes("valid transcript");
+  const hasStructuredAnalysis =
+    (Array.isArray(callData.keyDiscussionPoints) && callData.keyDiscussionPoints.length > 0) ||
+    (Array.isArray(callData.keyPoints) && callData.keyPoints.length > 0);
 
-  if (hasUsableSummary) return;
+  if (hasUsableSummary && hasStructuredAnalysis && callData.analysisStatus === "completed") return;
 
   const analysis = await generateServerCallSummary(transcriptText, callData.knowledgeBaseSnapshot || {});
   const result = normalizeServerAnalysisResult(analysis);
@@ -698,11 +704,15 @@ async function finalizeCallSummaryFromTranscript(callId: string, transcriptTextF
     outcome: result.outcome,
     sentiment: result.sentiment,
     keyPoints: result.keyPoints,
+    keyDiscussionPoints: result.keyPoints,
     objectionsRaised: result.objectionsRaised,
     nextAction: result.nextAction,
+    detailedAnalysis: result.summary,
+    analysisStatus: "completed",
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   }));
   console.log("[SUMMARY SAVED]", callId);
+  console.log("[ANALYSIS STRUCTURED SAVED]", callId);
 
   if (callData.leadId) {
     await db.collection("leads").doc(callData.leadId).update(sanitizeForFirestore({

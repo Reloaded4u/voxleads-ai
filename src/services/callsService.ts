@@ -21,6 +21,23 @@ export const callsService = {
       return typeof result?.value === 'string' ? result.value : '';
     };
 
+    const normalizeArrayField = (data: any, candidates: { field: string; value: unknown }[]) => {
+      const result = candidates.find(({ value }) =>
+        Array.isArray(value) &&
+        value.some(item => typeof item === 'string' && item.trim() && !staleSummary(item))
+      );
+      console.log('[ANALYSIS FIELD USED]', result?.field || 'none');
+      return Array.isArray(result?.value)
+        ? result.value.map(item => String(item)).filter(item => item.trim() && !staleSummary(item))
+        : [];
+    };
+
+    const normalizeStringField = (data: any, candidates: { field: string; value: unknown }[]) => {
+      const result = candidates.find(({ value }) => typeof value === 'string' && value.trim() && !staleSummary(value));
+      console.log('[ANALYSIS FIELD USED]', result?.field || 'none');
+      return typeof result?.value === 'string' ? result.value : '';
+    };
+
     const normalizeSummary = (data: any) => pickField(data, [
       { field: 'summary', value: data.summary },
       { field: 'aiSummary', value: data.aiSummary },
@@ -63,6 +80,37 @@ export const callsService = {
           summary: normalizeSummary(data),
           transcript: normalizeTranscript(data),
           recordingUrl: normalizeRecordingUrl(data),
+          keyPoints: normalizeArrayField(data, [
+            { field: 'keyDiscussionPoints', value: data.keyDiscussionPoints },
+            { field: 'keyPoints', value: data.keyPoints },
+            { field: 'analysis.keyDiscussionPoints', value: data.analysis?.keyDiscussionPoints },
+            { field: 'analysis.keyPoints', value: data.analysis?.keyPoints },
+          ]),
+          keyDiscussionPoints: normalizeArrayField(data, [
+            { field: 'keyDiscussionPoints', value: data.keyDiscussionPoints },
+            { field: 'keyPoints', value: data.keyPoints },
+            { field: 'analysis.keyDiscussionPoints', value: data.analysis?.keyDiscussionPoints },
+            { field: 'analysis.keyPoints', value: data.analysis?.keyPoints },
+          ]),
+          objectionsRaised: normalizeArrayField(data, [
+            { field: 'objectionsRaised', value: data.objectionsRaised },
+            { field: 'objections', value: data.objections },
+            { field: 'analysis.objectionsRaised', value: data.analysis?.objectionsRaised },
+          ]),
+          sentiment: normalizeStringField(data, [
+            { field: 'sentiment', value: data.sentiment },
+            { field: 'analysis.sentiment', value: data.analysis?.sentiment },
+          ]) as CallRecord['sentiment'],
+          nextAction: normalizeStringField(data, [
+            { field: 'nextAction', value: data.nextAction },
+            { field: 'analysis.nextAction', value: data.analysis?.nextAction },
+          ]),
+          detailedAnalysis: normalizeStringField(data, [
+            { field: 'detailedAnalysis', value: data.detailedAnalysis },
+            { field: 'analysis.detailedAnalysis', value: data.analysis?.detailedAnalysis },
+            { field: 'summary', value: data.summary },
+          ]),
+          analysisStatus: data.analysisStatus,
           createdAt: data.createdAt?.toDate() || new Date(),
           updatedAt: data.updatedAt?.toDate() || new Date(),
         };
@@ -244,8 +292,10 @@ export const callsService = {
       const callData = callSnap.data() as CallRecord;
       const kb = callData.knowledgeBaseSnapshot || {};
 
-      const analysisPrompt = callContextBuilder.buildSummaryPrompt(kb, transcript);
-      const analysis = await geminiService.generateCallSummary(transcript, analysisPrompt);
+      const transcriptForAnalysis = (transcript || callData.transcriptText || callData.transcript || '').trim();
+      console.log('[ANALYSIS INPUT LENGTH]', transcriptForAnalysis.length);
+      const analysisPrompt = callContextBuilder.buildSummaryPrompt(kb, transcriptForAnalysis);
+      const analysis = await geminiService.generateCallSummary(transcriptForAnalysis, analysisPrompt);
       
       const result = this.normalizeAnalysisResult(analysis);
 
@@ -254,15 +304,25 @@ export const callsService = {
       await firebase.updateDoc(firebase.doc(firebase.db, 'calls', callId), sanitizeForFirestore({
         status: 'completed',
         summary: result.summary,
-        transcript,
+        analysisSummary: result.summary,
+        summaryText: result.summary,
+        callSummary: result.summary,
+        aiSummary: result.summary,
+        transcriptSummary: result.summary,
+        transcript: transcriptForAnalysis,
+        transcriptText: transcriptForAnalysis,
         duration,
         outcome,
         sentiment: result.sentiment,
         keyPoints: result.keyPoints,
+        keyDiscussionPoints: result.keyPoints,
         objectionsRaised: result.objectionsRaised,
         nextAction: result.nextAction,
+        detailedAnalysis: result.summary,
+        analysisStatus: 'completed',
         updatedAt: firebase.serverTimestamp()
       }));
+      console.log('[ANALYSIS STRUCTURED SAVED]', callId);
 
       await firebase.updateDoc(firebase.doc(firebase.db, 'leads', leadId), {
         status: outcome,

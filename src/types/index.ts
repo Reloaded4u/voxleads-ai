@@ -48,8 +48,11 @@ export interface CallRecord {
   outcome: LeadStatus;
   sentiment?: 'positive' | 'neutral' | 'negative';
   keyPoints?: string[];
+  keyDiscussionPoints?: string[];
   objectionsRaised?: string[];
   nextAction?: string;
+  detailedAnalysis?: string;
+  analysisStatus?: 'pending' | 'completed' | 'failed';
   knowledgeBaseSnapshot?: Partial<KnowledgeBase>;
   controlState?: 'ai_active' | 'agent_join_requested' | 'agent_joined' | 'handoff_completed' | 'call_ended';
   assignedAgentId?: string;
