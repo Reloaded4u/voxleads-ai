@@ -284,27 +284,45 @@ function isWeakFillerInput(text: string) {
 }
 
 function getKbDirectAnswer(userSpeech: string, kbContext: ReturnType<typeof normalizeKbForAgent>) {
-  const t = userSpeech.toLowerCase();
-  const categories: Array<{ name: string; match: RegExp; section: any }> = [
-    { name: "offersPromotions", match: /\b(offer|offers|promotion|promotions|discount|discounts|deal|deals|coupon|sale)\b/i, section: kbContext.offersPromotions },
-    { name: "productsServices", match: /\b(product|products|service|services|option|options|available|provide|offering|offerings)\b/i, section: kbContext.productsServices },
-    { name: "uniqueSellingPoints", match: /\b(why|benefit|benefits|usp|unique|advantage|choose|special|best)\b/i, section: kbContext.uniqueSellingPoints },
-    { name: "businessProfile", match: /\b(about|business|company|who are you|who is this|service area|location|where)\b/i, section: kbContext.businessProfile },
-    { name: "faqs", match: /\b(faq|question|questions|price|pricing|cost|rate|details|detail|how|what|which)\b/i, section: kbContext.faqs },
-    { name: "objections", match: /\b(not interested|expensive|already|concern|problem|issue|objection)\b/i, section: kbContext.objections },
-  ];
+  const normalizeTokens = (value: string) =>
+    value
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s]/gu, " ")
+      .split(/\s+/)
+      .filter((token) =>
+        token.length > 2 &&
+        !["the", "and", "for", "you", "your", "what", "which", "how", "why", "can", "could", "tell", "share", "explain", "details", "about"].includes(token)
+      );
 
-  for (const category of categories) {
-    if (!category.match.test(t)) continue;
-    const text = collectKbText(category.section);
-    if (!text.trim()) continue;
-    const answer = cleanDirectAnswer(text, 18);
-    console.log("[KB DIRECT ANSWER]", category.name, answer);
-    console.log("[GEMINI SKIPPED KB MATCH]");
-    return answer;
-  }
+  const userTokens = new Set(normalizeTokens(userSpeech));
+  if (userTokens.size === 0) return "";
 
-  return "";
+  const entries = [
+    ["faqs", kbContext.faqs],
+    ["productsServices", kbContext.productsServices],
+    ["uniqueSellingPoints", kbContext.uniqueSellingPoints],
+    ["offersPromotions", kbContext.offersPromotions],
+    ["businessProfile", kbContext.businessProfile],
+    ["objections", kbContext.objections],
+    ["appointments", kbContext.appointments],
+    ["callGuidance", kbContext.callGuidance],
+  ].map(([name, section]) => {
+    const sectionText = collectKbText(section);
+    const sectionTokens = new Set(normalizeTokens(sectionText));
+    let score = 0;
+    for (const token of userTokens) {
+      if (sectionTokens.has(token)) score++;
+    }
+    return { name: String(name), sectionText, score };
+  }).filter((entry) => entry.sectionText.trim());
+
+  const best = entries.sort((a, b) => b.score - a.score)[0];
+  if (!best || best.score <= 0) return "";
+
+  const answer = cleanDirectAnswer(best.sectionText, 18);
+  console.log("[KB DIRECT ANSWER]", best.name, answer);
+  console.log("[GEMINI SKIPPED KB MATCH]");
+  return answer;
 }
 
 async function generateAiResponse(
@@ -323,7 +341,7 @@ async function generateAiResponse(
 
   if (!apiKey) {
     console.log("[EMPTY REPLY FALLBACK USED]");
-    return "I can share that from the details I have.";
+    return "I don't have exact details right now, but our team can share that with you.";
   }
 
   const kbContext = normalizeKbForAgent(kb);
@@ -333,11 +351,8 @@ async function generateAiResponse(
     .join("\n");
   const lastCompleteSentenceWithinLimit = (value: string, maxWords: number) => trimToSentenceOrWords(value, maxWords);
   const kbUsedSection =
-    options.detectedIntent === "pricing" ? "faqs" :
     options.detectedIntent === "scheduling" ? "appointments" :
-    "faqs, callGuidance, businessProfile";
-  const faqText = JSON.stringify(kbContext.faqs).toLowerCase();
-  const hasPricingInFaqs = /(price|pricing|cost|rate|fee|charges|amount)/.test(faqText);
+    "best matching KB section";
 
   const prompt = `You are an AI calling assistant.
 
@@ -396,11 +411,6 @@ Reply:`;
       return "";
     }
     console.log("[GEMINI PROMPT PREVIEW]", prompt.slice(0, 800));
-    if (options.detectedIntent === "pricing" && !hasPricingInFaqs) {
-      const reply = "I don't have exact details right now, but our team can share them with you.";
-      console.log("[GEMINI FINAL REPLY]", reply);
-      return reply;
-    }
     console.log("[GEMINI CALLED]");
     console.log("[GEMINI ROUTE] Gemini question handling", userSpeech);
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
@@ -426,13 +436,13 @@ Reply:`;
       if (sentenceCut) reply = sentenceCut;
     }
 
-    reply = cleanFinalResponse(reply, "I can share that from the details I have.", maxWords);
+    reply = cleanFinalResponse(reply, "I don't have exact details right now, but our team can share that with you.", maxWords);
     console.log("[GEMINI FINAL REPLY]", reply);
     return reply;
   } catch (error) {
     console.error("[GEMINI ERROR]", error);
     console.log("[EMPTY REPLY FALLBACK USED]");
-    return "I can share that from the details I have.";
+    return "I don't have exact details right now, but our team can share that with you.";
   }
 }
 
@@ -1650,11 +1660,11 @@ async function startServer() {
 
     const extractAppointmentType = (value: string) => {
       const t = normalizeTurnText(value);
-      if (/\bsite visit\b/i.test(t)) return "site visit";
       if (/\bfollow up|followup\b/i.test(t)) return "follow-up";
       if (/\bcall back|callback|call later\b/i.test(t)) return "callback";
       if (/\bappointment\b/i.test(t)) return "appointment";
       if (/\bmeeting\b/i.test(t)) return "meeting";
+      if (/\bvisit\b/i.test(t)) return "visit";
       return null;
     };
 
@@ -1706,14 +1716,10 @@ async function startServer() {
     };
 
     const normalizeSttTranscript = (text: string) => {
-      let result = text
-        .replace(/\bc\s*bhk\b/gi, "3 bhk")
-        .replace(/\bthree\s+bhk\b/gi, "3 bhk")
-        .replace(/\bfree\s+bhk\b/gi, "3 bhk");
-      const normalized = normalizeTurnText(result);
+      const normalized = normalizeTurnText(text);
       if (normalized === "yesterday sir" || normalized === "yesterday") return "yes sudesh here";
       if (normalized === "yes sir" || normalized === "yeah sir") return "yes";
-      return result;
+      return text;
     };
 
     const isPositiveNameConfirmation = (text: string) => {
@@ -1789,7 +1795,7 @@ async function startServer() {
       return (
         isIdentityQuestion(text) ||
         text.trim().endsWith("?") ||
-        /\b(offer|offers|price|pricing|cost|rate|rates|details|detail|options|available|feature|features|where|what|which|how|why|explain|product|service|business|tell me|share|describe|can you|i want to ask)\b/i.test(t)
+        /\b(who|what|which|when|where|how|why|details|detail|options|available|feature|features|explain|product|service|business|tell me|share|describe|can you|could you|i want to ask)\b/i.test(t)
       );
     };
 
@@ -1837,7 +1843,6 @@ async function startServer() {
 
     const detectIntent = (text: string) => {
       const t = text.toLowerCase();
-      if (t.includes("price") || t.includes("cost") || t.includes("rate")) return "pricing";
       if (isExplicitSchedulingRequest(text)) return "scheduling";
       if (t.includes("yes") || t.includes("ok")) return "confirmation";
       return "general";
@@ -2283,23 +2288,12 @@ async function startServer() {
         console.log("[DIRECT QUESTION HANDLED]");
         console.log("[FAQ ANSWERED]");
         console.log("[RETURNING TO STAGE]", conversationStage);
-        return decision(sanitizeAiReplyForStage(answer, "I can answer that from the details I have."), conversationStage, true, 14);
+        return decision(sanitizeAiReplyForStage(answer, "I don't have exact details right now, but our team can share that with you."), conversationStage, true, 14);
       }
 
       if (routedIntent === "objection") {
-        console.log("[GEMINI CALLED]");
-        const answer = await timedStep("Gemini", () => generateGeminiReply({
-          transcript,
-          knowledgeBase: kb,
-          callContext,
-          conversationStage,
-          conversationHistory,
-          detectedIntent: "objection",
-          preferredLanguage,
-          maxWords: 14,
-        }));
-        console.log("[RETURNING TO STAGE]", conversationStage);
-        return decision(sanitizeAiReplyForStage(answer, buildClosingLine(callData, kb)), conversationStage, true, 14);
+        console.log("[GEMINI SKIPPED]");
+        return decision(buildClosingLine(callData, kb), "closing", false, 14);
       }
 
       if (conversationStage === "post_qualification") {
@@ -2325,7 +2319,7 @@ async function startServer() {
           maxWords: 14,
         }));
         console.log("[FAQ ANSWERED]");
-        return decision(sanitizeAiReplyForStage(answer, "I can answer that from the details I have."), "post_qualification", true, 14);
+        return decision(sanitizeAiReplyForStage(answer, "I don't have exact details right now, but our team can share that with you."), "post_qualification", true, 14);
       }
 
       if (conversationStage === "appointment") {
