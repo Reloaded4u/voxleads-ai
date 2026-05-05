@@ -131,19 +131,44 @@ function firstPresentValue(...values: any[]) {
   return undefined;
 }
 
+function normalizeKbKey(key: string) {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function findKbSection(source: any, keys: string[]) {
+  if (!source || typeof source !== "object") return undefined;
+  const normalizedTargets = new Set(keys.map(normalizeKbKey));
+  const queue = [source];
+
+  while (queue.length) {
+    const current = queue.shift();
+    if (!current || typeof current !== "object") continue;
+
+    for (const [key, value] of Object.entries(current)) {
+      const normalizedKey = normalizeKbKey(key);
+      if (normalizedTargets.has(normalizedKey)) return value;
+      if (value && typeof value === "object" && !Array.isArray(value)) queue.push(value);
+    }
+  }
+
+  return undefined;
+}
+
 function normalizeKbForAgent(kb: any = {}) {
   const structured = kb?.structuredKnowledge || kb?.structured || {};
+  console.log("[KB RAW KEYS]", Object.keys(kb || {}).join(","));
+  console.log("[KB RAW STRUCTURED KEYS]", Object.keys(structured || {}).join(","));
   const source = { ...structured, ...kb };
   const normalized = {
-    businessProfile: firstPresentValue(source.businessProfile, source.business, source.profile, source.companyProfile, source.businessInfo, {}),
-    productsServices: firstPresentValue(source.productsServices, source.products, source.services, source.offerings, source.productServices, source.productsAndServices, {}),
-    uniqueSellingPoints: firstPresentValue(source.uniqueSellingPoints, source.usps, source.usp, source.benefits, source.whyChooseUs, source.valueProposition, {}),
-    offersPromotions: firstPresentValue(source.offersPromotions, source.offers, source.promotions, source.discounts, source.deals, source.specialOffers, {}),
-    callGuidance: firstPresentValue(source.callGuidance, source.guidance, source.script, {}),
-    faqs: firstPresentValue(source.faqs?.items, source.faqs, source.questions, []),
-    objections: firstPresentValue(source.objections?.items, source.objections, source.objectionHandling, []),
-    appointments: firstPresentValue(source.appointments, source.scheduling, source.appointmentSettings, {}),
-    tone: firstPresentValue(source.tone, source.brandTone, source.voiceTone, {}),
+    businessProfile: firstPresentValue(findKbSection(source, ["businessProfile", "business profile", "business", "profile", "companyProfile", "company profile", "businessInfo", "business info"]), {}),
+    productsServices: firstPresentValue(findKbSection(source, ["productsServices", "products services", "products / services", "products & services", "products and services", "productServices", "product services", "products", "services", "offerings"]), {}),
+    uniqueSellingPoints: firstPresentValue(findKbSection(source, ["uniqueSellingPoints", "unique selling points", "unique selling points usp", "unique selling points / usp", "usp", "usps", "benefits", "whyChooseUs", "why choose us", "valueProposition", "value proposition"]), {}),
+    offersPromotions: firstPresentValue(findKbSection(source, ["offersPromotions", "offers promotions", "offers / promotions", "offers & promotions", "offers and promotions", "offers", "promotions", "discounts", "deals", "specialOffers", "special offers"]), {}),
+    callGuidance: firstPresentValue(findKbSection(source, ["callGuidance", "call guidance", "guidance", "script"]), {}),
+    faqs: firstPresentValue(findKbSection(source, ["faqs", "faq", "questions"])?.items, findKbSection(source, ["faqs", "faq", "questions"]), []),
+    objections: firstPresentValue(findKbSection(source, ["objections", "objectionHandling", "objection handling"])?.items, findKbSection(source, ["objections", "objectionHandling", "objection handling"]), []),
+    appointments: firstPresentValue(findKbSection(source, ["appointments", "appointment", "scheduling", "appointmentSettings", "appointment settings"]), {}),
+    tone: firstPresentValue(findKbSection(source, ["tone", "brandTone", "brand tone", "voiceTone", "voice tone"]), {}),
   };
 
   console.log("[KB NORMALIZED KEYS]", Object.keys(normalized).filter((key) => {
@@ -191,6 +216,35 @@ function trimToSentenceOrWords(value: string, maxWords: number) {
   return clean.split(/\s+/).slice(0, maxWords).join(" ").replace(/[,:;\-]+$/, "") + ".";
 }
 
+function cleanDirectAnswer(value: string, maxWords = 18) {
+  let clean = value.replace(/\s+/g, " ").trim();
+  const withoutArtifacts = clean
+    .replace(/\b\d{8,}\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (withoutArtifacts !== clean) {
+    console.log("[KB ARTIFACT REMOVED]", clean, "->", withoutArtifacts);
+    clean = withoutArtifacts;
+  }
+
+  let answer = trimToSentenceOrWords(clean, maxWords).trim();
+  answer = answer.replace(/\s+/g, " ").replace(/[,;:\-]+$/g, "").trim();
+
+  const incompleteEnding = /\b(and|or|with|for|to|of|the|a|an|home|free modular)$/i;
+  while (incompleteEnding.test(answer)) {
+    const previous = answer;
+    answer = answer.replace(/\s+\S+$/g, "").replace(/[,;:\-]+$/g, "").trim();
+    if (answer === previous) break;
+  }
+
+  const phraseBoundary = answer.match(/^(.{20,}?[.!?])/);
+  if (phraseBoundary) answer = phraseBoundary[1].trim();
+  if (!/[.!?]$/.test(answer)) answer += ".";
+
+  console.log("[DIRECT ANSWER CLEANED]", answer);
+  return answer;
+}
+
 function isWeakFillerInput(text: string) {
   const normalized = text
     .trim()
@@ -218,7 +272,7 @@ function getKbDirectAnswer(userSpeech: string, kbContext: ReturnType<typeof norm
     if (!category.match.test(t)) continue;
     const text = collectKbText(category.section);
     if (!text.trim()) continue;
-    const answer = trimToSentenceOrWords(text, 18);
+    const answer = cleanDirectAnswer(text, 18);
     console.log("[KB DIRECT ANSWER]", category.name, answer);
     console.log("[GEMINI SKIPPED KB MATCH]");
     return answer;
@@ -1971,6 +2025,7 @@ async function startServer() {
       const questions = getQualificationQuestions(kb);
 
       while (leadData.answers[currentQuestionIndex]) {
+        console.log("[QUALIFICATION QUESTION SKIPPED]", currentQuestionIndex);
         console.log("[QUESTION SKIPPED]", currentQuestionIndex, questions[currentQuestionIndex]?.id || "unknown");
         currentQuestionIndex += 1;
       }
@@ -1992,13 +2047,20 @@ async function startServer() {
       if (!qualificationStarted) return;
       const normalizedAnswer = normalizeTurnText(transcript);
       if (!normalizedAnswer) return;
-      if (leadData.answers[currentQuestionIndex]) {
-        const previous = normalizeTurnText(leadData.answers[currentQuestionIndex]);
-        if (previous === normalizedAnswer) {
-          console.log("[ANSWER STORED]", currentQuestionIndex, "repeat-confirmation", transcript);
+
+      const duplicateIndex = Object.entries(leadData.answers)
+        .find(([, answer]) => normalizeTurnText(String(answer)) === normalizedAnswer)?.[0];
+      if (duplicateIndex !== undefined) {
+        console.log("[QUALIFICATION DUPLICATE BLOCKED]", duplicateIndex, transcript);
+        if (leadData.answers[currentQuestionIndex]) {
+          console.log("[QUALIFICATION QUESTION SKIPPED]", currentQuestionIndex);
           currentQuestionIndex += 1;
-          return;
         }
+        return;
+      }
+
+      if (leadData.answers[currentQuestionIndex]) {
+        console.log("[QUALIFICATION QUESTION SKIPPED]", currentQuestionIndex);
         console.log("[QUESTION SKIPPED]", currentQuestionIndex, "already answered");
         currentQuestionIndex += 1;
       }
