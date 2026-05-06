@@ -184,14 +184,28 @@ function normalizeKbForAgent(kb: any = {}) {
   return normalized;
 }
 
+const INTERNAL_KB_KEYS = new Set([
+  "ownerid",
+  "userid",
+  "uid",
+  "callid",
+  "id",
+  "createdat",
+  "updatedat",
+  "providerid",
+  "transcriptbuffer",
+  "callcontrolstate",
+]);
+
 function collectKbText(value: any): string {
   if (value === undefined || value === null) return "";
   if (typeof value === "string") return value;
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   if (Array.isArray(value)) return value.map(collectKbText).filter(Boolean).join(" ");
   if (typeof value === "object") {
-    return Object.values(value)
-      .map(collectKbText)
+    return Object.entries(value)
+      .filter(([key]) => !INTERNAL_KB_KEYS.has(normalizeKbKey(key)))
+      .map(([, item]) => collectKbText(item))
       .filter((item) => item.trim())
       .join(" ");
   }
@@ -217,6 +231,24 @@ function trimToSentenceOrWords(value: string, maxWords: number) {
   return clean.split(/\s+/).slice(0, maxWords).join(" ").replace(/[,:;\-]+$/, "") + ".";
 }
 
+function sanitizeOutboundReply(value: string, fallback = "Sorry about that. This is Kanika from the sales team.") {
+  const original = String(value || "");
+  let clean = original
+    .replace(/\b[A-Za-z0-9_-]{20,}\b/g, "")
+    .replace(/\b\d{8,}\b/g, "")
+    .replace(/\b(?:ownerId|userId|callId|providerId|uid|createdAt|updatedAt)\s*[:=]\s*\S+/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (clean !== original.trim()) {
+    console.log("[INTERNAL_ID_REMOVED]");
+  }
+
+  if (!clean) clean = fallback;
+  console.log("[SAFE_REPLY_FINAL]", clean);
+  return clean;
+}
+
 function cleanFinalResponse(value: string, fallback = "Sure, what would you like to know?", maxWords = 15) {
   let clean = value
     .replace(/\b\d{8,}\b/g, "")
@@ -234,6 +266,7 @@ function cleanFinalResponse(value: string, fallback = "Sure, what would you like
     if (clean === previous) break;
   }
   if (!clean) clean = fallback;
+  clean = sanitizeOutboundReply(clean, fallback);
   if (!/[.!?]$/.test(clean)) {
     console.log("[INCOMPLETE SENTENCE FIXED]", clean);
     clean += ".";
@@ -609,6 +642,7 @@ function pcm16ToMulaw(pcmBuffer: Buffer): Buffer {
  * Requests mulaw/PCM directly from the provider — no ffmpeg needed.
  */
 async function fetchTtsAudio(message: string, ownerId: string, fallbackAttempt = false): Promise<Buffer | null> {
+  const safeMessage = sanitizeOutboundReply(message);
   try {
     const userDoc = await db.collection("users").doc(ownerId).get();
     const integrations = userDoc.data()?.integrations || {};
@@ -629,7 +663,7 @@ async function fetchTtsAudio(message: string, ownerId: string, fallbackAttempt =
         method: "POST",
         headers: { "Content-Type": "application/json", "xi-api-key": apiKey },
         body: JSON.stringify({
-          text: message,
+          text: safeMessage,
           model_id: "eleven_multilingual_v2",
           voice_settings: { stability: 0.5, similarity_boost: 0.75 }
         })
@@ -657,7 +691,7 @@ async function fetchTtsAudio(message: string, ownerId: string, fallbackAttempt =
       console.log(`[Vobiz TTS] azure key found=${!!key} region=${region} voice=${voice}`);
       if (!key || !region) throw new Error("Azure credentials missing");
 
-      const ssml = `<speak version='1.0' xml:lang='en-US'><voice xml:lang='en-US' name='${voice}'>${escapeXml(message)}</voice></speak>`;
+      const ssml = `<speak version='1.0' xml:lang='en-US'><voice xml:lang='en-US' name='${voice}'>${escapeXml(safeMessage)}</voice></speak>`;
       // Request raw 8kHz 8-bit mono mulaw directly from Azure — no transcoding needed
       const res = await fetch(`https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`, {
         method: "POST",
@@ -1833,7 +1867,7 @@ async function startServer() {
 
     const isIdentityQuestion = (text: string) => {
       const t = normalizeTurnText(text);
-      return /\b(who is this|who are you|who is it|who am i speaking to|where are you calling from)\b/i.test(t);
+      return /\b(who is this|who are you|who is it|who am i speaking to|where are you calling from|whos calling|who is calling|what was that)\b/i.test(t);
     };
 
     const isKbQuestionIntent = (text: string) => {
@@ -2102,8 +2136,10 @@ async function startServer() {
     const buildClosingLine = (callData: any, kb: any) =>
       applyGreetingPlaceholders(getScriptField(kb, "closingLine", "Thanks for your time. We'll follow up shortly."), callData, kb);
 
-    const buildIdentityReply = (callData: any, kb: any) =>
-      `This is ${getAgentName(kb, callData)} from ${getKbBusinessName(kb)}.`;
+    const buildIdentityReply = (_callData: any, _kb: any) => {
+      console.log("[META_QUESTION_HANDLED]");
+      return "This is Kanika from the sales team.";
+    };
 
     const buildLanguageReply = () => {
       console.log("[ANSWER SOURCE]", "language handler");
@@ -2697,7 +2733,7 @@ async function startServer() {
       }
 
       const { callData, kb } = await loadCallContext();
-      const greetingText = buildInitialGreeting(callData, kb);
+      const greetingText = sanitizeOutboundReply(buildInitialGreeting(callData, kb));
       console.log("[GREETING SOURCE]", getCallGuidance(kb)?.greeting ? "kb" : "fallback");
       console.log("[GREETING FINAL]", greetingText);
       conversationStage = "greeting";
@@ -2891,7 +2927,7 @@ async function startServer() {
         console.log("[CONVERSATION STAGE]", conversationStage);
         if (isEnded()) return;
 
-        const aiReply = reply;
+        const aiReply = sanitizeOutboundReply(reply);
         conversationHistory.push({ role: "user", text: transcript });
         conversationHistory.push({ role: "assistant", text: aiReply });
         lastTranscript = transcript.trim().toLowerCase();
