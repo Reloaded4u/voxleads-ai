@@ -255,7 +255,7 @@ function trimToSentenceOrWords(value: string, maxWords: number) {
   return clean.split(/\s+/).slice(0, maxWords).join(" ").replace(/[,:;\-]+$/, "") + ".";
 }
 
-function sanitizeOutboundReply(value: string, fallback = "Sorry about that. This is Kanika from the sales team.") {
+function sanitizeOutboundReply(value: string, fallback = "Sorry, could you repeat that?") {
   const original = String(value || "");
   let clean = original
     .replace(/\b[A-Za-z0-9_-]{20,}\b/g, "")
@@ -283,7 +283,7 @@ function cleanFinalResponse(value: string, fallback = "Sure, what would you like
     clean = fallback;
   }
   clean = trimToSentenceOrWords(clean, maxWords).replace(/[,;:\-]+$/g, "").trim();
-  const incompleteEnding = /\b(to|and|with|for|in|on|at|by|of|the|a|an)$/i;
+  const incompleteEnding = /\b(to|and|for|in|on|at|by|of|the|a|an)$/i;
   while (incompleteEnding.test(clean)) {
     const previous = clean;
     clean = clean.replace(/\s+\S+$/g, "").replace(/[,;:\-]+$/g, "").trim();
@@ -317,7 +317,7 @@ function cleanDirectAnswer(value: string, maxWords = 18) {
   let answer = trimToSentenceOrWords(clean, maxWords).trim();
   answer = answer.replace(/\s+/g, " ").replace(/[,;:\-]+$/g, "").trim();
 
-  const incompleteEnding = /\b(and|or|with|for|to|of|the|a|an|home|free modular)$/i;
+  const incompleteEnding = /\b(and|or|for|to|of|the|a|an)$/i;
   while (incompleteEnding.test(answer)) {
     const previous = answer;
     answer = answer.replace(/\s+\S+$/g, "").replace(/[,;:\-]+$/g, "").trim();
@@ -2207,9 +2207,31 @@ async function startServer() {
     const buildClosingLine = (callData: any, kb: any) =>
       applyGreetingPlaceholders(getScriptField(kb, "closingLine", "Thanks for your time. We'll follow up shortly."), callData, kb);
 
-    const buildIdentityReply = (_callData: any, _kb: any) => {
+    const buildIdentityResponse = (kb: any, leadContext: any) => {
+      const guidance = getCallGuidance(kb);
+      const profile = kb?.businessProfile || kb?.profile || {};
+      const agentName = firstText(guidance.agentName, kb?.agentName, profile.agentName, leadContext?.agentName);
+      const businessName = firstText(
+        profile.businessName,
+        profile.name,
+        profile.companyName,
+        kb?.businessName,
+        kb?.companyName,
+        leadContext?.businessName
+      );
+      const teamName = firstText(guidance.teamName, guidance.role, profile.teamName, profile.role, kb?.teamName, kb?.role);
+
+      console.log("[DYNAMIC_IDENTITY_USED]");
+      if (agentName && teamName && businessName) return `This is ${agentName} from ${teamName} at ${businessName}.`;
+      if (agentName && businessName) return `This is ${agentName} from ${businessName}.`;
+      if (teamName && businessName) return `This is ${teamName} from ${businessName}.`;
+      if (businessName) return `This is our team from ${businessName}.`;
+      return "This is our team calling regarding your inquiry.";
+    };
+
+    const buildIdentityReply = (callData: any, kb: any) => {
       console.log("[META_QUESTION_HANDLED]");
-      return "This is Kanika from the sales team, calling about your interest in Lodha Amara.";
+      return buildIdentityResponse(kb, callData);
     };
 
     const buildLanguageReply = () => {
@@ -2434,21 +2456,77 @@ async function startServer() {
       const repeatComplaintReply = (text: string) => {
         const t = text.toLowerCase();
         if (t.includes("already told") || t.includes("you said") || t.includes("again")) {
-          return "Sorry about that, let me not repeat. Moving ahead.";
+          console.log("[REPEATED_QUESTION_BLOCKED]");
+          if (conversationStage === "qualification") {
+            currentQuestionIndex += 1;
+            const nextQuestion = askNextQualificationQuestion(callData, kb);
+            return nextQuestion || "Got it, no worries. Let me move ahead.";
+          }
+          return "Got it, no worries. Let me move ahead.";
         }
         return "";
       };
 
+      const meaningfulWordCount = (value: string) =>
+        normalizeTurnText(value)
+          .split(" ")
+          .filter((word) => word && !["hello", "hi", "hey", "yeah", "yes", "okay", "ok", "go", "ahead", "please"].includes(word)).length;
+
       const isIncompleteUserInput = (value: string) => {
         const t = normalizeTurnText(value);
-        return ["what", "why", "how", "where", "who", "are you", "why do", "what was", "what is"].includes(t);
+        if (["what", "why", "how", "where", "who", "are you", "why do", "what was", "what is", "can you"].includes(t)) return true;
+        return meaningfulWordCount(value) > 0 && meaningfulWordCount(value) < 3 && detectIntentType(value) === "general_question";
+      };
+
+      const isGenericGreetingInput = (value: string) => ["hello", "hello?", "hi", "hi?"].includes(value.trim().toLowerCase());
+      const isGenericContinueInput = (value: string) => ["okay", "ok", "yes", "go ahead", "continue"].includes(normalizeTurnText(value));
+      const hasClearBusinessIntent = (value: string) => {
+        const intentType = detectIntentType(value);
+        if (["pricing", "location", "amenities", "configuration", "offers", "scheduling", "language_request"].includes(intentType)) return true;
+        const t = normalizeTurnText(value);
+        return /\b(product|service|business|details|detail|available|feature|features|not interested|expensive|busy)\b/i.test(t);
+      };
+
+      const handleContextualInput = async () => {
+        if (isGenericGreetingInput(transcript)) {
+          console.log("[KB_SEARCH_SKIPPED_LOW_CONFIDENCE]");
+          console.log("[GENERIC_INPUT_HANDLED]");
+          console.log("[CONTEXTUAL_REPLY_USED]");
+          console.log("[STAGE_PRESERVED]", conversationStage);
+          return decision("Yes, I'm here.", conversationStage, false, 8);
+        }
+
+        if (isIncompleteUserInput(transcript)) {
+          console.log("[INTENT_CONFIDENCE_LOW]");
+          console.log("[KB_SEARCH_BLOCKED]");
+          console.log("[KB_SEARCH_SKIPPED_LOW_CONFIDENCE]");
+          console.log("[INCOMPLETE_INPUT_CLARIFIED]", transcript);
+          console.log("[STAGE_PRESERVED]", conversationStage);
+          return decision("Sorry, could you repeat that?", conversationStage, false, 8);
+        }
+
+        if (isGenericContinueInput(transcript)) {
+          console.log("[KB_SEARCH_SKIPPED_LOW_CONFIDENCE]");
+          console.log("[GENERIC_INPUT_HANDLED]");
+          console.log("[CONTEXTUAL_REPLY_USED]");
+          const pendingPrompt = getCurrentPendingPrompt(callData, kb);
+          if (pendingPrompt) {
+            console.log("[STAGE_PRESERVED]", conversationStage);
+            return decision(pendingPrompt, conversationStage, false, 14);
+          }
+        }
+
+        return null;
       };
 
       const answerFromKB = async () => {
-        if (isIncompleteUserInput(transcript)) {
-          console.log("[INCOMPLETE_INPUT_CLARIFIED]", transcript);
-          return decision("Sorry, could you please repeat that?", conversationStage, false, 10);
+        if (!hasClearBusinessIntent(transcript) && !isIdentityQuestion(transcript)) {
+          console.log("[INTENT_CONFIDENCE_LOW]");
+          console.log("[KB_SEARCH_BLOCKED]");
+          console.log("[STAGE_PRESERVED]", conversationStage);
+          return decision("Sorry, could you repeat that?", conversationStage, false, 8);
         }
+        console.log("[KB_SEARCH_ALLOWED]");
         if (conversationStage === "appointment") {
           console.log("[USER QUESTION OVERRIDES APPOINTMENT]");
         } else {
@@ -2485,7 +2563,10 @@ async function startServer() {
             lastQuestion = currentQuestion;
           }
         }
+        const previousStage = conversationStage;
         if (nextStage !== conversationStage) moveStage(nextStage);
+        if (conversationStage !== previousStage) console.log("[STAGE_ADVANCED]", previousStage, "->", conversationStage);
+        else console.log("[STAGE_PRESERVED]", conversationStage);
         console.log("[REPLY DECISION]", finalReply, "nextStage=", conversationStage, "gemini=", needsGemini);
         console.log("[STATE AFTER]", conversationStage);
         return { reply: finalReply, needsGemini, maxWords };
@@ -2507,6 +2588,9 @@ async function startServer() {
       if (detectLanguageRequest(transcript)) {
         return handleLanguageSwitch(transcript);
       }
+
+      const contextualDecision = await handleContextualInput();
+      if (contextualDecision) return contextualDecision;
 
       const nextAction = decideNextAction(transcript, callState);
       console.log("[DECISION ACTION]", nextAction);
