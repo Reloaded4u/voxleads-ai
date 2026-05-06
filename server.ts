@@ -1963,13 +1963,19 @@ async function startServer() {
 
     const isIdentityQuestion = (text: string) => {
       const t = normalizeTurnText(text);
-      return /\b(who is this|who are you|who is it|who am i speaking to|where are you calling from|whos calling|who is calling|are you calling me|what was that|why are you calling)\b/i.test(t);
+      return /\b(who is this|who are you|who is it|who am i speaking to|where are you calling from|whos calling|who is calling|are you calling me|what was that)\b/i.test(t);
+    };
+
+    const isPurposeQuestion = (text: string) => {
+      const t = normalizeTurnText(text);
+      return /\b(why are you calling|why did you call|why calling|what is this about|what are you calling about|reason for calling)\b/i.test(t);
     };
 
     const isKbQuestionIntent = (text: string) => {
       const t = normalizeTurnText(text);
       return (
         isIdentityQuestion(text) ||
+        isPurposeQuestion(text) ||
         text.trim().endsWith("?") ||
         /\b(who|what|which|when|where|how|why|details|detail|options|available|feature|features|explain|product|service|business|tell me|share|describe|can you|could you|i want to ask)\b/i.test(t)
       );
@@ -2006,7 +2012,8 @@ async function startServer() {
       const intentType = detectIntentType(text);
       if (intentType === "language_request" || isLanguageRequest(text)) return "language_request";
       if (intentType === "scheduling") return "scheduling_request";
-      if (["pricing", "location", "amenities", "configuration", "offers"].includes(intentType)) return "direct_question";
+      if (["pricing", "location", "amenities", "configuration", "offers", "possession", "investment"].includes(intentType)) return "direct_question";
+      if (isContinuationIntent(text)) return "scripted_next_step";
       if (hasIntentConflict(text)) {
         console.log("[INTENT CONFLICT BLOCKED]", "direct_question priority over scheduling");
         return "direct_question";
@@ -2027,13 +2034,33 @@ async function startServer() {
       return "general";
     };
 
-    const isPermissionPositive = (text: string) => /\b(yes|okay|ok|go ahead|sure|continue)\b/i.test(text) || isPositiveNameConfirmation(text);
+    const isContinuationIntent = (text: string) => {
+      const t = normalizeTurnText(text);
+      return [
+        "yes",
+        "yes we can talk",
+        "okay",
+        "ok",
+        "okay go ahead",
+        "go ahead",
+        "continue",
+        "tell me",
+        "yes explain",
+        "explain",
+        "sure",
+        "speak",
+        "proceed",
+      ].includes(t) || /\b(yes|okay|ok|sure)\b.*\b(explain|continue|go ahead|tell me|speak|proceed)\b/i.test(t);
+    };
+
+    const isSemanticAvailabilityConfirmation = (text: string) => isContinuationIntent(text) || isPositiveNameConfirmation(text);
+    const isPermissionPositive = (text: string) => isContinuationIntent(text) || isPositiveNameConfirmation(text);
     const isPermissionNegative = (text: string) => /\b(no|not interested)\b/i.test(text);
     const isBusyOrCallLater = (text: string) => isExplicitSchedulingRequest(text);
     const isIdentityConfirmed = (text: string) => isPositiveNameConfirmation(text) || /\b(right|it is|okay|ok|sure)\b/i.test(text);
-    const isAvailabilityPositive = (text: string) => /\b(yes|yeah|yep|okay|ok|sure|go ahead|continue)\b/i.test(text) || isPositiveNameConfirmation(text);
+    const isAvailabilityPositive = (text: string) => isSemanticAvailabilityConfirmation(text);
     const isAvailabilityNegative = (text: string) => /\b(no|not interested)\b/i.test(text) || isExplicitSchedulingRequest(text);
-    const isPositiveResponse = (text: string) => /\b(yes|okay|ok|sure|interested|go ahead|continue|please)\b/i.test(text) || isPositiveNameConfirmation(text);
+    const isPositiveResponse = (text: string) => isContinuationIntent(text) || /\b(interested|please)\b/i.test(text) || isPositiveNameConfirmation(text);
 
     const firstText = (...values: any[]) => {
       for (const value of values) {
@@ -2257,6 +2284,17 @@ async function startServer() {
     const buildIdentityReply = (callData: any, kb: any) => {
       console.log("[META_QUESTION_HANDLED]");
       return buildIdentityResponse(kb, callData);
+    };
+
+    const buildPurposeReply = (callData: any, kb: any) => {
+      const guidance = getCallGuidance(kb);
+      const purpose = firstText(guidance.purpose, guidance.callPurpose, guidance.openingLine, guidance.hook);
+      console.log("[META_QUESTION_HANDLED]");
+      return applyGreetingPlaceholders(
+        purpose || "I'm calling regarding your inquiry and wanted to briefly share some details.",
+        callData,
+        kb
+      );
     };
 
     const buildLanguageReply = () => {
@@ -2516,7 +2554,7 @@ async function startServer() {
       };
 
       const isGenericGreetingInput = (value: string) => ["hello", "hello?", "hi", "hi?"].includes(value.trim().toLowerCase());
-      const isGenericContinueInput = (value: string) => ["okay", "ok", "yes", "go ahead", "continue"].includes(normalizeTurnText(value));
+      const isGenericContinueInput = (value: string) => isContinuationIntent(value);
       const hasClearBusinessIntent = (value: string) => {
         const intentType = detectIntentType(value);
         if (["pricing", "location", "amenities", "configuration", "offers", "possession", "investment", "scheduling", "language_request"].includes(intentType)) return true;
@@ -2556,7 +2594,7 @@ async function startServer() {
       };
 
       const answerFromKB = async () => {
-        if (!hasClearBusinessIntent(transcript) && !isIdentityQuestion(transcript)) {
+        if (!hasClearBusinessIntent(transcript) && !isIdentityQuestion(transcript) && !isPurposeQuestion(transcript)) {
           console.log("[INTENT_CONFIDENCE_LOW]");
           console.log("[KB_SEARCH_BLOCKED]");
           console.log("[STAGE_PRESERVED]", conversationStage);
@@ -2567,6 +2605,12 @@ async function startServer() {
           console.log("[USER QUESTION OVERRIDES APPOINTMENT]");
         } else {
           console.log("[INTENT OVERRIDE] user question detected, skipping appointment");
+        }
+        if (isPurposeQuestion(transcript)) {
+          console.log("[DECISION: ANSWER]");
+          console.log("[DIRECT QUESTION HANDLED]");
+          console.log("[RETURNING TO STAGE]", conversationStage);
+          return decision(buildPurposeReply(callData, kb), conversationStage, false, 18);
         }
         if (isIdentityQuestion(transcript)) {
           console.log("[DECISION: ANSWER]");
@@ -2641,6 +2685,43 @@ async function startServer() {
       if (detectLanguageRequest(transcript)) {
         return handleLanguageSwitch(transcript);
       }
+
+      const advanceScriptAfterConfirmation = () => {
+        if (conversationStage === "availability" && isSemanticAvailabilityConfirmation(transcript)) {
+          console.log("[SEMANTIC_CONFIRMATION_DETECTED]", transcript);
+          availabilityDelivered = true;
+          markCompletedStage("availability");
+          console.log("[AVAILABILITY_COMPLETED]");
+          console.log("[STAGE_REPLAY_BLOCKED]", "availability");
+          const nextStageReply = getStageReply("permission", callData, kb);
+          return decision(nextStageReply.reply, nextStageReply.nextStage, false, 14);
+        }
+        if (conversationStage === "permission" && isContinuationIntent(transcript)) {
+          console.log("[SEMANTIC_CONFIRMATION_DETECTED]", transcript);
+          permissionDelivered = true;
+          markCompletedStage("permission");
+          const nextStageReply = getStageReply("hook", callData, kb);
+          return decision(nextStageReply.reply, nextStageReply.nextStage, false, 60);
+        }
+        if (conversationStage === "hook" && isContinuationIntent(transcript)) {
+          console.log("[SEMANTIC_CONFIRMATION_DETECTED]", transcript);
+          hookDelivered = true;
+          markCompletedStage("hook");
+          const nextStageReply = getStageReply("pitch", callData, kb);
+          return decision(nextStageReply.reply, nextStageReply.nextStage, false, 60);
+        }
+        if (conversationStage === "pitch" && isContinuationIntent(transcript)) {
+          console.log("[SEMANTIC_CONFIRMATION_DETECTED]", transcript);
+          pitchDelivered = true;
+          markCompletedStage("pitch");
+          const nextStageReply = getStageReply("qualification", callData, kb);
+          return decision(nextStageReply.reply, nextStageReply.nextStage, false, 18);
+        }
+        return null;
+      };
+
+      const stageConfirmationDecision = advanceScriptAfterConfirmation();
+      if (stageConfirmationDecision) return stageConfirmationDecision;
 
       const contextualDecision = await handleContextualInput();
       if (contextualDecision) return contextualDecision;
