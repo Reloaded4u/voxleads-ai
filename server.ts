@@ -2375,6 +2375,23 @@ async function startServer() {
         return { reply: finalReply, needsGemini, maxWords };
       };
 
+      const detectLanguageRequest = (userText: string) =>
+        detectIntentType(userText) === "language_request" || isLanguageRequest(userText);
+
+      const handleLanguageSwitch = (userText: string) => {
+        console.log("[LANGUAGE REQUEST DETECTED]", userText);
+        preferredLanguage = getRequestedLanguage(userText);
+        console.log("[PREFERRED LANGUAGE SET]", preferredLanguage);
+        console.log("[LANGUAGE SWITCH]", preferredLanguage);
+        console.log("[GEMINI SKIPPED]");
+        console.log("[RETURNING TO STAGE]", conversationStage);
+        return decision(buildLanguageReply(), conversationStage, false, 14);
+      };
+
+      if (detectLanguageRequest(transcript)) {
+        return handleLanguageSwitch(transcript);
+      }
+
       const nextAction = decideNextAction(transcript, callState);
       console.log("[DECISION ACTION]", nextAction);
       console.log("[INTENT TYPE]", detectIntentType(transcript));
