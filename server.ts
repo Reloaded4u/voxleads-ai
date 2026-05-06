@@ -195,11 +195,35 @@ const INTERNAL_KB_KEYS = new Set([
   "providerid",
   "transcriptbuffer",
   "callcontrolstate",
+  "followupinstructions",
+  "crminstructions",
+  "aftercallactions",
+  "aftercall",
+  "saveleaddetails",
+  "triggernotification",
+  "notification",
+  "rawmetadata",
+  "metadata",
+  "provider",
 ]);
+
+const INTERNAL_TEXT_PATTERNS = [
+  /\bafter the call\b/i,
+  /\bsave all collected responses\b/i,
+  /\bsend lead details to crm\b/i,
+  /\btrigger notification\b/i,
+  /\bcrm\b/i,
+];
 
 function collectKbText(value: any): string {
   if (value === undefined || value === null) return "";
-  if (typeof value === "string") return value;
+  if (typeof value === "string") {
+    if (INTERNAL_TEXT_PATTERNS.some((pattern) => pattern.test(value))) {
+      console.log("[INTERNAL_KB_EXCLUDED]");
+      return "";
+    }
+    return value;
+  }
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   if (Array.isArray(value)) return value.map(collectKbText).filter(Boolean).join(" ");
   if (typeof value === "object") {
@@ -267,6 +291,10 @@ function cleanFinalResponse(value: string, fallback = "Sure, what would you like
   }
   if (!clean) clean = fallback;
   clean = sanitizeOutboundReply(clean, fallback);
+  if (/\bwith[.!?]?$/i.test(clean)) {
+    clean = clean.replace(/\bwith[.!?]?$/i, "with you");
+    console.log("[WITH_YOU_FIX_APPLIED]");
+  }
   if (!/[.!?]$/.test(clean)) {
     console.log("[INCOMPLETE SENTENCE FIXED]", clean);
     clean += ".";
@@ -339,13 +367,56 @@ const intentToKBMap: Partial<Record<IntentType, keyof ReturnType<typeof normaliz
   location: "businessProfile",
 };
 
+const SPEAKABLE_CALL_GUIDANCE_KEYS = [
+  "greeting",
+  "availabilityCheck",
+  "availabilityQuestion",
+  "permissionLine",
+  "permissionQuestion",
+  "hook",
+  "openingLine",
+  "pitch",
+  "mainPitch",
+  "shortPitch",
+  "qualificationQuestions",
+  "closingLine",
+];
+
+function pickSpeakableFields(source: any, keys: string[]) {
+  if (!source || typeof source !== "object") return {};
+  const result: Record<string, any> = {};
+  for (const key of keys) {
+    const value = findKbSection(source, [key]);
+    if (value !== undefined && value !== null) result[key] = value;
+  }
+  return result;
+}
+
+function getSpeakableKbContext(kbContext: ReturnType<typeof normalizeKbForAgent>) {
+  const speakableKb = {
+    businessProfile: kbContext.businessProfile,
+    productsServices: kbContext.productsServices,
+    uniqueSellingPoints: kbContext.uniqueSellingPoints,
+    offersPromotions: kbContext.offersPromotions,
+    callGuidance: pickSpeakableFields(kbContext.callGuidance, SPEAKABLE_CALL_GUIDANCE_KEYS),
+    faqs: kbContext.faqs,
+    objections: kbContext.objections,
+    appointments: kbContext.appointments,
+    answerBank: (kbContext as any).answerBank,
+  };
+  console.log("[SPEAKABLE_KB_KEYS]", Object.keys(speakableKb).filter((key) => collectKbText((speakableKb as any)[key]).trim()).join(","));
+  console.log("[INTERNAL_KB_EXCLUDED]");
+  return speakableKb;
+}
+
 function getKbDirectAnswer(userSpeech: string, kbContext: ReturnType<typeof normalizeKbForAgent>) {
   const intentType = detectIntentType(userSpeech);
+  const speakableKb = getSpeakableKbContext(kbContext);
   console.log("[INTENT TYPE]", intentType);
 
   if (["pricing", "location", "amenities", "configuration", "offers"].includes(intentType)) {
     const sectionName = intentToKBMap[intentType];
-    const sectionValue = sectionName ? kbContext[sectionName] : undefined;
+    const sectionValue = sectionName ? (speakableKb as any)[sectionName] : undefined;
     console.log("[KB SECTION SELECTED]", sectionName || intentType);
     const sectionText = collectKbText(sectionValue);
     if (sectionText.trim()) {
@@ -373,14 +444,14 @@ function getKbDirectAnswer(userSpeech: string, kbContext: ReturnType<typeof norm
   if (userTokens.size === 0) return "";
 
   const entries = [
-    ["faqs", kbContext.faqs],
-    ["productsServices", kbContext.productsServices],
-    ["uniqueSellingPoints", kbContext.uniqueSellingPoints],
-    ["offersPromotions", kbContext.offersPromotions],
-    ["businessProfile", kbContext.businessProfile],
-    ["objections", kbContext.objections],
-    ["appointments", kbContext.appointments],
-    ["callGuidance", kbContext.callGuidance],
+    ["faqs", speakableKb.faqs],
+    ["productsServices", speakableKb.productsServices],
+    ["uniqueSellingPoints", speakableKb.uniqueSellingPoints],
+    ["offersPromotions", speakableKb.offersPromotions],
+    ["businessProfile", speakableKb.businessProfile],
+    ["objections", speakableKb.objections],
+    ["appointments", speakableKb.appointments],
+    ["callGuidance", speakableKb.callGuidance],
   ].map(([name, section]) => {
     const sectionText = collectKbText(section);
     const sectionTokens = new Set(normalizeTokens(sectionText));
@@ -1867,7 +1938,7 @@ async function startServer() {
 
     const isIdentityQuestion = (text: string) => {
       const t = normalizeTurnText(text);
-      return /\b(who is this|who are you|who is it|who am i speaking to|where are you calling from|whos calling|who is calling|what was that)\b/i.test(t);
+      return /\b(who is this|who are you|who is it|who am i speaking to|where are you calling from|whos calling|who is calling|are you calling me|what was that|why are you calling)\b/i.test(t);
     };
 
     const isKbQuestionIntent = (text: string) => {
@@ -2138,7 +2209,7 @@ async function startServer() {
 
     const buildIdentityReply = (_callData: any, _kb: any) => {
       console.log("[META_QUESTION_HANDLED]");
-      return "This is Kanika from the sales team.";
+      return "This is Kanika from the sales team, calling about your interest in Lodha Amara.";
     };
 
     const buildLanguageReply = () => {
@@ -2368,7 +2439,16 @@ async function startServer() {
         return "";
       };
 
+      const isIncompleteUserInput = (value: string) => {
+        const t = normalizeTurnText(value);
+        return ["what", "why", "how", "where", "who", "are you", "why do", "what was", "what is"].includes(t);
+      };
+
       const answerFromKB = async () => {
+        if (isIncompleteUserInput(transcript)) {
+          console.log("[INCOMPLETE_INPUT_CLARIFIED]", transcript);
+          return decision("Sorry, could you please repeat that?", conversationStage, false, 10);
+        }
         if (conversationStage === "appointment") {
           console.log("[USER QUESTION OVERRIDES APPOINTMENT]");
         } else {
