@@ -164,6 +164,12 @@ function normalizeKbForAgent(kb: any = {}) {
     productsServices: firstPresentValue(findKbSection(source, ["productsServices", "products services", "products / services", "products & services", "products and services", "productServices", "product services", "products", "services", "offerings"]), {}),
     uniqueSellingPoints: firstPresentValue(findKbSection(source, ["uniqueSellingPoints", "unique selling points", "unique selling points usp", "unique selling points / usp", "usp", "usps", "benefits", "whyChooseUs", "why choose us", "valueProposition", "value proposition"]), {}),
     offersPromotions: firstPresentValue(findKbSection(source, ["offersPromotions", "offers promotions", "offers / promotions", "offers & promotions", "offers and promotions", "offers", "promotions", "discounts", "deals", "specialOffers", "special offers"]), {}),
+    pricing: firstPresentValue(findKbSection(source, ["pricing", "price", "prices", "cost", "costing", "rates", "rate", "priceRange", "price range", "configurationPricing", "configuration pricing", "startingPrice", "starting price"]), {}),
+    location: firstPresentValue(findKbSection(source, ["location", "address", "siteLocation", "site location", "area", "businessLocation", "business location"]), {}),
+    amenities: firstPresentValue(findKbSection(source, ["amenities", "amenity", "facilities", "facility", "features"]), {}),
+    configurations: firstPresentValue(findKbSection(source, ["configurations", "configuration", "options", "variants", "types", "availableOptions", "available options"]), {}),
+    possession: firstPresentValue(findKbSection(source, ["possession", "handover", "completion", "delivery", "timeline", "availabilityDate", "availability date"]), {}),
+    investment: firstPresentValue(findKbSection(source, ["investment", "invest", "roi", "returns", "return", "appreciation", "rental"]), {}),
     callGuidance: firstPresentValue(findKbSection(source, ["callGuidance", "call guidance", "guidance", "script"]), {}),
     faqs: firstPresentValue(findKbSection(source, ["faqs", "faq", "questions"])?.items, findKbSection(source, ["faqs", "faq", "questions"]), []),
     objections: firstPresentValue(findKbSection(source, ["objections", "objectionHandling", "objection handling"])?.items, findKbSection(source, ["objections", "objectionHandling", "objection handling"]), []),
@@ -345,7 +351,7 @@ function isWeakFillerInput(text: string) {
   return meaningfulWords.length > 0 && meaningfulWords.length < 3 && !/[?]/.test(text);
 }
 
-type IntentType = "pricing" | "location" | "amenities" | "configuration" | "offers" | "scheduling" | "language_request" | "general_question";
+type IntentType = "pricing" | "location" | "amenities" | "configuration" | "offers" | "possession" | "investment" | "scheduling" | "language_request" | "general_question";
 
 function detectIntentType(userInput: string): IntentType {
   const t = userInput.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
@@ -356,15 +362,19 @@ function detectIntentType(userInput: string): IntentType {
   if (/\b(amenity|amenities|facility|facilities|features|included|include)\b/i.test(t)) return "amenities";
   if (/\b(configuration|configurations|config|options|types|available|variant|variants)\b/i.test(t)) return "configuration";
   if (/\b(offer|offers|promotion|promotions|discount|deal|deals)\b/i.test(t)) return "offers";
+  if (/\b(possession|handover|ready|completion|delivery|timeline)\b/i.test(t)) return "possession";
+  if (/\b(investment|invest|roi|return|returns|rental|appreciation)\b/i.test(t)) return "investment";
   return "general_question";
 }
 
 const intentToKBMap: Partial<Record<IntentType, keyof ReturnType<typeof normalizeKbForAgent>>> = {
-  configuration: "productsServices",
-  amenities: "uniqueSellingPoints",
+  pricing: "pricing",
+  location: "location",
+  amenities: "amenities",
+  configuration: "configurations",
   offers: "offersPromotions",
-  pricing: "offersPromotions",
-  location: "businessProfile",
+  possession: "possession",
+  investment: "investment",
 };
 
 const SPEAKABLE_CALL_GUIDANCE_KEYS = [
@@ -398,6 +408,12 @@ function getSpeakableKbContext(kbContext: ReturnType<typeof normalizeKbForAgent>
     productsServices: kbContext.productsServices,
     uniqueSellingPoints: kbContext.uniqueSellingPoints,
     offersPromotions: kbContext.offersPromotions,
+    pricing: (kbContext as any).pricing,
+    location: (kbContext as any).location,
+    amenities: (kbContext as any).amenities,
+    configurations: (kbContext as any).configurations,
+    possession: (kbContext as any).possession,
+    investment: (kbContext as any).investment,
     callGuidance: pickSpeakableFields(kbContext.callGuidance, SPEAKABLE_CALL_GUIDANCE_KEYS),
     faqs: kbContext.faqs,
     objections: kbContext.objections,
@@ -414,7 +430,7 @@ function getKbDirectAnswer(userSpeech: string, kbContext: ReturnType<typeof norm
   const speakableKb = getSpeakableKbContext(kbContext);
   console.log("[INTENT TYPE]", intentType);
 
-  if (["pricing", "location", "amenities", "configuration", "offers"].includes(intentType)) {
+  if (["pricing", "location", "amenities", "configuration", "offers", "possession", "investment"].includes(intentType)) {
     const sectionName = intentToKBMap[intentType];
     const sectionValue = sectionName ? (speakableKb as any)[sectionName] : undefined;
     console.log("[KB SECTION SELECTED]", sectionName || intentType);
@@ -445,6 +461,12 @@ function getKbDirectAnswer(userSpeech: string, kbContext: ReturnType<typeof norm
 
   const entries = [
     ["faqs", speakableKb.faqs],
+    ["pricing", (speakableKb as any).pricing],
+    ["location", (speakableKb as any).location],
+    ["amenities", (speakableKb as any).amenities],
+    ["configurations", (speakableKb as any).configurations],
+    ["possession", (speakableKb as any).possession],
+    ["investment", (speakableKb as any).investment],
     ["productsServices", speakableKb.productsServices],
     ["uniqueSellingPoints", speakableKb.uniqueSellingPoints],
     ["offersPromotions", speakableKb.offersPromotions],
@@ -2339,6 +2361,8 @@ async function startServer() {
     };
     const skipCompletedStage = (stage: ConversationStage) => {
       if (!completedStages.has(stage)) return stage;
+      console.log("[STAGE_LOCKED]", stage);
+      console.log("[STAGE_REPLAY_BLOCKED]", stage);
       console.log("[STAGE_ALREADY_COMPLETED]", stage);
       const next = stageAfter(stage);
       console.log("[ADVANCING_TO_NEXT_STAGE]", next);
@@ -2373,6 +2397,8 @@ async function startServer() {
     const getNextUnfinishedStageReply = (callData: any, kb: any) => {
       let stage = conversationStage;
       while (completedStages.has(stage) && stage !== "ended") {
+        console.log("[STAGE_LOCKED]", stage);
+        console.log("[STAGE_REPLAY_BLOCKED]", stage);
         console.log("[STAGE_ALREADY_COMPLETED]", stage);
         stage = stageAfter(stage);
         console.log("[ADVANCING_TO_NEXT_STAGE]", stage);
@@ -2432,45 +2458,8 @@ async function startServer() {
       }
     };
 
-    const deliverMissingPreQualificationStage = (callData: any, kb: any) => {
-      console.log("[FLOW GUARD] qualification blocked because previous KB stages missing");
-
-      if (!availabilityDelivered) {
-        const text = buildAvailabilityQuestion(callData, kb);
-        availabilityDelivered = true;
-        moveStage("permission");
-        console.log("[FLOW STEP] delivered availabilityCheck");
-        console.log("[STAGE FLOW]", conversationStage);
-        return text;
-      }
-
-      if (!permissionDelivered) {
-        const text = buildPermissionQuestion(callData, kb);
-        permissionDelivered = true;
-        moveStage("hook");
-        console.log("[FLOW STEP] delivered permissionLine");
-        console.log("[STAGE FLOW]", conversationStage);
-        return text;
-      }
-
-      if (!hookDelivered) {
-        const text = applyGreetingPlaceholders(getOpeningHook(kb), callData, kb);
-        hookDelivered = true;
-        moveStage("pitch");
-        console.log("[FLOW STEP] delivered hook");
-        console.log("[STAGE FLOW]", conversationStage);
-        return text;
-      }
-
-      if (!pitchDelivered) {
-        const text = applyGreetingPlaceholders(getMainPitch(kb), callData, kb);
-        pitchDelivered = true;
-        moveStage("qualification");
-        console.log("[FLOW STEP] delivered pitch");
-        console.log("[STAGE FLOW]", conversationStage);
-        return text;
-      }
-
+    const deliverMissingPreQualificationStage = (_callData: any, _kb: any) => {
+      console.log("[STAGE_PRESERVED]", conversationStage);
       return "";
     };
 
@@ -2508,9 +2497,9 @@ async function startServer() {
           if (conversationStage === "qualification") {
             currentQuestionIndex += 1;
             const nextQuestion = askNextQualificationQuestion(callData, kb);
-            return nextQuestion || "Got it, no worries. Let me move ahead.";
+            return nextQuestion || "Sure.";
           }
-          return "Got it, no worries. Let me move ahead.";
+          return "Sure.";
         }
         return "";
       };
@@ -2530,7 +2519,7 @@ async function startServer() {
       const isGenericContinueInput = (value: string) => ["okay", "ok", "yes", "go ahead", "continue"].includes(normalizeTurnText(value));
       const hasClearBusinessIntent = (value: string) => {
         const intentType = detectIntentType(value);
-        if (["pricing", "location", "amenities", "configuration", "offers", "scheduling", "language_request"].includes(intentType)) return true;
+        if (["pricing", "location", "amenities", "configuration", "offers", "possession", "investment", "scheduling", "language_request"].includes(intentType)) return true;
         const t = normalizeTurnText(value);
         return /\b(product|service|business|details|detail|available|feature|features|not interested|expensive|busy)\b/i.test(t);
       };
@@ -2609,20 +2598,22 @@ async function startServer() {
           const advancedStage = stageAfter(previousStage);
           console.log("[ADVANCING_TO_NEXT_STAGE]", advancedStage);
           const advancedReply = getStageReply(advancedStage, callData, kb);
-          finalReply = advancedReply.reply || "Got it, no worries. Let me move ahead.";
+          finalReply = advancedReply.reply || "Sure.";
           nextStage = advancedReply.nextStage;
         }
         if (currentQuestion.endsWith("?")) {
           if (lastQuestion === currentQuestion) {
             console.log("[LOOP BLOCKED] same question detected");
-            finalReply = "Got it, no worries. Let me move ahead.";
+            finalReply = "Sure.";
           } else {
             lastQuestion = currentQuestion;
           }
         }
-        if (finalReply === "Got it, no worries. Let me move ahead." && lastAckReply === finalReply) {
+        if (["Sure."].includes(finalReply) && lastAckReply === finalReply) {
           console.log("[ACK_REPEAT_BLOCKED]");
-          finalReply = "Moving ahead.";
+          const nextStageReply = getNextUnfinishedStageReply(callData, kb);
+          finalReply = nextStageReply.reply || "Please continue.";
+          nextStage = nextStageReply.nextStage;
         }
         lastAckReply = finalReply;
         pendingCompletedStage = !needsGemini && nextStage !== previousStage ? previousStage : null;
@@ -2814,7 +2805,6 @@ async function startServer() {
       }
 
       if (conversationStage === "qualification") {
-        if (!preQualificationStagesDelivered()) return decision(deliverMissingPreQualificationStage(callData, kb), conversationStage, false);
         if (callState.lowConfidenceWithoutTime) {
           console.log("[TURN HELD] low confidence", transcript);
           return decision("Sure, what would you like to know?", conversationStage, false, 14);
@@ -2972,6 +2962,7 @@ async function startServer() {
         await timedStep("audio send", () => sendVobizAudio(ws, greetingAudio, () => !playbackInterrupted));
         await appendTranscript("AI", greetingText);
         greetingDelivered = true;
+        markCompletedStage("greeting");
         conversationStage = "availability";
         console.log("[STAGE FLOW]", conversationStage);
       } else {
