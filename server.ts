@@ -1748,6 +1748,9 @@ async function startServer() {
     let savedCallbackTime = "";
     let preferredLanguage = "English";
     let lastQuestion = "";
+    let lastAckReply = "";
+    let pendingCompletedStage: ConversationStage | null = null;
+    const completedStages = new Set<ConversationStage>();
     let playbackInterrupted = false;
     let bargeInBuffers: Buffer[] = [];
     let pendingBargeInAudio: Buffer | null = null;
@@ -2323,6 +2326,25 @@ async function startServer() {
     };
 
     const stageOrder: ConversationStage[] = ["greeting", "availability", "permission", "hook", "pitch", "qualification", "post_qualification", "appointment", "closing", "ended"];
+    const scriptedStageOrder: ConversationStage[] = ["greeting", "availability", "permission", "hook", "pitch", "qualification", "appointment", "closing", "ended"];
+    const stageAfter = (stage: ConversationStage): ConversationStage => {
+      const index = scriptedStageOrder.indexOf(stage);
+      if (index < 0) return stage;
+      if (stage === "ended") return "ended";
+      return scriptedStageOrder[Math.min(index + 1, scriptedStageOrder.length - 1)] || stage;
+    };
+    const markCompletedStage = (stage: ConversationStage | null) => {
+      if (!stage || stage === "post_qualification" || stage === "ended") return;
+      completedStages.add(stage);
+    };
+    const skipCompletedStage = (stage: ConversationStage) => {
+      if (!completedStages.has(stage)) return stage;
+      console.log("[STAGE_ALREADY_COMPLETED]", stage);
+      const next = stageAfter(stage);
+      console.log("[ADVANCING_TO_NEXT_STAGE]", next);
+      moveStage(next);
+      return conversationStage;
+    };
 
     const moveStage = (nextStage: ConversationStage) => {
       if (stageOrder.indexOf(nextStage) < stageOrder.indexOf(conversationStage)) {
@@ -2331,6 +2353,32 @@ async function startServer() {
       }
       conversationStage = nextStage;
       return conversationStage;
+    };
+
+    const getStageReply = (stage: ConversationStage, callData: any, kb: any) => {
+      if (stage === "ended") return { reply: "", nextStage: "ended" as ConversationStage };
+      const activeStage = skipCompletedStage(stage);
+      if (activeStage === "ended") return { reply: "", nextStage: "ended" as ConversationStage };
+      if (activeStage !== stage) return getStageReply(activeStage, callData, kb);
+      if (activeStage === "availability") return { reply: buildAvailabilityQuestion(callData, kb), nextStage: "permission" as ConversationStage };
+      if (activeStage === "permission") return { reply: buildPermissionQuestion(callData, kb), nextStage: "hook" as ConversationStage };
+      if (activeStage === "hook") return { reply: applyGreetingPlaceholders(getOpeningHook(kb), callData, kb), nextStage: "pitch" as ConversationStage };
+      if (activeStage === "pitch") return { reply: applyGreetingPlaceholders(getMainPitch(kb), callData, kb), nextStage: "qualification" as ConversationStage };
+      if (activeStage === "qualification") return { reply: askNextQualificationQuestion(callData, kb), nextStage: "qualification" as ConversationStage };
+      if (activeStage === "appointment") return { reply: "Sure, I can help with that. What day and time works for you?", nextStage: "appointment" as ConversationStage };
+      if (activeStage === "closing") return { reply: buildClosingLine(callData, kb), nextStage: "ended" as ConversationStage };
+      return { reply: "", nextStage: activeStage };
+    };
+
+    const getNextUnfinishedStageReply = (callData: any, kb: any) => {
+      let stage = conversationStage;
+      while (completedStages.has(stage) && stage !== "ended") {
+        console.log("[STAGE_ALREADY_COMPLETED]", stage);
+        stage = stageAfter(stage);
+        console.log("[ADVANCING_TO_NEXT_STAGE]", stage);
+      }
+      moveStage(stage);
+      return getStageReply(stage, callData, kb);
     };
 
     const missingKbAnswerFallback = "I don't have exact details right now, but our team can share that with you.";
@@ -2509,10 +2557,9 @@ async function startServer() {
           console.log("[KB_SEARCH_SKIPPED_LOW_CONFIDENCE]");
           console.log("[GENERIC_INPUT_HANDLED]");
           console.log("[CONTEXTUAL_REPLY_USED]");
-          const pendingPrompt = getCurrentPendingPrompt(callData, kb);
-          if (pendingPrompt) {
-            console.log("[STAGE_PRESERVED]", conversationStage);
-            return decision(pendingPrompt, conversationStage, false, 14);
+          const nextStageReply = getNextUnfinishedStageReply(callData, kb);
+          if (nextStageReply.reply) {
+            return decision(nextStageReply.reply, nextStageReply.nextStage, false, 14);
           }
         }
 
@@ -2555,6 +2602,16 @@ async function startServer() {
       const decision = async (reply: string, nextStage: ConversationStage, needsGemini = false, maxWords = 10) => {
         let finalReply = reply;
         const currentQuestion = finalReply.trim();
+        const previousStage = conversationStage;
+        const stageWasCompleted = completedStages.has(previousStage);
+        if (nextStage === previousStage && stageWasCompleted) {
+          console.log("[RECURSIVE_STAGE_BLOCKED]", previousStage);
+          const advancedStage = stageAfter(previousStage);
+          console.log("[ADVANCING_TO_NEXT_STAGE]", advancedStage);
+          const advancedReply = getStageReply(advancedStage, callData, kb);
+          finalReply = advancedReply.reply || "Got it, no worries. Let me move ahead.";
+          nextStage = advancedReply.nextStage;
+        }
         if (currentQuestion.endsWith("?")) {
           if (lastQuestion === currentQuestion) {
             console.log("[LOOP BLOCKED] same question detected");
@@ -2563,13 +2620,18 @@ async function startServer() {
             lastQuestion = currentQuestion;
           }
         }
-        const previousStage = conversationStage;
+        if (finalReply === "Got it, no worries. Let me move ahead." && lastAckReply === finalReply) {
+          console.log("[ACK_REPEAT_BLOCKED]");
+          finalReply = "Moving ahead.";
+        }
+        lastAckReply = finalReply;
+        pendingCompletedStage = !needsGemini && nextStage !== previousStage ? previousStage : null;
         if (nextStage !== conversationStage) moveStage(nextStage);
         if (conversationStage !== previousStage) console.log("[STAGE_ADVANCED]", previousStage, "->", conversationStage);
         else console.log("[STAGE_PRESERVED]", conversationStage);
         console.log("[REPLY DECISION]", finalReply, "nextStage=", conversationStage, "gemini=", needsGemini);
         console.log("[STATE AFTER]", conversationStage);
-        return { reply: finalReply, needsGemini, maxWords };
+        return { reply: finalReply, needsGemini, maxWords, completedStage: pendingCompletedStage };
       };
 
       const detectLanguageRequest = (userText: string) =>
@@ -3130,6 +3192,10 @@ async function startServer() {
           return;
         }
         await appendTranscript("AI", aiReply);
+        if (decision.completedStage) {
+          markCompletedStage(decision.completedStage);
+        }
+        pendingCompletedStage = null;
         mediaBuffers = [];
         if (conversationStage === "closing" || conversationStage === "ended") {
           console.log("[CALL ENDING AFTER COMPLETION]");
