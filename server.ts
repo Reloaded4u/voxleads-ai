@@ -178,6 +178,47 @@ function normalizeKbForAgent(kb: any = {}) {
     tone: firstPresentValue(findKbSection(source, ["tone", "brandTone", "brand tone", "voiceTone", "voice tone"]), {}),
   };
 
+  const extractKbAnswerByKeywords = (value: any, keywords: RegExp) => {
+    if (!value) return "";
+    const items = Array.isArray(value) ? value : typeof value === "object" ? Object.values(value) : [value];
+    const matches = items
+      .map((item) => collectKbText(item))
+      .map((item) => item.replace(/\s+/g, " ").trim())
+      .filter((item) => item && keywords.test(item));
+    return matches.join(" ");
+  };
+
+  if (!collectKbText(normalized.pricing).trim()) {
+    const pricingFromFaqs = extractKbAnswerByKeywords(normalized.faqs, /\b(price|pricing|cost|rate|amount|fee|charge)\b/i);
+    if (pricingFromFaqs) {
+      normalized.pricing = pricingFromFaqs;
+      console.log("[KB_NORMALIZED_PRICING]");
+    }
+  }
+
+  if (!collectKbText(normalized.location).trim()) {
+    const locationFromFaqs = extractKbAnswerByKeywords(normalized.faqs, /\b(location|address|where|area|located)\b/i);
+    const locationFromProfile = extractKbAnswerByKeywords(normalized.businessProfile, /\b(location|address|area|located|road|street|city|state|country)\b/i);
+    const location = locationFromFaqs || locationFromProfile;
+    if (location) {
+      normalized.location = location;
+      console.log("[KB_NORMALIZED_LOCATION]");
+    }
+  }
+
+  if (!collectKbText(normalized.amenities).trim()) {
+    const amenitiesFromFaqs = extractKbAnswerByKeywords(normalized.faqs, /\b(amenities|amenity|facilities|facility|features|feature|included|include)\b/i);
+    if (amenitiesFromFaqs) {
+      normalized.amenities = amenitiesFromFaqs;
+      console.log("[KB_NORMALIZED_AMENITIES]");
+    }
+  }
+
+  if (!collectKbText(normalized.configurations).trim()) {
+    const configurationsFromFaqs = extractKbAnswerByKeywords(normalized.faqs, /\b(configuration|configurations|options|variants|types|available)\b/i);
+    if (configurationsFromFaqs) normalized.configurations = configurationsFromFaqs;
+  }
+
   console.log("[KB NORMALIZED KEYS]", Object.keys(normalized).filter((key) => {
     const value = (normalized as any)[key];
     return typeof value === "string" ? value.trim() : Array.isArray(value) ? value.length : Object.keys(value || {}).length;
@@ -2015,7 +2056,7 @@ async function startServer() {
 
     const isIdentityQuestion = (text: string) => {
       const t = normalizeTurnText(text);
-      return /\b(who is this|who are you|who is it|who am i speaking to|where are you calling from|whos calling|who is calling|are you calling me|what was that)\b/i.test(t);
+      return /\b(who is this|who's this|whos this|who are you|who is it|who am i speaking to|where are you calling from|your name|which company|whos calling|who's calling|who calling|who is calling|are you calling me|what was that)\b/i.test(t);
     };
 
     const isPurposeQuestion = (text: string) => {
@@ -2612,8 +2653,15 @@ async function startServer() {
         playbackInterrupted = true;
         leadData.outcome = "not_interested";
         disinterestTerminationPending = true;
+        moveStage("ended");
+        console.log("[CALL_ENDED_DISINTEREST]");
         console.log("[GEMINI SKIPPED]");
-        return decision("Understood. Thanks for your time.", "closing", false, 6);
+        return {
+          reply: "Understood. Thanks for your time.",
+          needsGemini: false,
+          maxWords: 6,
+          completedStage: null,
+        };
       }
 
       const repeatComplaintReply = (text: string) => {
@@ -2773,11 +2821,16 @@ async function startServer() {
             lastQuestion = currentQuestion;
           }
         }
-        if (["Sure."].includes(finalReply) && lastAckReply === finalReply) {
-          console.log("[ACK_REPEAT_BLOCKED]");
+        if (/^(sure|okay|alright)\.?$/i.test(finalReply.trim())) {
           const nextStageReply = getNextUnfinishedStageReply(callData, kb);
-          finalReply = nextStageReply.reply || "Please continue.";
-          nextStage = nextStageReply.nextStage;
+          if (nextStageReply.reply) {
+            console.log("[ADVANCING_TO_NEXT_STAGE]", nextStageReply.nextStage);
+            finalReply = nextStageReply.reply;
+            nextStage = nextStageReply.nextStage;
+          } else if (lastAckReply === finalReply) {
+            console.log("[ACK_REPEAT_BLOCKED]");
+            finalReply = "Please continue.";
+          }
         }
         lastAckReply = finalReply;
         pendingCompletedStage = !needsGemini && nextStage !== previousStage ? previousStage : null;
@@ -2882,7 +2935,7 @@ async function startServer() {
           playbackInterrupted = true;
           leadData.outcome = "not_interested";
           disinterestTerminationPending = true;
-          return decision("Understood. Thanks for your time.", "closing", false, 6);
+          return decision("Understood. Thanks for your time.", "ended", false, 6);
         }
         return decision(buildClosingLine(callData, kb), "closing", false, 14);
       }
@@ -3425,7 +3478,10 @@ async function startServer() {
         mediaBuffers = [];
         if (conversationStage === "closing" || conversationStage === "ended") {
           console.log("[CALL ENDING AFTER COMPLETION]");
-          if (disinterestTerminationPending) console.log("[CALL_ENDED_DISINTEREST]");
+          if (disinterestTerminationPending) {
+            console.log("[DISINTEREST_REPLY_SENT]");
+            console.log("[CALL_ENDED_DISINTEREST]");
+          }
           moveStage("ended");
           console.log("[STAGE FLOW]", conversationStage);
           state = "ENDING";
