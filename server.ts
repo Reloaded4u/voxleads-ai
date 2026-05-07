@@ -1894,6 +1894,7 @@ async function startServer() {
     let savedCallbackTime = "";
     let preferredLanguage = "English";
     let lastQuestion = "";
+    let lastQualificationClarification = "";
     let lastAckReply = "";
     let pendingCompletedStage: ConversationStage | null = null;
     const completedStages = new Set<ConversationStage>();
@@ -2540,6 +2541,7 @@ async function startServer() {
       if (!isValidQualificationAnswer(clean, questionText)) {
         console.log("[QUALIFICATION_VALIDATION_FAILED]", transcript);
         console.log("[INVALID_ANSWER_REJECTED]", transcript);
+        console.log("[QUALIFICATION_INDEX_PRESERVED]", currentQuestionIndex);
         return false;
       }
 
@@ -2967,18 +2969,29 @@ async function startServer() {
       const stageConfirmationDecision = advanceScriptAfterConfirmation();
       if (stageConfirmationDecision) return stageConfirmationDecision;
 
-      const buildQualificationClarification = () => {
+      const buildQualificationClarification = (input = "") => {
         const q = normalizeTurnText(getCurrentPendingPrompt(callData, kb));
-        if (q.includes("budget")) return "Could you share your budget range?";
-        if (q.includes("configuration") || q.includes("bhk")) return "Which configuration?";
-        if (q.includes("timeline") || q.includes("when")) return "What timeline works for you?";
-        return getCurrentPendingPrompt(callData, kb) || "Please answer briefly.";
+        const t = normalizeTurnText(input);
+        let clarification = "Please complete your question.";
+        if (!isConfusionInput(t) && !isIncompletePhrase(input)) {
+          if (q.includes("budget")) clarification = "Please share an approximate budget, like 70 lakh or 1 crore.";
+          else if (q.includes("configuration") || q.includes("bhk")) clarification = "Do you mean 1, 2, or 3 BHK?";
+          else if (q.includes("timeline") || q.includes("when")) clarification = "Are you planning this soon or later?";
+        }
+        console.log("[INVALID_INPUT_CONTEXTUAL_CLARIFY]", clarification);
+        console.log("[QUALIFICATION_INDEX_PRESERVED]", currentQuestionIndex);
+        if (normalizeTurnText(clarification) === normalizeTurnText(lastQualificationClarification)) {
+          console.log("[QUESTION_REPEAT_SUPPRESSED]");
+          return "Please complete your question.";
+        }
+        lastQualificationClarification = clarification;
+        return clarification;
       };
 
       if (conversationStage === "qualification" && isContextualShortAnswer(transcript)) {
         console.log("[CONTEXTUAL_SHORT_ANSWER_ACCEPTED]", transcript);
         if (!storeQualificationAnswer(transcript, getCurrentPendingPrompt(callData, kb))) {
-          return decision(buildQualificationClarification(), conversationStage, false, 8);
+          return decision(buildQualificationClarification(transcript), conversationStage, false, 8);
         }
         const nextQuestionReply = askNextQualificationQuestion(callData, kb);
         return decision(nextQuestionReply, conversationStage, false, 8);
@@ -3174,7 +3187,7 @@ async function startServer() {
           return decision("Sure, what would you like to know?", conversationStage, false, 14);
         }
         if (qualificationStarted && !storeQualificationAnswer(transcript, getCurrentPendingPrompt(callData, kb))) {
-          return decision(buildQualificationClarification(), conversationStage, false, 8);
+          return decision(buildQualificationClarification(transcript), conversationStage, false, 8);
         }
         const nextQuestionReply = askNextQualificationQuestion(callData, kb);
         return decision(nextQuestionReply, conversationStage, false);
