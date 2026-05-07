@@ -1766,6 +1766,7 @@ async function startServer() {
     let leadData: {
       nameConfirmed: boolean;
       answers: Record<number, string>;
+      outcome?: string;
     } = {
       nameConfirmed: false,
       answers: {},
@@ -1813,6 +1814,7 @@ async function startServer() {
     let pendingCompletedStage: ConversationStage | null = null;
     const completedStages = new Set<ConversationStage>();
     let playbackInterrupted = false;
+    let disinterestTerminationPending = false;
     let bargeInBuffers: Buffer[] = [];
     let pendingBargeInAudio: Buffer | null = null;
     const BARGE_IN_WINDOW_FRAMES = 35;
@@ -1994,9 +1996,14 @@ async function startServer() {
       return preferredLanguage;
     };
 
+    const isDisinterestIntent = (text: string) => {
+      const t = normalizeTurnText(text);
+      return /\b(not interested|no interest|i am not interested|im not interested|i'm not interested|totally not interested|dont call|don't call|stop|remove me|remove my number|not now|no thanks|cancel)\b/i.test(t);
+    };
+
     const isObjectionIntent = (text: string) => {
       const t = normalizeTurnText(text);
-      return /\b(not interested|dont want|do not want|too expensive|already have|stop calling|remove my number|no need)\b/i.test(t);
+      return isDisinterestIntent(text) || /\b(dont want|do not want|too expensive|already have|stop calling|no need)\b/i.test(t);
     };
 
     const isMetaComment = (text: string) => {
@@ -2044,6 +2051,7 @@ async function startServer() {
     };
 
     type RoutedIntent =
+      | "disinterest"
       | "language_request"
       | "direct_question"
       | "objection"
@@ -2054,6 +2062,7 @@ async function startServer() {
       | "scripted_next_step";
 
     const classifyUserIntent = (text: string): RoutedIntent => {
+      if (isDisinterestIntent(text)) return "disinterest";
       const intentType = detectIntentType(text);
       if (intentType === "language_request" || isLanguageRequest(text)) return "language_request";
       if (intentType === "scheduling") return "scheduling_request";
@@ -2530,6 +2539,7 @@ async function startServer() {
     const decideNextAction = (userInput: string, state: any): NextAction => {
       const routed = classifyUserIntent(userInput);
       if (state?.stage === "ended" || conversationStage === "ended") return "end_call";
+      if (routed === "disinterest") return "end_call";
       if (routed === "objection" || isPermissionNegative(userInput)) return "end_call";
       if (routed === "direct_question") return "answer_from_kb";
       if (routed === "scheduling_request") return "ask_next_question";
@@ -2566,8 +2576,13 @@ async function startServer() {
     const getNextReply = async (transcript: string, callState: any, kb: any) => {
       const callData = callState.callData;
       const callContext = callState.callContext;
+      if (conversationStage === "ended") {
+        console.log("[CALL_ENDED_DISINTEREST]", "already ended");
+        return { reply: "", needsGemini: false, maxWords: 0, completedStage: null };
+      }
       const routedIntent = classifyUserIntent(transcript);
       const turnIntent =
+        routedIntent === "disinterest" ? "frustration" :
         routedIntent === "direct_question" ? "direct_question" :
         routedIntent === "scheduling_request" ? "scheduling_request" :
         routedIntent === "objection" ? "frustration" :
@@ -2589,6 +2604,17 @@ async function startServer() {
       console.log("[INTENT]", intent);
       console.log("[TURN INTENT]", turnIntent);
       console.log("[QUESTION INDEX]", currentQuestionIndex);
+
+      if (routedIntent === "disinterest") {
+        console.log("[DISINTEREST_DETECTED]", transcript);
+        console.log("[CALL_TERMINATION_INTENT]");
+        if (conversationStage === "qualification") console.log("[QUALIFICATION_BLOCKED_DISINTEREST]");
+        playbackInterrupted = true;
+        leadData.outcome = "not_interested";
+        disinterestTerminationPending = true;
+        console.log("[GEMINI SKIPPED]");
+        return decision("Understood. Thanks for your time.", "closing", false, 6);
+      }
 
       const repeatComplaintReply = (text: string) => {
         const t = text.toLowerCase();
@@ -2849,6 +2875,15 @@ async function startServer() {
 
       if (nextAction === "end_call") {
         console.log("[DECISION: END_CALL]");
+        if (isDisinterestIntent(transcript)) {
+          console.log("[DISINTEREST_DETECTED]", transcript);
+          console.log("[CALL_TERMINATION_INTENT]");
+          if (conversationStage === "qualification") console.log("[QUALIFICATION_BLOCKED_DISINTEREST]");
+          playbackInterrupted = true;
+          leadData.outcome = "not_interested";
+          disinterestTerminationPending = true;
+          return decision("Understood. Thanks for your time.", "closing", false, 6);
+        }
         return decision(buildClosingLine(callData, kb), "closing", false, 14);
       }
 
@@ -3390,6 +3425,7 @@ async function startServer() {
         mediaBuffers = [];
         if (conversationStage === "closing" || conversationStage === "ended") {
           console.log("[CALL ENDING AFTER COMPLETION]");
+          if (disinterestTerminationPending) console.log("[CALL_ENDED_DISINTEREST]");
           moveStage("ended");
           console.log("[STAGE FLOW]", conversationStage);
           state = "ENDING";
