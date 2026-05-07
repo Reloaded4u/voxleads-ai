@@ -309,6 +309,23 @@ function cleanFinalResponse(value: string, fallback = "Sure, what would you like
   return clean;
 }
 
+function compressReplyForLiveCall(value: string, maxWords = 16) {
+  const original = String(value || "").replace(/\s+/g, " ").trim();
+  let clean = original
+    .replace(/\bSure,?\s+I can help with that\.\s*/i, "Sure. ")
+    .replace(/\bWhat day and time works for you\?/i, "What time works for you?")
+    .replace(/\bI don't have exact details right now, but our team can share that with you\.?/i, "Our team can share exact details.")
+    .replace(/\bI don't have exact details right now, but our team can share them with you\.?/i, "Our team can share exact details.")
+    .replace(/\bwould you like to\b/gi, "want to")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  clean = cleanFinalResponse(clean, "Sure. What would you like to know?", maxWords);
+  if (clean !== original) console.log("[RESPONSE_COMPRESSED]", original, "->", clean);
+  console.log("[TTS_OPTIMIZED]", clean.split(/\s+/).filter(Boolean).length);
+  return clean;
+}
+
 function cleanDirectAnswer(value: string, maxWords = 18) {
   let clean = value.replace(/\s+/g, " ").trim();
   const withoutArtifacts = clean
@@ -430,7 +447,28 @@ function getKbDirectAnswer(userSpeech: string, kbContext: ReturnType<typeof norm
   const speakableKb = getSpeakableKbContext(kbContext);
   console.log("[INTENT TYPE]", intentType);
 
-  if (["pricing", "location", "amenities", "configuration", "offers", "possession", "investment"].includes(intentType)) {
+  if (intentType === "pricing") {
+    const pricingSources: Array<[string, any]> = [
+      ["pricing", (speakableKb as any).pricing],
+      ["faqs", speakableKb.faqs],
+      ["offersPromotions", speakableKb.offersPromotions],
+    ];
+    for (const [sectionName, sectionValue] of pricingSources) {
+      const sectionText = collectKbText(sectionValue);
+      if (!sectionText.trim()) continue;
+      if (sectionName !== "pricing" && !/\b(price|pricing|cost|rate|amount|fee|charge)\b/i.test(sectionText)) continue;
+      console.log("[KB SECTION SELECTED]", sectionName);
+      const answer = cleanDirectAnswer(sectionText, 16);
+      console.log("[ANSWER SOURCE]", sectionName);
+      console.log("[KB DIRECT ANSWER]", sectionName, answer);
+      console.log("[GEMINI SKIPPED KB MATCH]");
+      return answer;
+    }
+    console.log("[WRONG MATCH BLOCKED]", "missing pricing/faqs pricing/offers pricing");
+    return "";
+  }
+
+  if (["location", "amenities", "configuration", "offers", "possession", "investment"].includes(intentType)) {
     const sectionName = intentToKBMap[intentType];
     const sectionValue = sectionName ? (speakableKb as any)[sectionName] : undefined;
     console.log("[KB SECTION SELECTED]", sectionName || intentType);
@@ -665,6 +703,7 @@ async function sendVobizAudio(ws: any, audioBuffer: Buffer, shouldContinue?: () 
     }
     if (shouldContinue && !shouldContinue()) {
       console.log("[AUDIO INTERRUPTED]");
+      console.log("[TTS_INTERRUPTED]");
       break;
     }
 
@@ -1830,7 +1869,6 @@ async function startServer() {
       if (weekday) return weekday;
       const explicitDate = t.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\b/i);
       if (explicitDate) return explicitDate[0];
-      if (/\b(morning|afternoon|evening)\b/i.test(t)) return t.match(/\b(morning|afternoon|evening)\b/i)?.[1] || "";
       return "";
     };
 
@@ -1863,10 +1901,16 @@ async function startServer() {
     };
 
     const buildAppointmentMemoryConfirmation = () => {
-      if (appointmentData.date && appointmentData.time) return `Got it. I'll arrange that for ${appointmentData.date} at ${appointmentData.time}.`;
-      if (appointmentData.time) return `Got it. I'll arrange that at ${appointmentData.time}.`;
-      if (appointmentData.date) return `Got it. I'll arrange that for ${appointmentData.date}.`;
-      return "Got it. I'll arrange that.";
+      if (appointmentData.date && appointmentData.time) return `Got it. ${appointmentData.date} at ${appointmentData.time}.`;
+      if (appointmentData.time) return `Got it. At ${appointmentData.time}.`;
+      if (appointmentData.date) return `Got it. For ${appointmentData.date}.`;
+      return "Got it.";
+    };
+
+    const buildAppointmentPromptForMissingInfo = () => {
+      if (appointmentData.date && !appointmentData.time) return "What time works for you?";
+      if (appointmentData.time && !appointmentData.date) return "Which day works for you?";
+      return "Sure. What time works for you?";
     };
 
     const getMaxWordsForStage = () => 14;
@@ -2427,7 +2471,7 @@ async function startServer() {
       if (activeStage === "hook") return { reply: applyGreetingPlaceholders(getOpeningHook(kb), callData, kb), nextStage: "pitch" as ConversationStage };
       if (activeStage === "pitch") return { reply: applyGreetingPlaceholders(getMainPitch(kb), callData, kb), nextStage: "qualification" as ConversationStage };
       if (activeStage === "qualification") return { reply: askNextQualificationQuestion(callData, kb), nextStage: "qualification" as ConversationStage };
-      if (activeStage === "appointment") return { reply: "Sure, I can help with that. What day and time works for you?", nextStage: "appointment" as ConversationStage };
+      if (activeStage === "appointment") return { reply: buildAppointmentPromptForMissingInfo(), nextStage: "appointment" as ConversationStage };
       if (activeStage === "closing") return { reply: buildClosingLine(callData, kb), nextStage: "ended" as ConversationStage };
       return { reply: "", nextStage: activeStage };
     };
@@ -2445,7 +2489,8 @@ async function startServer() {
       return getStageReply(stage, callData, kb);
     };
 
-    const missingKbAnswerFallback = "I don't have exact details right now, but our team can share that with you.";
+    const missingKbAnswerFallback = "Our team can share exact details.";
+    const pricingFallback = "Pricing depends on configuration and availability, but our team can share exact details.";
 
     type NextAction = "answer_from_kb" | "ask_next_question" | "clarify" | "fallback" | "end_call";
 
@@ -2629,7 +2674,7 @@ async function startServer() {
         console.log("[DECISION: FALLBACK]");
         console.log("[DIRECT QUESTION HANDLED]");
         console.log("[RETURNING TO STAGE]", conversationStage);
-        return decision(missingKbAnswerFallback, conversationStage, false, 14);
+        return decision(detectIntentType(transcript) === "pricing" ? pricingFallback : missingKbAnswerFallback, conversationStage, false, 14);
       };
 
       const decision = async (reply: string, nextStage: ConversationStage, needsGemini = false, maxWords = 10) => {
@@ -2723,6 +2768,18 @@ async function startServer() {
       const stageConfirmationDecision = advanceScriptAfterConfirmation();
       if (stageConfirmationDecision) return stageConfirmationDecision;
 
+      if (conversationStage === "appointment" && (hasDateExpression(transcript) || hasTimeExpression(transcript))) {
+        console.log("[APPOINTMENT_CONTEXT_MATCH]", transcript);
+        updateAppointmentData(transcript);
+        console.log("[SCHEDULING_DATA_CAPTURED]", JSON.stringify(appointmentData));
+        if (appointmentData.date && appointmentData.time) {
+          appointmentData.confirmed = true;
+          console.log("[SCHEDULING CONFIRMED]", JSON.stringify(appointmentData));
+          return decision(buildAppointmentMemoryConfirmation(), "post_qualification", false, 10);
+        }
+        return decision(buildAppointmentPromptForMissingInfo(), "appointment", false, 8);
+      }
+
       const contextualDecision = await handleContextualInput();
       if (contextualDecision) return contextualDecision;
 
@@ -2785,7 +2842,7 @@ async function startServer() {
           console.log("[DECISION: ASK_NEXT]");
           console.log("[APPOINTMENT TRIGGERED]");
           console.log("[GEMINI SKIPPED]");
-          return decision("Sure, I can help with that. What day and time works for you?", "appointment", false, 14);
+          return decision(buildAppointmentPromptForMissingInfo(), "appointment", false, 10);
         }
         if (isContinueInfoRequest(transcript)) {
           console.log("[DECISION: CLARIFY]");
@@ -2796,7 +2853,7 @@ async function startServer() {
           console.log("[DECISION: ASK_NEXT]");
           console.log("[APPOINTMENT TRIGGERED]");
           console.log("[GEMINI SKIPPED]");
-          return decision("Sure, I can help with that. What day and time works for you?", "appointment", false, 14);
+          return decision(buildAppointmentPromptForMissingInfo(), "appointment", false, 10);
         }
         console.log("[DECISION: CLARIFY]");
         console.log("[APPOINTMENT DEFERRED]");
@@ -2825,7 +2882,7 @@ async function startServer() {
           return decision("Sure, what would you like to know?", "appointment", false, 14);
         }
         console.log("[GEMINI SKIPPED]");
-        return decision("Sure, I can help with that. What day and time works for you?", "appointment", false, 14);
+        return decision(buildAppointmentPromptForMissingInfo(), "appointment", false, 10);
       }
 
       if (intent === "appointment") {
@@ -2838,7 +2895,7 @@ async function startServer() {
           return decision(buildAppointmentMemoryConfirmation(), "post_qualification", false, 12);
         }
         console.log("[GEMINI SKIPPED]");
-        return decision("Sure, I can help with that. What day and time works for you?", "appointment", false, 14);
+        return decision(buildAppointmentPromptForMissingInfo(), "appointment", false, 10);
       }
 
       if (conversationStage === "availability") {
@@ -3035,13 +3092,14 @@ async function startServer() {
       console.log("[GREETING FINAL]", greetingText);
       conversationStage = "greeting";
       console.log("[STAGE FLOW]", conversationStage);
-      const greetingAudio = await timedStep("TTS", () => fetchTtsAudio(greetingText, ownerId));
+      const optimizedGreetingText = compressReplyForLiveCall(greetingText, 16);
+      const greetingAudio = await timedStep("TTS", () => fetchTtsAudio(optimizedGreetingText, ownerId));
       if (isEnded()) return;
 
       if (greetingAudio) {
         playbackInterrupted = false;
         await timedStep("audio send", () => sendVobizAudio(ws, greetingAudio, () => !playbackInterrupted));
-        await appendTranscript("AI", greetingText);
+        await appendTranscript("AI", optimizedGreetingText);
         greetingDelivered = true;
         markCompletedStage("greeting");
         conversationStage = "availability";
@@ -3092,6 +3150,7 @@ async function startServer() {
       const transcript = normalizeSttTranscript(stt.transcript || "");
       if (!transcript || !isBargeInPhrase(transcript)) return;
       console.log("[BARGE IN DETECTED]", transcript);
+      console.log("[USER_INTERRUPT_DETECTED]", transcript);
       playbackInterrupted = true;
       pendingBargeInAudio = audioBuffer;
       state = "LISTENING";
@@ -3218,6 +3277,7 @@ async function startServer() {
           console.log("[REPLY WORD COUNT]", reply.split(/\s+/).filter(Boolean).length);
         }
         reply = cleanFinalResponse(reply, "Sure, what would you like to know?", shouldTrimReply ? replyMaxWords : 60);
+        reply = compressReplyForLiveCall(reply, Math.min(16, Math.max(8, replyMaxWords || 10)));
 
         console.log("[GEMINI OUTPUT]", reply);
         console.log("[GEMINI FINAL REPLY]", reply);
@@ -3225,7 +3285,7 @@ async function startServer() {
         console.log("[CONVERSATION STAGE]", conversationStage);
         if (isEnded()) return;
 
-        const aiReply = sanitizeOutboundReply(reply);
+        const aiReply = sanitizeOutboundReply(compressReplyForLiveCall(reply, 16));
         conversationHistory.push({ role: "user", text: transcript });
         conversationHistory.push({ role: "assistant", text: aiReply });
         lastTranscript = transcript.trim().toLowerCase();
