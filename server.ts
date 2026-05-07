@@ -1885,6 +1885,9 @@ async function startServer() {
     let lastTranscript = "";
     let lastAiReply = "";
     let heldTranscript = "";
+    let pendingPartialTranscript = "";
+    let pendingPartialTranscriptAt = 0;
+    const aiReplyHistory: string[] = [];
     let turnInProgress = false;
     let callCompletedLogged = false;
     let greetingDelivered = false;
@@ -2331,6 +2334,57 @@ async function startServer() {
         "i need your",
         "before can",
       ].some((phrase) => normalized === phrase || normalized.endsWith(` ${phrase}`));
+    };
+
+    const isClearShortCommand = (text: string) => {
+      const normalized = normalizeTurnText(text);
+      return /^(yes|yeah|yep|no|nope|repeat|busy|call later|not interested|stop calling|stop|go ahead|continue|okay|ok)$/.test(normalized) ||
+        /\b(not interested|stop calling|call later|dont call|don't call)\b/i.test(text);
+    };
+
+    const isLikelyCurrentStageIntent = (text: string) => {
+      const normalized = normalizeTurnText(text);
+      if (!normalized) return false;
+      if (conversationStage === "appointment") return Boolean(extractCallbackTime(text) || hasDateExpression(text) || hasTimeExpression(text));
+      if (conversationStage === "qualification") return isValidQualificationAnswer(text, lastQuestion || "");
+      if (["availability", "permission", "hook", "pitch"].includes(conversationStage)) return isContinuationIntent(text) || isPositiveResponse(text);
+      return detectIntentType(text) !== "general_question" || isIdentityQuestion(text) || isPurposeQuestion(text);
+    };
+
+    const isIncompleteSpeechFragment = (text: string, confidence = 1) => {
+      const normalized = normalizeTurnText(text);
+      if (!normalized || isClearShortCommand(text) || isDisinterestIntent(text)) return false;
+      const usefulWords = normalized
+        .split(" ")
+        .filter((word) => word && !["hello", "hi", "hey", "okay", "ok", "yeah", "yes", "thank", "thanks", "you"].includes(word));
+      if (confidence < 0.6 && usefulWords.length < 4) {
+        console.log("[LOW_CONFIDENCE_SHORT_TURN_HELD]", text, "confidence=", confidence);
+        return true;
+      }
+      if (usefulWords.length < 3 && confidence < 0.85) return true;
+      if ([
+        "im looking",
+        "i am looking",
+        "im interested in",
+        "i am interested in",
+        "i want",
+        "i want to",
+        "i am not",
+        "im not",
+        "i have to",
+        "looking for",
+        "interested in",
+        "want to know",
+        "can you",
+        "what is",
+        "tell me",
+        "go ahead and",
+      ].some((phrase) => normalized === phrase || normalized.endsWith(` ${phrase}`))) {
+        return true;
+      }
+      if (normalized === "temp fuse") return true;
+      if (normalized === "know why" && confidence < 0.6) return true;
+      return usefulWords.length > 0 && usefulWords.length <= 2 && confidence < 0.85 && !isLikelyCurrentStageIntent(text);
     };
 
     const isLowConfidenceAllowed = (text: string) => Boolean(extractCallbackTime(text));
@@ -2916,6 +2970,26 @@ async function startServer() {
         return /\b(product|service|business|details|detail|available|feature|features|not interested|expensive|busy)\b/i.test(t);
       };
 
+      const getContextualRepeatPrompt = () => {
+        const pendingPrompt = getCurrentPendingPrompt(callData, kb);
+        const normalizedPending = normalizeTurnText(pendingPrompt || lastQuestion || "");
+        let prompt = "Could you say that once more?";
+        if (conversationStage === "availability") {
+          prompt = "I just wanted to check if this is a good time for a quick call.";
+        } else if (conversationStage === "permission") {
+          prompt = "Is this a good time for a quick call?";
+        } else if (conversationStage === "pitch") {
+          prompt = "Shall I quickly explain why I called?";
+        } else if (conversationStage === "qualification" && (normalizedPending.includes("configuration") || normalizedPending.includes("bhk"))) {
+          prompt = "Do you mean 1, 2, or 3 BHK?";
+        } else if (conversationStage === "qualification" && pendingPrompt) {
+          prompt = pendingPrompt;
+        }
+        console.log("[GENERIC_REPEAT_REPLACED]");
+        console.log("[CONTEXTUAL_REPEAT_USED]", prompt);
+        return renderForConversationLanguage(prompt);
+      };
+
       const handleContextualInput = async () => {
         if (isGenericGreetingInput(transcript)) {
           console.log("[KB_SEARCH_SKIPPED_LOW_CONFIDENCE]");
@@ -2931,7 +3005,7 @@ async function startServer() {
           console.log("[KB_SEARCH_SKIPPED_LOW_CONFIDENCE]");
           console.log("[INCOMPLETE_INPUT_CLARIFIED]", transcript);
           console.log("[STAGE_PRESERVED]", conversationStage);
-          return decision(preferredLanguage === "Hindi" || preferredLanguage === "Hinglish" ? "Samajh nahi aaya." : "Please repeat.", conversationStage, false, 6);
+          return decision(getContextualRepeatPrompt(), conversationStage, false, 8);
         }
 
         if (isGenericContinueInput(transcript)) {
@@ -2952,7 +3026,7 @@ async function startServer() {
           console.log("[INTENT_CONFIDENCE_LOW]");
           console.log("[KB_SEARCH_BLOCKED]");
           console.log("[STAGE_PRESERVED]", conversationStage);
-          return decision(preferredLanguage === "Hindi" || preferredLanguage === "Hinglish" ? "Samajh nahi aaya." : "Please repeat.", conversationStage, false, 6);
+          return decision(getContextualRepeatPrompt(), conversationStage, false, 8);
         }
         console.log("[KB_SEARCH_ALLOWED]");
         if (conversationStage === "appointment") {
@@ -3018,6 +3092,24 @@ async function startServer() {
             finalReply = "Please continue.";
           }
         }
+        const normalizedFinalReply = normalizeTurnText(finalReply);
+        const repeatFallback = /\b(please repeat|could you say that once more|samajh nahi aaya)\b/i.test(finalReply);
+        const repeatedReply = normalizedFinalReply && aiReplyHistory.filter((item) => normalizeTurnText(item) === normalizedFinalReply).length >= 1;
+        if ((repeatFallback || repeatedReply) && aiReplyHistory.length >= 1) {
+          console.log("[REPEAT_LOOP_BLOCKED]");
+          const contextualPrompt = getContextualRepeatPrompt();
+          if (normalizeTurnText(contextualPrompt) !== normalizedFinalReply) {
+            finalReply = contextualPrompt;
+          } else {
+            const nextStageReply = getNextUnfinishedStageReply(callData, kb);
+            finalReply = nextStageReply.reply || "Could you say that once more?";
+            nextStage = nextStageReply.nextStage || nextStage;
+          }
+        }
+        if (finalReply.trim()) {
+          aiReplyHistory.push(finalReply);
+          if (aiReplyHistory.length > 3) aiReplyHistory.shift();
+        }
         lastAckReply = finalReply;
         pendingCompletedStage = !needsGemini && nextStage !== previousStage ? previousStage : null;
         if (nextStage !== conversationStage) moveStage(nextStage);
@@ -3050,6 +3142,16 @@ async function startServer() {
 
       if (detectLanguageRequest(transcript)) {
         return handleLanguageSwitch(transcript);
+      }
+
+      const isChannelCheckDuringQualification = (value: string) =>
+        conversationStage === "qualification" &&
+        /\b(hello|thank you|thanks|are you there|can you hear me)\b/i.test(value);
+
+      if (isChannelCheckDuringQualification(transcript)) {
+        console.log("[CHANNEL_CHECK_DETECTED]", transcript);
+        console.log("[QUALIFICATION_PROMPT_RESUMED]");
+        return decision("Yes, I'm here. Are you looking for self-use or investment?", conversationStage, false, 10);
       }
 
       const advanceScriptAfterConfirmation = () => {
@@ -3624,8 +3726,31 @@ async function startServer() {
         const confidence = typeof stt.confidence === "number" ? stt.confidence : 0;
         const lowConfidenceWithoutTime = confidence < 0.65 && !isLowConfidenceAllowed(transcript);
 
+        if (pendingPartialTranscript) {
+          const partialAgeMs = Date.now() - pendingPartialTranscriptAt;
+          if (partialAgeMs <= 2000) {
+            transcript = `${pendingPartialTranscript} ${transcript}`.trim();
+            console.log("[PARTIAL_TRANSCRIPT_MERGED]", transcript);
+          }
+          pendingPartialTranscript = "";
+          pendingPartialTranscriptAt = 0;
+          console.log("[PARTIAL_TRANSCRIPT_CLEARED]");
+        }
+
+        if (isIncompleteSpeechFragment(transcript, confidence)) {
+          pendingPartialTranscript = transcript;
+          pendingPartialTranscriptAt = Date.now();
+          console.log("[TURN_HELD_INCOMPLETE_FRAGMENT]", transcript, "confidence=", confidence);
+          console.log("[PARTIAL_TRANSCRIPT_BUFFERED]", pendingPartialTranscript);
+          state = "LISTENING";
+          return;
+        }
+
         if (isVaguePartialTranscript(transcript)) {
+          pendingPartialTranscript = transcript;
+          pendingPartialTranscriptAt = Date.now();
           console.log("[TURN HELD] incomplete phrase");
+          console.log("[PARTIAL_TRANSCRIPT_BUFFERED]", pendingPartialTranscript);
           state = "LISTENING";
           return;
         }
@@ -3633,12 +3758,17 @@ async function startServer() {
         if (heldTranscript) {
           transcript = `${heldTranscript} ${transcript}`.trim();
           heldTranscript = "";
+          console.log("[PARTIAL_TRANSCRIPT_MERGED]", transcript);
+          console.log("[PARTIAL_TRANSCRIPT_CLEARED]");
         }
 
         const normalizedTranscript = normalizeTurnText(transcript);
         if (isIncompletePhrase(normalizedTranscript)) {
           heldTranscript = transcript;
+          pendingPartialTranscript = transcript;
+          pendingPartialTranscriptAt = Date.now();
           console.log("[TURN HELD] incomplete phrase");
+          console.log("[PARTIAL_TRANSCRIPT_BUFFERED]", pendingPartialTranscript);
           state = "LISTENING";
           return;
         }
