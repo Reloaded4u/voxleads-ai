@@ -1057,6 +1057,7 @@ type TranscriptEntry = {
 
 const liveCallTranscriptBuffers = new Map<string, TranscriptEntry[]>();
 const endedVobizCallIds = new Set<string>();
+const finalizedCalls = new Set<string>();
 
 function formatTranscriptEntries(entries: TranscriptEntry[]) {
   return entries
@@ -1149,12 +1150,23 @@ async function generateServerCallSummary(transcriptText: string, kb: any) {
 
 async function finalizeCallSummaryFromTranscript(callId: string, transcriptTextFromMemory = "") {
   if (!callId) return;
+  if (finalizedCalls.has(callId)) {
+    console.log("[CALL_END_ALREADY_FINALIZED]", callId);
+    return;
+  }
 
   const callRef = db.collection("calls").doc(callId);
   const callSnap = await callRef.get();
   if (!callSnap.exists) return;
 
   const callData = callSnap.data() || {};
+  if (callData.finalized === true) {
+    finalizedCalls.add(callId);
+    console.log("[CALL_END_ALREADY_FINALIZED]", callId);
+    return;
+  }
+  finalizedCalls.add(callId);
+  console.log("[CALL_END_FINALIZE_ONCE]", callId);
   const transcriptText = (
     transcriptTextFromMemory ||
     callData.transcriptText ||
@@ -1215,6 +1227,7 @@ async function finalizeCallSummaryFromTranscript(callId: string, transcriptTextF
     nextAction: result.nextAction,
     detailedAnalysis: result.summary,
     analysisStatus: "completed",
+    finalized: true,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   }));
   console.log("[SUMMARY SAVED]", callId);
@@ -1923,6 +1936,7 @@ async function startServer() {
     let preferredLanguage = "English";
     let lastQuestion = "";
     let lastQualificationClarification = "";
+    let lastQualificationAnswerAccepted = false;
     let lastAckReply = "";
     let pendingCompletedStage: ConversationStage | null = null;
     const completedStages = new Set<ConversationStage>();
@@ -2507,6 +2521,60 @@ async function startServer() {
       return buildSchedulingQuestion(callData, kb);
     };
 
+    const inferQualificationField = (questionText: string) => {
+      const q = normalizeTurnText(questionText);
+      if (/\b(self use|self-use|investment|purpose|intent)\b/i.test(q)) return "purpose";
+      if (/\b(configuration|bhk|option|package|service|plan|product)\b/i.test(q)) return "configuration";
+      if (/\b(budget|price range|range|pricing|cost)\b/i.test(q)) return "budget";
+      if (/\b(timeline|when|planning|plan to|looking to)\b/i.test(q)) return "timeline";
+      return "";
+    };
+
+    const getRequiredQualificationFields = (kb: any) => {
+      const questions = getQualificationQuestions(kb);
+      const fields = new Map<string, number>();
+      questions.forEach((question, index) => {
+        const field = inferQualificationField(question.text);
+        if (field && !fields.has(field)) fields.set(field, index);
+      });
+      return fields;
+    };
+
+    const getStoredQualificationFields = (kb: any) => {
+      const questions = getQualificationQuestions(kb);
+      const fields = new Set<string>();
+      Object.entries(leadData.answers).forEach(([index, answer]) => {
+        const field = inferQualificationField(questions[Number(index)]?.text || "");
+        if (field && String(answer || "").trim()) fields.add(field);
+      });
+      return fields;
+    };
+
+    const getFirstMissingQualificationIndex = (kb: any) => {
+      const required = getRequiredQualificationFields(kb);
+      const stored = getStoredQualificationFields(kb);
+      for (const [field, index] of required.entries()) {
+        if (!stored.has(field)) return { field, index };
+      }
+      return null;
+    };
+
+    const hasCompletedRequiredQualification = (_callData: any, kb: any) => {
+      const required = getRequiredQualificationFields(kb);
+      const stored = getStoredQualificationFields(kb);
+      console.log("[QUALIFICATION_COMPLETE_CHECK]");
+      console.log("[QUALIFICATION_REQUIRED_FIELDS]", Array.from(required.keys()).join(",") || "none");
+      console.log("[QUALIFICATION_STORED_FIELDS]", Array.from(stored.keys()).join(",") || "none");
+      for (const field of required.keys()) {
+        if (!stored.has(field)) {
+          console.log("[QUALIFICATION_COMPLETE_FALSE]");
+          return false;
+        }
+      }
+      console.log("[QUALIFICATION_COMPLETE_TRUE]");
+      return true;
+    };
+
     const askNextQualificationQuestion = (callData: any, kb: any) => {
       const questions = getQualificationQuestions(kb);
 
@@ -2518,6 +2586,18 @@ async function startServer() {
 
       const question = questions[currentQuestionIndex];
       if (!question) {
+        if (!hasCompletedRequiredQualification(callData, kb)) {
+          const missing = getFirstMissingQualificationIndex(kb);
+          if (missing) {
+            currentQuestionIndex = missing.index;
+            console.log("[QUALIFICATION_NOT_COMPLETE]");
+            console.log("[MISSING_QUALIFICATION_FIELD]", missing.field);
+            console.log("[RETURNING_TO_QUALIFICATION_INDEX]", currentQuestionIndex);
+            const pendingQuestion = questions[currentQuestionIndex];
+            qualificationStarted = true;
+            return renderForConversationLanguage(applyGreetingPlaceholders(pendingQuestion.text, callData, kb));
+          }
+        }
         moveStage("post_qualification");
         console.log("[APPOINTMENT DEFERRED]");
         console.log("[STAGE FLOW]", conversationStage);
@@ -2566,6 +2646,7 @@ async function startServer() {
     };
 
     const storeQualificationAnswer = (transcript: string, questionText = "") => {
+      lastQualificationAnswerAccepted = false;
       if (!qualificationStarted) return false;
       const clean = normalizeUserInput(transcript);
       const normalizedAnswer = normalizeTurnText(clean);
@@ -2574,6 +2655,7 @@ async function startServer() {
         console.log("[QUALIFICATION_VALIDATION_FAILED]", transcript);
         console.log("[INVALID_ANSWER_REJECTED]", transcript);
         console.log("[QUALIFICATION_INDEX_PRESERVED]", currentQuestionIndex);
+        console.log("[ADVANCE_BLOCKED_INVALID_ANSWER]");
         return false;
       }
 
@@ -2585,6 +2667,7 @@ async function startServer() {
           console.log("[QUALIFICATION QUESTION SKIPPED]", currentQuestionIndex);
           currentQuestionIndex += 1;
         }
+        lastQualificationAnswerAccepted = true;
         return true;
       }
 
@@ -2597,6 +2680,7 @@ async function startServer() {
       console.log("[ANSWER STORED]", currentQuestionIndex, clean);
       console.log("[LEAD MEMORY UPDATED]", currentQuestionIndex, "->", clean);
       currentQuestionIndex += 1;
+      lastQualificationAnswerAccepted = true;
       return true;
     };
 
@@ -3119,6 +3203,46 @@ async function startServer() {
         return decision(buildClosingLine(callData, kb), "closing", false, 14);
       }
 
+      const looksLikeQualificationAnswer = (value: string) => {
+        const t = normalizeTurnText(value);
+        return /\b(investment|invest|self[ -]?use|own use|personal use|both|bhk|bedroom|one two|one, two|\d+\s*bhk|lakh|lac|crore|budget|range|around|under|between|next month|this month|soon|later|immediately)\b/i.test(t);
+      };
+
+      const buildPostQualificationClarification = (field: string, input = "") => {
+        console.log("[POST_QUALIFICATION_CONTEXTUAL_CLARIFY]", field, input);
+        if (field === "configuration") return "Could you clarify your preferred option?";
+        if (field === "budget") return "Do you mean around 1.2 crore, or another budget range?";
+        if (field === "timeline") return "Do you mean you are planning next month?";
+        return "Could you clarify your preferred option?";
+      };
+
+      if (conversationStage === "post_qualification" && looksLikeQualificationAnswer(transcript)) {
+        console.log("[LATE_QUALIFICATION_ANSWER_DETECTED]", transcript);
+        const missing = getFirstMissingQualificationIndex(kb);
+        if (missing) {
+          currentQuestionIndex = missing.index;
+          console.log("[RETURNING_TO_MISSING_QUALIFICATION]", missing.field);
+          const questionText = getQualificationQuestions(kb)[currentQuestionIndex]?.text || "";
+          if (isValidQualificationAnswer(transcript, questionText)) {
+            qualificationStarted = true;
+            if (storeQualificationAnswer(transcript, questionText)) {
+              console.log("[LATE_QUALIFICATION_STORED]", missing.field);
+              if (hasCompletedRequiredQualification(callData, kb)) {
+                moveStage("post_qualification");
+              } else {
+                const nextMissing = getFirstMissingQualificationIndex(kb);
+                if (nextMissing) {
+                  currentQuestionIndex = nextMissing.index;
+                  return decision(askNextQualificationQuestion(callData, kb), "qualification", false, 8);
+                }
+              }
+            }
+          } else {
+            return decision(buildPostQualificationClarification(missing.field, transcript), "qualification", false, 8);
+          }
+        }
+      }
+
       if (conversationStage === "post_qualification") {
         if (routedIntent === "scheduling_request") {
           updateAppointmentData(transcript);
@@ -3231,6 +3355,11 @@ async function startServer() {
           return decision("Sure, what would you like to know?", conversationStage, false, 14);
         }
         if (qualificationStarted && !storeQualificationAnswer(transcript, getCurrentPendingPrompt(callData, kb))) {
+          return decision(buildQualificationClarification(transcript), conversationStage, false, 8);
+        }
+        if (lastQualificationAnswerAccepted !== true) {
+          console.log("[ADVANCE_BLOCKED_INVALID_ANSWER]");
+          console.log("[QUALIFICATION_INDEX_PRESERVED]", currentQuestionIndex);
           return decision(buildQualificationClarification(transcript), conversationStage, false, 8);
         }
         const nextQuestionReply = askNextQualificationQuestion(callData, kb);
