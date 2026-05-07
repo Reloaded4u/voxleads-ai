@@ -1973,14 +1973,15 @@ async function startServer() {
     const isLanguageRequest = (text: string) => {
       const t = normalizeTurnText(text);
       return (
-        /\b(hindi|english|marathi|tamil|telugu|kannada|malayalam|gujarati|punjabi|bengali|language)\b/i.test(t) &&
-        /\b(talk|speak|baat|bolo|bol|can you|could you|nahi aati|mein|me)\b/i.test(t)
-      ) || /\bmujhe english nahi aati\b/i.test(t);
+        /\b(hindi|english|hinglish|marathi|tamil|telugu|kannada|malayalam|gujarati|punjabi|bengali|language)\b/i.test(t) &&
+        /\b(talk|speak|baat|baat karo|baat kariye|bolo|boliye|bol|can you|could you|nahi aati|mein|me)\b/i.test(t)
+      ) || /\b(hindi me|hindi mein|hindi bolo|hindi boliye|hindi baat|hindi mein baat karo|hindi me baat kariye|hinglish|english mein|english me|mujhe english nahi aati)\b/i.test(t);
     };
 
     const getRequestedLanguage = (text: string) => {
       const t = normalizeTurnText(text);
       if (/\bhindi\b/i.test(t)) return "Hindi";
+      if (/\bhinglish\b/i.test(t)) return "Hinglish";
       if (/\bmarathi\b/i.test(t)) return "Marathi";
       if (/\benglish\b/i.test(t)) return "English";
       if (/\btamil\b/i.test(t)) return "Tamil";
@@ -2343,7 +2344,21 @@ async function startServer() {
 
     const buildLanguageReply = () => {
       console.log("[ANSWER SOURCE]", "language handler");
-      return "Yes, I can continue in that language.";
+      if (preferredLanguage === "Hindi" || preferredLanguage === "Hinglish") return "Ji, boliye.";
+      return "Please go ahead.";
+    };
+
+    const renderForConversationLanguage = (text: string) => {
+      if (!text) return text;
+      if (preferredLanguage !== "Hindi" && preferredLanguage !== "Hinglish") return text;
+      const normalized = normalizeTurnText(text);
+      if (normalized.includes("self use") && normalized.includes("investment")) return "Self use ke liye ya investment?";
+      if (normalized.includes("configuration")) return "Aapko kaunsa configuration chahiye?";
+      if (normalized.includes("location") || normalized.includes("where")) return "Aapki preferred location kya hai?";
+      if (normalized.includes("time") || normalized.includes("day")) return "Kaunsa time theek rahega?";
+      if (normalized.includes("good time") || normalized.includes("quick call")) return "Kya abhi baat kar sakte hain?";
+      if (normalized.includes("explain")) return "Main short mein explain karun?";
+      return text;
     };
 
     const getCurrentPendingPrompt = (callData: any, kb: any) => {
@@ -2354,7 +2369,7 @@ async function startServer() {
       if (conversationStage === "qualification") {
         const questions = getQualificationQuestions(kb);
         return questions[currentQuestionIndex]?.text
-          ? applyGreetingPlaceholders(questions[currentQuestionIndex].text, callData, kb)
+          ? renderForConversationLanguage(applyGreetingPlaceholders(questions[currentQuestionIndex].text, callData, kb))
           : "";
       }
       if (conversationStage === "appointment" && !appointmentPromptDelivered) return buildSchedulingQuestion(callData, kb);
@@ -2389,13 +2404,15 @@ async function startServer() {
 
       qualificationStarted = true;
       console.log("[QUESTION ASKED]", currentQuestionIndex, question.id, question.text);
-      return applyGreetingPlaceholders(question.text, callData, kb);
+      return renderForConversationLanguage(applyGreetingPlaceholders(question.text, callData, kb));
     };
 
     function normalizeUserInput(text: string) {
       const t = text.toLowerCase();
 
       if (t.includes("selfie")) return "self-use";
+      if (/\bself\s*use\b/i.test(t)) return "self_use";
+      if (/\b3\s*bhk|three\s*bhk|c\s*bhk|cbhk|free\s*bhk\b/i.test(t)) return "3bhk";
       if (t.includes("investment")) return "investment";
 
       return text;
@@ -2592,8 +2609,40 @@ async function startServer() {
           .split(" ")
           .filter((word) => word && !["hello", "hi", "hey", "yeah", "yes", "okay", "ok", "go", "ahead", "please"].includes(word)).length;
 
+      const isContextualShortAnswer = (value: string) => {
+        const t = normalizeTurnText(value);
+        if (!t) return false;
+        if (conversationStage === "appointment" && (hasDateExpression(value) || hasTimeExpression(value))) {
+          console.log("[QUESTION_CONTEXT_MATCH]", "appointment");
+          return true;
+        }
+        if (conversationStage !== "qualification") return false;
+        const words = t.split(" ").filter(Boolean);
+        if (words.length > 4) return false;
+        const context = normalizeTurnText(`${lastQuestion} ${lastAiReply} ${getCurrentPendingPrompt(callData, kb)}`);
+        if (!context) return false;
+        if ((context.includes("self use") || context.includes("investment")) && /\b(self use|self|investment|invest)\b/i.test(t)) {
+          console.log("[QUESTION_CONTEXT_MATCH]", "self_use_or_investment");
+          return true;
+        }
+        if ((context.includes("configuration") || context.includes("config")) && /\b(\d+\s*bhk|bhk|cbhk|c bhk|three bhk|one|two|three|four)\b/i.test(t)) {
+          console.log("[QUESTION_CONTEXT_MATCH]", "configuration");
+          return true;
+        }
+        if ((context.includes("location") || context.includes("where")) && /^[a-z ]{2,30}$/i.test(t)) {
+          console.log("[QUESTION_CONTEXT_MATCH]", "location");
+          return true;
+        }
+        if (currentQuestionIndex >= 0 && words.length > 0) {
+          console.log("[QUESTION_CONTEXT_MATCH]", "qualification");
+          return true;
+        }
+        return false;
+      };
+
       const isIncompleteUserInput = (value: string) => {
         const t = normalizeTurnText(value);
+        if (isContextualShortAnswer(value)) return false;
         if (["what", "why", "how", "where", "who", "are you", "why do", "what was", "what is", "can you"].includes(t)) return true;
         return meaningfulWordCount(value) > 0 && meaningfulWordCount(value) < 3 && detectIntentType(value) === "general_question";
       };
@@ -2622,7 +2671,7 @@ async function startServer() {
           console.log("[KB_SEARCH_SKIPPED_LOW_CONFIDENCE]");
           console.log("[INCOMPLETE_INPUT_CLARIFIED]", transcript);
           console.log("[STAGE_PRESERVED]", conversationStage);
-          return decision("Sorry, could you repeat that?", conversationStage, false, 8);
+          return decision(preferredLanguage === "Hindi" || preferredLanguage === "Hinglish" ? "Samajh nahi aaya." : "Please repeat.", conversationStage, false, 6);
         }
 
         if (isGenericContinueInput(transcript)) {
@@ -2643,7 +2692,7 @@ async function startServer() {
           console.log("[INTENT_CONFIDENCE_LOW]");
           console.log("[KB_SEARCH_BLOCKED]");
           console.log("[STAGE_PRESERVED]", conversationStage);
-          return decision("Sorry, could you repeat that?", conversationStage, false, 8);
+          return decision(preferredLanguage === "Hindi" || preferredLanguage === "Hinglish" ? "Samajh nahi aaya." : "Please repeat.", conversationStage, false, 6);
         }
         console.log("[KB_SEARCH_ALLOWED]");
         if (conversationStage === "appointment") {
@@ -2720,6 +2769,7 @@ async function startServer() {
       const handleLanguageSwitch = (userText: string) => {
         console.log("[LANGUAGE REQUEST DETECTED]", userText);
         preferredLanguage = getRequestedLanguage(userText);
+        console.log("[CONVERSATION LANGUAGE]", preferredLanguage);
         console.log("[PREFERRED LANGUAGE SET]", preferredLanguage);
         console.log("[LANGUAGE SWITCH]", preferredLanguage);
         console.log("[GEMINI SKIPPED]");
@@ -2768,6 +2818,13 @@ async function startServer() {
       const stageConfirmationDecision = advanceScriptAfterConfirmation();
       if (stageConfirmationDecision) return stageConfirmationDecision;
 
+      if (conversationStage === "qualification" && isContextualShortAnswer(transcript)) {
+        console.log("[CONTEXTUAL_SHORT_ANSWER_ACCEPTED]", transcript);
+        storeQualificationAnswer(transcript);
+        const nextQuestionReply = askNextQualificationQuestion(callData, kb);
+        return decision(nextQuestionReply, conversationStage, false, 8);
+      }
+
       if (conversationStage === "appointment" && (hasDateExpression(transcript) || hasTimeExpression(transcript))) {
         console.log("[APPOINTMENT_CONTEXT_MATCH]", transcript);
         updateAppointmentData(transcript);
@@ -2809,6 +2866,7 @@ async function startServer() {
       if (routedIntent === "language_request") {
         console.log("[LANGUAGE REQUEST DETECTED]", transcript);
         preferredLanguage = getRequestedLanguage(transcript);
+        console.log("[CONVERSATION LANGUAGE]", preferredLanguage);
         console.log("[PREFERRED LANGUAGE SET]", preferredLanguage);
         console.log("[LANGUAGE SWITCH]", preferredLanguage);
         console.log("[GEMINI SKIPPED]");
@@ -3151,6 +3209,7 @@ async function startServer() {
       if (!transcript || !isBargeInPhrase(transcript)) return;
       console.log("[BARGE IN DETECTED]", transcript);
       console.log("[USER_INTERRUPT_DETECTED]", transcript);
+      console.log("[USER_BARGE_IN]", transcript);
       playbackInterrupted = true;
       pendingBargeInAudio = audioBuffer;
       state = "LISTENING";
