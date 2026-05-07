@@ -367,8 +367,23 @@ function compressReplyForLiveCall(value: string, maxWords = 16) {
   return clean;
 }
 
+function stripFaqQuestionText(value: string) {
+  const original = String(value || "").replace(/\s+/g, " ").trim();
+  let clean = original
+    .replace(/^\s*Q\s*[:\-]\s*/i, "")
+    .replace(/\s+A\s*[:\-]\s*/i, " ")
+    .replace(/^\s*(what is|what are|can i|can we|how much|how many|where is|where are|which|do you|does it|is there|are there)[^?]{0,180}\?\s*/i, "")
+    .replace(/^\s*(what is|what are|can i|can we|how much|how many|where is|where are|which|do you|does it|is there|are there)[^.!?]{0,180}\s+/i, "");
+  clean = clean.replace(/^\s*[^.!?]{0,120}\s+\/\s+[^.!?]{0,120}\s+/i, "");
+  if (clean !== original) {
+    console.log("[FAQ_QUESTION_REMOVED]");
+    console.log("[FAQ_ANSWER_ONLY]", clean);
+  }
+  return clean.trim() || original;
+}
+
 function cleanDirectAnswer(value: string, maxWords = 18) {
-  let clean = value.replace(/\s+/g, " ").trim();
+  let clean = stripFaqQuestionText(value).replace(/\s+/g, " ").trim();
   const withoutArtifacts = clean
     .replace(/\b\d{8,}\b/g, "")
     .replace(/\s+/g, " ")
@@ -499,7 +514,7 @@ function getKbDirectAnswer(userSpeech: string, kbContext: ReturnType<typeof norm
       if (!sectionText.trim()) continue;
       if (sectionName !== "pricing" && !/\b(price|pricing|cost|rate|amount|fee|charge)\b/i.test(sectionText)) continue;
       console.log("[KB SECTION SELECTED]", sectionName);
-      const answer = cleanDirectAnswer(sectionText, 16);
+      const answer = cleanDirectAnswer(sectionText, 8);
       console.log("[ANSWER SOURCE]", sectionName);
       console.log("[KB DIRECT ANSWER]", sectionName, answer);
       console.log("[GEMINI SKIPPED KB MATCH]");
@@ -2496,11 +2511,37 @@ async function startServer() {
       return text;
     }
 
-    const storeQualificationAnswer = (transcript: string) => {
-      if (!qualificationStarted) return;
+    const isConfusionInput = (text: string) => {
+      const t = normalizeTurnText(text);
+      return /^(what|what\?|hello|hello\?|repeat|come again|who are you|what are you|who is this|please repeat)$/i.test(t);
+    };
+
+    const isValidQualificationAnswer = (answer: string, questionText = "") => {
+      const normalizedAnswer = normalizeTurnText(answer);
+      const question = normalizeTurnText(questionText || lastQuestion || lastAiReply);
+      if (!normalizedAnswer || isConfusionInput(normalizedAnswer) || isIdentityQuestion(normalizedAnswer) || normalizedAnswer.endsWith("?")) return false;
+      if (question.includes("configuration") || question.includes("bhk")) {
+        return /\b(\d+\s*bhk|1bhk|2bhk|3bhk|4bhk|one|two|three|four|studio)\b/i.test(normalizedAnswer);
+      }
+      if (question.includes("budget")) {
+        return /\b(\d+|lakh|lac|crore|cr|thousand|k|million|budget|around|approx)\b/i.test(normalizedAnswer);
+      }
+      if (question.includes("timeline") || question.includes("when")) {
+        return /\b(today|tomorrow|week|month|year|immediately|soon|later|morning|afternoon|evening|\d{1,2}\s*(am|pm)?)\b/i.test(normalizedAnswer);
+      }
+      return normalizedAnswer.split(" ").filter(Boolean).length <= 6;
+    };
+
+    const storeQualificationAnswer = (transcript: string, questionText = "") => {
+      if (!qualificationStarted) return false;
       const clean = normalizeUserInput(transcript);
       const normalizedAnswer = normalizeTurnText(clean);
-      if (!normalizedAnswer) return;
+      if (!normalizedAnswer) return false;
+      if (!isValidQualificationAnswer(clean, questionText)) {
+        console.log("[QUALIFICATION_VALIDATION_FAILED]", transcript);
+        console.log("[INVALID_ANSWER_REJECTED]", transcript);
+        return false;
+      }
 
       const duplicateIndex = Object.entries(leadData.answers)
         .find(([, answer]) => normalizeTurnText(String(answer)) === normalizedAnswer)?.[0];
@@ -2510,7 +2551,7 @@ async function startServer() {
           console.log("[QUALIFICATION QUESTION SKIPPED]", currentQuestionIndex);
           currentQuestionIndex += 1;
         }
-        return;
+        return true;
       }
 
       if (leadData.answers[currentQuestionIndex]) {
@@ -2522,6 +2563,7 @@ async function startServer() {
       console.log("[ANSWER STORED]", currentQuestionIndex, clean);
       console.log("[LEAD MEMORY UPDATED]", currentQuestionIndex, "->", clean);
       currentQuestionIndex += 1;
+      return true;
     };
 
     const stageOrder: ConversationStage[] = ["greeting", "availability", "permission", "hook", "pitch", "qualification", "post_qualification", "appointment", "closing", "ended"];
@@ -2735,7 +2777,7 @@ async function startServer() {
           console.log("[QUESTION_CONTEXT_MATCH]", "location");
           return true;
         }
-        if (currentQuestionIndex >= 0 && words.length > 0) {
+        if (currentQuestionIndex >= 0 && words.length > 0 && !isConfusionInput(t) && !t.endsWith("?")) {
           console.log("[QUESTION_CONTEXT_MATCH]", "qualification");
           return true;
         }
@@ -2745,7 +2787,7 @@ async function startServer() {
       const isIncompleteUserInput = (value: string) => {
         const t = normalizeTurnText(value);
         if (isContextualShortAnswer(value)) return false;
-        if (["what", "why", "how", "where", "who", "are you", "why do", "what was", "what is", "can you"].includes(t)) return true;
+        if (isConfusionInput(t) || ["what", "why", "how", "where", "who", "are you", "why do", "what was", "what is", "can you"].includes(t)) return true;
         return meaningfulWordCount(value) > 0 && meaningfulWordCount(value) < 3 && detectIntentType(value) === "general_question";
       };
 
@@ -2925,9 +2967,19 @@ async function startServer() {
       const stageConfirmationDecision = advanceScriptAfterConfirmation();
       if (stageConfirmationDecision) return stageConfirmationDecision;
 
+      const buildQualificationClarification = () => {
+        const q = normalizeTurnText(getCurrentPendingPrompt(callData, kb));
+        if (q.includes("budget")) return "Could you share your budget range?";
+        if (q.includes("configuration") || q.includes("bhk")) return "Which configuration?";
+        if (q.includes("timeline") || q.includes("when")) return "What timeline works for you?";
+        return getCurrentPendingPrompt(callData, kb) || "Please answer briefly.";
+      };
+
       if (conversationStage === "qualification" && isContextualShortAnswer(transcript)) {
         console.log("[CONTEXTUAL_SHORT_ANSWER_ACCEPTED]", transcript);
-        storeQualificationAnswer(transcript);
+        if (!storeQualificationAnswer(transcript, getCurrentPendingPrompt(callData, kb))) {
+          return decision(buildQualificationClarification(), conversationStage, false, 8);
+        }
         const nextQuestionReply = askNextQualificationQuestion(callData, kb);
         return decision(nextQuestionReply, conversationStage, false, 8);
       }
@@ -3121,7 +3173,9 @@ async function startServer() {
           console.log("[TURN HELD] low confidence", transcript);
           return decision("Sure, what would you like to know?", conversationStage, false, 14);
         }
-        if (qualificationStarted) storeQualificationAnswer(transcript);
+        if (qualificationStarted && !storeQualificationAnswer(transcript, getCurrentPendingPrompt(callData, kb))) {
+          return decision(buildQualificationClarification(), conversationStage, false, 8);
+        }
         const nextQuestionReply = askNextQualificationQuestion(callData, kb);
         return decision(nextQuestionReply, conversationStage, false);
       }
