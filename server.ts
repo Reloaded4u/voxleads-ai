@@ -1013,6 +1013,7 @@ type TranscriptEntry = {
 };
 
 const liveCallTranscriptBuffers = new Map<string, TranscriptEntry[]>();
+const endedVobizCallIds = new Set<string>();
 
 function formatTranscriptEntries(entries: TranscriptEntry[]) {
   return entries
@@ -1784,7 +1785,7 @@ async function startServer() {
   });
 
   // Vobiz WebSocket connection handler
-  wss.on("connection", (ws, request) => {
+  wss.on("connection", async (ws, request) => {
     console.log("[VOBIZ ACTIVE HANDLER HIT]");
 
     const urlParams = new URLSearchParams(request.url?.split("?")[1] || "");
@@ -1792,6 +1793,33 @@ async function startServer() {
     let ownerId = urlParams.get("ownerId");
 
     console.log(`[WS OPEN] callId=${callId} ownerId=${ownerId}`);
+
+    if (callId && endedVobizCallIds.has(callId)) {
+      console.log("[RECONNECT_BLOCKED_ENDED_CALL]", callId);
+      if (ws.readyState === 1) ws.close();
+      return;
+    }
+
+    if (callId) {
+      try {
+        const existingCallSnap = await db.collection("calls").doc(callId).get();
+        const existingCall = existingCallSnap.data() || {};
+        if (
+          existingCall.controlState === "call_ended" ||
+          existingCall.callControlState === "call_ended" ||
+          existingCall.leadData?.outcome === "not_interested" ||
+          existingCall.outcome === "not_interested"
+        ) {
+          endedVobizCallIds.add(callId);
+          console.log("[RECONNECT_BLOCKED_ENDED_CALL]", callId);
+          if (ws.readyState === 1) ws.close();
+          return;
+        }
+      } catch (error) {
+        console.error("[RECONNECT_BLOCK_CHECK_FAILED]", error);
+      }
+    }
+
     void ensureVobizRecordingStarted(callId, ownerId);
 
     type CallState = "GREETING" | "SPEAKING" | "COOLDOWN" | "LISTENING" | "PROCESSING" | "ENDING" | "ENDED";
@@ -3471,6 +3499,28 @@ async function startServer() {
           return;
         }
         await appendTranscript("AI", aiReply);
+        console.log("[FINAL_REPLY_PLAYED]", aiReply);
+        if (disinterestTerminationPending) {
+          console.log("[FORCE_WS_CLOSE_AFTER_DISINTEREST]", callId);
+          if (callId) {
+            endedVobizCallIds.add(callId);
+            await db.collection("calls").doc(callId).update(sanitizeForFirestore({
+              status: "completed",
+              controlState: "call_ended",
+              callControlState: "call_ended",
+              endedAt: admin.firestore.FieldValue.serverTimestamp(),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              leadData,
+            })).catch((error) => console.error("[CALL CONTROL END UPDATE FAILED]", error));
+            liveCallTranscriptBuffers.delete(callId);
+          }
+          console.log("[DISINTEREST_REPLY_SENT]");
+          console.log("[LIVE_CALL_TERMINATED]");
+          state = "ENDING";
+          if (ws.readyState === 1) ws.close();
+          endCall();
+          return;
+        }
         if (decision.completedStage) {
           markCompletedStage(decision.completedStage);
         }
