@@ -352,12 +352,23 @@ function cleanFinalResponse(value: string, fallback = "Sure, what would you like
 
 function compressReplyForLiveCall(value: string, maxWords = 16) {
   const original = String(value || "").replace(/\s+/g, " ").trim();
+  const protectedReplies = [
+    "What would you like to know?",
+    "Could you please repeat that?",
+    "Do you mean 1, 2, or 3 BHK?",
+    "Are you looking for self-use or investment?",
+  ];
+  if (original.split(/\s+/).filter(Boolean).length < 10 || protectedReplies.some((reply) => normalizeKbKey(reply) === normalizeKbKey(original))) {
+    console.log("[RESPONSE_COMPRESSION_SKIPPED_SHORT_REPLY]", original);
+    return original;
+  }
   let clean = original
     .replace(/\bSure,?\s+I can help with that\.\s*/i, "Sure. ")
     .replace(/\bWhat day and time works for you\?/i, "What time works for you?")
     .replace(/\bI don't have exact details right now, but our team can share that with you\.?/i, "Our team can share exact details.")
     .replace(/\bI don't have exact details right now, but our team can share them with you\.?/i, "Our team can share exact details.")
-    .replace(/\bwould you like to\b/gi, "want to")
+    .replace(/\bwhat would you like to\b/gi, "what do you want to")
+    .replace(/\byou would like to\b/gi, "you want to")
     .replace(/\s+/g, " ")
     .trim();
 
@@ -382,7 +393,7 @@ function stripFaqQuestionText(value: string) {
   return clean.trim() || original;
 }
 
-function cleanDirectAnswer(value: string, maxWords = 18) {
+function cleanDirectAnswer(value: string, maxWords = 18, fallback = "") {
   let clean = stripFaqQuestionText(value).replace(/\s+/g, " ").trim();
   const withoutArtifacts = clean
     .replace(/\b\d{8,}\b/g, "")
@@ -403,11 +414,28 @@ function cleanDirectAnswer(value: string, maxWords = 18) {
     if (answer === previous) break;
   }
 
-  const phraseBoundary = answer.match(/^(.{20,}?[.!?])/);
+  const phraseBoundary = answer.match(/^(.{40,}?[.!?])/);
   if (phraseBoundary) answer = phraseBoundary[1].trim();
   if (!/[.!?]$/.test(answer)) answer += ".";
 
-  answer = cleanFinalResponse(answer, "I can share those details from the knowledge base.", maxWords);
+  answer = cleanFinalResponse(answer, fallback || "I can share those details from the knowledge base.", maxWords);
+  const usefulWords = answer
+    .replace(/[.!?]/g, "")
+    .split(/\s+/)
+    .filter((word) => word && !["the", "a", "an"].includes(word.toLowerCase()));
+  if (usefulWords.length < 4 || /^(availability|pricing|location)\.?$/i.test(answer.trim())) {
+    console.log("[DIRECT_ANSWER_TOO_SHORT]", answer);
+    const originalUseful = clean.split(/\s+/).filter(Boolean);
+    if (fallback) {
+      console.log("[FAQ_CLEANER_FALLBACK_USED]", fallback);
+      return fallback;
+    }
+    if (originalUseful.length >= 4) {
+      const fallbackAnswer = cleanFinalResponse(clean, "I can share those details from the knowledge base.", maxWords);
+      console.log("[FAQ_CLEANER_FALLBACK_USED]", fallbackAnswer);
+      return fallbackAnswer;
+    }
+  }
   console.log("[DIRECT ANSWER CLEANED]", answer);
   return answer;
 }
@@ -514,7 +542,7 @@ function getKbDirectAnswer(userSpeech: string, kbContext: ReturnType<typeof norm
       if (!sectionText.trim()) continue;
       if (sectionName !== "pricing" && !/\b(price|pricing|cost|rate|amount|fee|charge)\b/i.test(sectionText)) continue;
       console.log("[KB SECTION SELECTED]", sectionName);
-      const answer = cleanDirectAnswer(sectionText, 8);
+      const answer = cleanDirectAnswer(sectionText, 8, "Pricing depends on the selected option and current availability. Our team can share the latest details.");
       console.log("[ANSWER SOURCE]", sectionName);
       console.log("[KB DIRECT ANSWER]", sectionName, answer);
       console.log("[GEMINI SKIPPED KB MATCH]");
@@ -2067,10 +2095,10 @@ async function startServer() {
 
     const getRequestedLanguage = (text: string) => {
       const t = normalizeTurnText(text);
-      if (/\bhindi\b/i.test(t)) return "Hindi";
-      if (/\bhinglish\b/i.test(t)) return "Hinglish";
+      if (/\b(hindi|हिंदी|हिन्दी)\b/i.test(text)) return "Hindi";
+      if (/\bhinglish\b/i.test(text)) return "Hinglish";
+      if (/\benglish\b/i.test(text)) return "English";
       if (/\bmarathi\b/i.test(t)) return "Marathi";
-      if (/\benglish\b/i.test(t)) return "English";
       if (/\btamil\b/i.test(t)) return "Tamil";
       if (/\btelugu\b/i.test(t)) return "Telugu";
       if (/\bkannada\b/i.test(t)) return "Kannada";
@@ -2083,7 +2111,7 @@ async function startServer() {
 
     const isDisinterestIntent = (text: string) => {
       const t = normalizeTurnText(text);
-      return /\b(not interested|no interest|i am not interested|im not interested|i'm not interested|totally not interested|dont call|don't call|stop|remove me|remove my number|not now|no thanks|cancel)\b/i.test(t);
+      return /\b(not interested|no interest|i am not interested|im not interested|i'm not interested|totally not interested|not into|not into this|i am not into|im not into|i'm not into|dont call|don't call|dont want|don't want|do not want|stop|remove me|remove my number|not now|no thanks|no thank you|cancel)\b/i.test(t);
     };
 
     const isObjectionIntent = (text: string) => {
@@ -2520,15 +2548,19 @@ async function startServer() {
     const isValidQualificationAnswer = (answer: string, questionText = "") => {
       const normalizedAnswer = normalizeTurnText(answer);
       const question = normalizeTurnText(questionText || lastQuestion || lastAiReply);
-      if (!normalizedAnswer || isConfusionInput(normalizedAnswer) || isIdentityQuestion(normalizedAnswer) || normalizedAnswer.endsWith("?")) return false;
+      const globalNonAnswer = /\b(answer me|first answer|answer first|tell me first|explain first|price|cost|pricing|who are you|why are you calling|can you speak|speak hindi|hindi|repeat|what|hello|not interested|not into|no thanks)\b/i;
+      if (!normalizedAnswer || globalNonAnswer.test(normalizedAnswer) || isConfusionInput(normalizedAnswer) || isIdentityQuestion(normalizedAnswer) || isPurposeQuestion(normalizedAnswer) || isLanguageRequest(answer) || isDisinterestIntent(answer) || normalizedAnswer.endsWith("?")) return false;
+      if (question.includes("self use") || question.includes("investment")) {
+        return /\b(self[ -]?use|own use|personal use|investment|invest|investor|both)\b/i.test(normalizedAnswer);
+      }
       if (question.includes("configuration") || question.includes("bhk")) {
-        return /\b(\d+\s*bhk|1bhk|2bhk|3bhk|4bhk|one|two|three|four|studio)\b/i.test(normalizedAnswer);
+        return /\b(\d+\s*bhk|1bhk|2bhk|3bhk|4bhk|one\s*bhk|two\s*bhk|three\s*bhk|one bedroom|two bedroom|three bedroom|1 bedroom|2 bedroom|3 bedroom|two b|2 b|two be|to bhk|too bhk|one b|three b|studio)\b/i.test(normalizedAnswer);
       }
       if (question.includes("budget")) {
-        return /\b(\d+|lakh|lac|crore|cr|thousand|k|million|budget|around|approx)\b/i.test(normalizedAnswer);
+        return /\b((\d+.*(lakh|lac|crore|cr))|budget|range|around|under|between)\b/i.test(normalizedAnswer);
       }
       if (question.includes("timeline") || question.includes("when")) {
-        return /\b(today|tomorrow|week|month|year|immediately|soon|later|morning|afternoon|evening|\d{1,2}\s*(am|pm)?)\b/i.test(normalizedAnswer);
+        return /\b(now|immediately|this month|next month|within|after|later|soon|days|weeks|months|today|tomorrow|week|month|year|morning|afternoon|evening|\d{1,2}\s*(am|pm)?)\b/i.test(normalizedAnswer);
       }
       return normalizedAnswer.split(" ").filter(Boolean).length <= 6;
     };
@@ -2719,8 +2751,10 @@ async function startServer() {
       console.log("[QUESTION INDEX]", currentQuestionIndex);
 
       if (routedIntent === "disinterest") {
+        console.log("[EARLY_DISINTEREST_DETECTED]", transcript);
         console.log("[DISINTEREST_DETECTED]", transcript);
         console.log("[CALL_TERMINATION_INTENT]");
+        console.log("[CALL_END_REQUESTED]");
         if (conversationStage === "qualification") console.log("[QUALIFICATION_BLOCKED_DISINTEREST]");
         playbackInterrupted = true;
         leadData.outcome = "not_interested";
@@ -2729,7 +2763,7 @@ async function startServer() {
         console.log("[CALL_ENDED_DISINTEREST]");
         console.log("[GEMINI SKIPPED]");
         return {
-          reply: "Understood. Thanks for your time.",
+          reply: "Understood. I won't call again. Thank you.",
           needsGemini: false,
           maxWords: 6,
           completedStage: null,
@@ -2779,11 +2813,7 @@ async function startServer() {
           console.log("[QUESTION_CONTEXT_MATCH]", "location");
           return true;
         }
-        if (currentQuestionIndex >= 0 && words.length > 0 && !isConfusionInput(t) && !t.endsWith("?")) {
-          console.log("[QUESTION_CONTEXT_MATCH]", "qualification");
-          return true;
-        }
-        return false;
+        return isValidQualificationAnswer(value, getCurrentPendingPrompt(callData, kb));
       };
 
       const isIncompleteUserInput = (value: string) => {
@@ -2918,14 +2948,20 @@ async function startServer() {
         detectIntentType(userText) === "language_request" || isLanguageRequest(userText);
 
       const handleLanguageSwitch = (userText: string) => {
-        console.log("[LANGUAGE REQUEST DETECTED]", userText);
+        console.log("[LANGUAGE_REQUEST_DETECTED]", userText);
         preferredLanguage = getRequestedLanguage(userText);
         console.log("[CONVERSATION LANGUAGE]", preferredLanguage);
+        console.log("[REQUESTED_LANGUAGE_SET]", preferredLanguage);
         console.log("[PREFERRED LANGUAGE SET]", preferredLanguage);
         console.log("[LANGUAGE SWITCH]", preferredLanguage);
+        if (conversationStage === "qualification") console.log("[QUALIFICATION_INDEX_PRESERVED]", currentQuestionIndex);
         console.log("[GEMINI SKIPPED]");
         console.log("[RETURNING TO STAGE]", conversationStage);
-        return decision(buildLanguageReply(), conversationStage, false, 14);
+        const pending = conversationStage === "qualification" ? renderForConversationLanguage(getCurrentPendingPrompt(callData, kb)) : "";
+        const languageReply = preferredLanguage === "Hindi" || preferredLanguage === "Hinglish"
+          ? `Haan, main simple Hindi mein baat kar sakti hoon.${pending ? " " + pending : ""}`
+          : buildLanguageReply();
+        return decision(languageReply, conversationStage, false, 14);
       };
 
       if (detectLanguageRequest(transcript)) {
@@ -2972,17 +3008,17 @@ async function startServer() {
       const buildQualificationClarification = (input = "") => {
         const q = normalizeTurnText(getCurrentPendingPrompt(callData, kb));
         const t = normalizeTurnText(input);
-        let clarification = "Please complete your question.";
-        if (!isConfusionInput(t) && !isIncompletePhrase(input)) {
-          if (q.includes("budget")) clarification = "Please share an approximate budget, like 70 lakh or 1 crore.";
-          else if (q.includes("configuration") || q.includes("bhk")) clarification = "Do you mean 1, 2, or 3 BHK?";
-          else if (q.includes("timeline") || q.includes("when")) clarification = "Are you planning this soon or later?";
-        }
+        let clarification = "Could you clarify that?";
+        if (q.includes("budget")) clarification = "Please share an approximate budget, like 70 lakh or 1 crore.";
+        else if (q.includes("configuration") || q.includes("bhk")) clarification = "Do you mean 1, 2, or 3 BHK?";
+        else if (q.includes("timeline") || q.includes("when")) clarification = "Are you planning this soon or later?";
+        else if (q.includes("self use") || q.includes("investment")) clarification = "Are you looking for self-use or investment?";
         console.log("[INVALID_INPUT_CONTEXTUAL_CLARIFY]", clarification);
         console.log("[QUALIFICATION_INDEX_PRESERVED]", currentQuestionIndex);
         if (normalizeTurnText(clarification) === normalizeTurnText(lastQualificationClarification)) {
           console.log("[QUESTION_REPEAT_SUPPRESSED]");
-          return "Please complete your question.";
+          const pending = getCurrentPendingPrompt(callData, kb);
+          return pending || clarification;
         }
         lastQualificationClarification = clarification;
         return clarification;
@@ -3028,7 +3064,9 @@ async function startServer() {
           playbackInterrupted = true;
           leadData.outcome = "not_interested";
           disinterestTerminationPending = true;
-          return decision("Understood. Thanks for your time.", "ended", false, 6);
+          console.log("[FINAL_DISINTEREST_REPLY]");
+          console.log("[CALL_END_REQUESTED]");
+          return decision("Understood. I won't call again. Thank you.", "ended", false, 8);
         }
         return decision(buildClosingLine(callData, kb), "closing", false, 14);
       }
@@ -3045,14 +3083,20 @@ async function startServer() {
       }
 
       if (routedIntent === "language_request") {
-        console.log("[LANGUAGE REQUEST DETECTED]", transcript);
+        console.log("[LANGUAGE_REQUEST_DETECTED]", transcript);
         preferredLanguage = getRequestedLanguage(transcript);
         console.log("[CONVERSATION LANGUAGE]", preferredLanguage);
+        console.log("[REQUESTED_LANGUAGE_SET]", preferredLanguage);
         console.log("[PREFERRED LANGUAGE SET]", preferredLanguage);
         console.log("[LANGUAGE SWITCH]", preferredLanguage);
+        if (conversationStage === "qualification") console.log("[QUALIFICATION_INDEX_PRESERVED]", currentQuestionIndex);
         console.log("[GEMINI SKIPPED]");
         console.log("[RETURNING TO STAGE]", conversationStage);
-        return decision(buildLanguageReply(), conversationStage, false, 14);
+        const pending = conversationStage === "qualification" ? renderForConversationLanguage(getCurrentPendingPrompt(callData, kb)) : "";
+        const languageReply = preferredLanguage === "Hindi" || preferredLanguage === "Hinglish"
+          ? `Haan, main simple Hindi mein baat kar sakti hoon.${pending ? " " + pending : ""}`
+          : buildLanguageReply();
+        return decision(languageReply, conversationStage, false, 14);
       }
 
       if (routedIntent === "meta_comment") {
