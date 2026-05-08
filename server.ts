@@ -2458,6 +2458,10 @@ async function startServer() {
     const isIncompleteSpeechFragment = (text: string, confidence = 1) => {
       const normalized = normalizeTurnText(text);
       if (!normalized || isClearShortCommand(text) || isDisinterestIntent(text)) return false;
+      if (conversationStage === "qualification" && extractActiveConfigurationAnswer(text)) {
+        console.log("[INCOMPLETE_HOLD_BYPASSED_ACTIVE_CONFIG]", text);
+        return false;
+      }
       if (conversationStage === "appointment" && /\b(will i get confirmation|get confirmation|confirmation from|confirmation|will your team confirm|team confirm|will i receive|message|whatsapp|sms|call back)\b/i.test(text)) return false;
       const usefulWords = normalized
         .split(" ")
@@ -3486,8 +3490,13 @@ async function startServer() {
 
       if (isChannelCheckDuringQualification(transcript)) {
         console.log("[CHANNEL_CHECK_DETECTED]", transcript);
+        console.log("[CHANNEL_CHECK_RESUME_NEXT_MISSING]");
+        const stored = getStoredQualificationFields(kb);
+        if (stored.has("purpose")) console.log("[PURPOSE_ALREADY_STORED_SKIP]");
+        if (stored.has("configuration")) console.log("[CONFIGURATION_ALREADY_STORED_SKIP]");
+        const nextMissingPrompt = getNextMissingQualificationQuestion(callData, kb);
         console.log("[QUALIFICATION_PROMPT_RESUMED]");
-        return decision("Yes, I'm here. Are you looking for self-use or investment?", conversationStage, false, 10);
+        return decision(`Yes, I'm here. ${nextMissingPrompt || "Please continue."}`.trim(), conversationStage, false, 12);
       }
 
       const advanceScriptAfterConfirmation = () => {
@@ -3890,7 +3899,9 @@ async function startServer() {
         }
         if (callState.lowConfidenceWithoutTime) {
           console.log("[TURN HELD] low confidence", transcript);
-          return decision("Sure, what would you like to know?", conversationStage, false, 14);
+          console.log("[QUALIFICATION_LOW_CONFIDENCE_HELD_NO_GENERIC_REPLY]");
+          const nextMissingPrompt = getNextMissingQualificationQuestion(callData, kb);
+          return decision(nextMissingPrompt || buildQualificationClarification(transcript), conversationStage, false, 10);
         }
         if (qualificationStarted && !storeQualificationAnswer(transcript, getCurrentPendingPrompt(callData, kb))) {
           return decision(buildQualificationClarification(transcript), conversationStage, false, 8);
@@ -4178,6 +4189,46 @@ async function startServer() {
 
         const confidence = typeof stt.confidence === "number" ? stt.confidence : 0;
         const lowConfidenceWithoutTime = confidence < 0.65 && !isLowConfidenceAllowed(transcript);
+        let preloadedCallContext: { callData: any; kb: any } | null = null;
+        let forcedQualificationReply = "";
+        const preloadCallContext = async () => {
+          if (!preloadedCallContext) preloadedCallContext = await loadCallContext();
+          return preloadedCallContext;
+        };
+        const tryEarlyActiveConfigCapture = async (value: string, source = "transcript") => {
+          if (conversationStage !== "qualification") return false;
+          const { callData, kb } = await preloadCallContext();
+          const missing = getFirstMissingQualificationIndex(kb);
+          if (missing?.field !== "configuration") return false;
+          console.log("[EARLY_ACTIVE_CONFIG_CAPTURE_ATTEMPT]", value, source);
+          const config = extractActiveConfigurationAnswer(value);
+          if (!config) return false;
+          console.log("[EARLY_ACTIVE_CONFIG_CAPTURED]", config);
+          console.log("[CONFIGURATION_SIGNAL_NORMALIZED]", config);
+          storeQualificationSignal("configuration", config, kb);
+          pendingPartialTranscript = "";
+          pendingPartialTranscriptAt = 0;
+          console.log("[PARTIAL_TRANSCRIPT_CLEARED_AFTER_CONFIG_CAPTURE]");
+          lastQualificationAnswerAccepted = true;
+          forcedQualificationReply = askNextQualificationQuestion(callData, kb);
+          console.log("[QUALIFICATION_PRE_ROUTING_SIGNAL_SCAN]", value);
+          console.log("[QUALIFICATION_DEBUG_AFTER_STORE]", JSON.stringify({
+            storedPurpose: getQualificationField(callData, "purpose") || "",
+            storedConfiguration: getQualificationField(callData, "configuration") || "",
+            storedBudget: getQualificationField(callData, "budget") || "",
+            storedTimeline: getQualificationField(callData, "timeline") || "",
+          }));
+          return true;
+        };
+
+        if (pendingPartialTranscript && await tryEarlyActiveConfigCapture(pendingPartialTranscript, "pendingPartialTranscript")) {
+          console.log("[PENDING_PARTIAL_CONFIG_FOUND_BEFORE_CLEAR]");
+          console.log("[CONFIGURATION_SIGNAL_STORED_FROM_PARTIAL]");
+        }
+
+        if (await tryEarlyActiveConfigCapture(transcript)) {
+          // Continue through the normal accepted-turn path with a forced next-question reply.
+        }
 
         if (pendingPartialTranscript) {
           const partialAgeMs = Date.now() - pendingPartialTranscriptAt;
@@ -4274,7 +4325,7 @@ async function startServer() {
         state = "PROCESSING";
         console.log("[Vobiz State] PROCESSING");
 
-        const { callData, kb } = await loadCallContext();
+        const { callData, kb } = preloadedCallContext || await loadCallContext();
         if (isEnded()) return;
 
         const transcriptTextForContext = formatTranscriptEntries(transcriptBuffer);
@@ -4283,11 +4334,13 @@ async function startServer() {
         let shouldTrimReply = true;
         let replyMaxWords = 10;
 
-        const decision = await timedStep("getNextReply", () => getNextReply(
-          transcript,
-          buildCallState(callData, callContext, detectedIntent, lowConfidenceWithoutTime),
-          kb
-        ));
+        const decision = forcedQualificationReply
+          ? { reply: forcedQualificationReply, maxWords: 10, needsGemini: false, completedStage: null }
+          : await timedStep("getNextReply", () => getNextReply(
+            transcript,
+            buildCallState(callData, callContext, detectedIntent, lowConfidenceWithoutTime),
+            kb
+          ));
         reply = decision.reply;
         replyMaxWords = decision.maxWords;
         shouldTrimReply = decision.maxWords <= 14;
