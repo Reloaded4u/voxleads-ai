@@ -1854,8 +1854,10 @@ async function startServer() {
 
     console.log(`[WS OPEN] callId=${callId} ownerId=${ownerId}`);
 
-    if (callId && endedVobizCallIds.has(callId)) {
+    if (callId && (endedVobizCallIds.has(callId) || finalizedCalls.has(callId))) {
+      console.log("[WS_RECONNECT_BLOCKED_ENDED_CALL]", callId);
       console.log("[RECONNECT_BLOCKED_ENDED_CALL]", callId);
+      console.log("[GREETING_BLOCKED_ENDED_CALL]", callId);
       if (ws.readyState === 1) ws.close();
       return;
     }
@@ -1867,11 +1869,16 @@ async function startServer() {
         if (
           existingCall.controlState === "call_ended" ||
           existingCall.callControlState === "call_ended" ||
+          existingCall.status === "completed" ||
+          existingCall.status === "ended" ||
           existingCall.leadData?.outcome === "not_interested" ||
           existingCall.outcome === "not_interested"
         ) {
           endedVobizCallIds.add(callId);
+          finalizedCalls.add(callId);
+          console.log("[WS_RECONNECT_BLOCKED_ENDED_CALL]", callId);
           console.log("[RECONNECT_BLOCKED_ENDED_CALL]", callId);
+          console.log("[GREETING_BLOCKED_ENDED_CALL]", callId);
           if (ws.readyState === 1) ws.close();
           return;
         }
@@ -1983,17 +1990,41 @@ async function startServer() {
         .replace(/\s+/g, " ")
         .trim();
 
+    const formatAppointmentTime = (hourValue: string | number, suffix: "AM" | "PM") => {
+      const hour = Number(hourValue);
+      if (!Number.isFinite(hour) || hour <= 0 || hour > 12) return "";
+      console.log("[APPOINTMENT_TIME_NORMALIZED]", hour, suffix);
+      return `${hour}:00 ${suffix}`;
+    };
+
     const extractCallbackTime = (value: string) => {
       const normalized = normalizeTimeTranscript(value);
-      const match = normalized.match(/\b(\d{1,2})(?::\d{2})?\s*(am|pm|a m|p m)\b/i);
-      if (!match) {
-        const period = normalized.match(/\b(morning|afternoon|evening)\b/i)?.[1];
-        return period || "";
+      const explicit = normalized.match(/\b(\d{1,2})(?::\d{2})?\s*(am|pm|a m|p m)\b/i);
+      if (explicit) {
+        console.log("[APPOINTMENT_TIME_EXTRACTED]", explicit[0]);
+        const suffix = (explicit[2] || "").replace(/\s+/g, "").toUpperCase() as "AM" | "PM";
+        return formatAppointmentTime(explicit[1], suffix);
       }
 
-      const hour = match[1];
-      const suffix = (match[2] || "").replace(/\s+/g, "").toUpperCase();
-      return `${hour} ${suffix}`;
+      const numberWithPeriod = normalized.match(/\b(\d{1,2})\s*(?:in the\s+)?(morning|afternoon|evening|night)\b/i);
+      if (numberWithPeriod) {
+        console.log("[APPOINTMENT_TIME_EXTRACTED]", numberWithPeriod[0]);
+        const hour = Number(numberWithPeriod[1]);
+        const period = numberWithPeriod[2].toLowerCase();
+        if (period === "morning") return formatAppointmentTime(hour, hour === 12 ? "PM" : "AM");
+        if (period === "afternoon") return formatAppointmentTime(hour, hour === 12 ? "PM" : "PM");
+        if (period === "evening") return formatAppointmentTime(hour, hour >= 1 && hour <= 6 ? "PM" : "PM");
+        if (period === "night") return formatAppointmentTime(hour, "PM");
+      }
+
+      const bareHour = normalized.match(/^\s*(\d{1,2})\s*$/)?.[1];
+      if (bareHour && conversationStage === "appointment") {
+        console.log("[APPOINTMENT_TIME_CONTEXT_INFERRED]", bareHour);
+        return formatAppointmentTime(bareHour, "AM");
+      }
+
+      const period = normalized.match(/\b(morning|afternoon|evening)\b/i)?.[1];
+      return period || "";
     };
 
     const extractCallbackDate = (value: string) => {
@@ -2012,6 +2043,7 @@ async function startServer() {
       const t = normalizeTurnText(value);
       if (/\bfollow up|followup\b/i.test(t)) return "follow-up";
       if (/\bcall back|callback|call later\b/i.test(t)) return "callback";
+      if (/\bsite visit\b/i.test(t)) return "site visit";
       if (/\bappointment\b/i.test(t)) return "appointment";
       if (/\bmeeting\b/i.test(t)) return "meeting";
       if (/\bvisit\b/i.test(t)) return "visit";
@@ -2036,9 +2068,17 @@ async function startServer() {
       return { date, time, type };
     };
 
+    const displayAppointmentTime = (time: string | null) =>
+      String(time || "").replace(/:00\s+/i, " ");
+
     const buildAppointmentMemoryConfirmation = () => {
-      if (appointmentData.date && appointmentData.time) return `Got it. ${appointmentData.date} at ${appointmentData.time}.`;
-      if (appointmentData.time) return `Got it. At ${appointmentData.time}.`;
+      const type = appointmentData.type || "appointment";
+      const time = displayAppointmentTime(appointmentData.time);
+      if (appointmentData.date && appointmentData.time) {
+        console.log("[APPOINTMENT_CONFIRMATION_REPLY_USED]");
+        return `Done. I've noted your ${type} request for ${appointmentData.date} at ${time}. Our team will confirm shortly.`;
+      }
+      if (appointmentData.time) return `Got it. At ${time}.`;
       if (appointmentData.date) return `Got it. For ${appointmentData.date}.`;
       return "Got it.";
     };
@@ -2358,6 +2398,7 @@ async function startServer() {
     const isIncompleteSpeechFragment = (text: string, confidence = 1) => {
       const normalized = normalizeTurnText(text);
       if (!normalized || isClearShortCommand(text) || isDisinterestIntent(text)) return false;
+      if (conversationStage === "appointment" && /\b(will i get confirmation|get confirmation|confirmation from|confirmation|will your team confirm|team confirm|will i receive|message|whatsapp|sms|call back)\b/i.test(text)) return false;
       const usefulWords = normalized
         .split(" ")
         .filter((word) => word && !["hello", "hi", "hey", "okay", "ok", "yeah", "yes", "thank", "thanks", "you"].includes(word));
@@ -2384,6 +2425,10 @@ async function startServer() {
         "tell me",
         "go ahead and",
       ].some((phrase) => normalized === phrase || normalized.endsWith(` ${phrase}`))) {
+        return true;
+      }
+      if (conversationStage === "appointment" && /^(will i|get confirmation|the confirmation from|confirmation from|will your|will i get|from your team)$/i.test(normalized)) {
+        console.log("[APPOINTMENT_PARTIAL_HELD]", text);
         return true;
       }
       if (normalized === "temp fuse") return true;
@@ -2644,7 +2689,10 @@ async function startServer() {
       }
       if (field === "configuration") {
         if (/\b(1\s*bhk|one\s*bhk|1 bedroom|one bedroom|one b)\b/i.test(t)) return "1 BHK";
-        if (/\b(2\s*bhk|two\s*bhk|2 bedroom|two bedroom|two b|2 b|two be|to bhk|too bhk)\b/i.test(t)) return "2 BHK";
+        if (/\b(2\s*bhk|two\s*bhk|two\s*b\s*h\s*k|2 bedroom|two bedroom|2 bed|two bed|two b|2 b|two be|two bee|to bhk|too bhk|two b apartment|two bhk apartments?|2 bhk apartments?|vsk apartment|bsk apartment|bhk apartment|do we expect|do bhk|do b h k|do bedroom|do b)\b/i.test(t)) {
+          console.log("[CONFIGURATION_SIGNAL_NORMALIZED]", "2 BHK");
+          return "2 BHK";
+        }
         if (/\b(3\s*bhk|three\s*bhk|3 bedroom|three bedroom|three b|cbhk|c bhk|free bhk)\b/i.test(t)) return "3 BHK";
       }
       return value.trim();
@@ -2656,7 +2704,8 @@ async function startServer() {
       if (/\b(self[ -]?use|own use|personal use|investment|invest|investor|both)\b/i.test(normalized)) {
         signals.push({ field: "purpose", value: normalizeQualificationSignalValue("purpose", userText) });
       }
-      if (/\b(1\s*bhk|one\s*bhk|1 bedroom|one bedroom|2\s*bhk|two\s*bhk|2 bedroom|two bedroom|3\s*bhk|three\s*bhk|3 bedroom|three bedroom|two b|2 b|two be|to bhk|too bhk|one b|three b|cbhk|c bhk|free bhk)\b/i.test(normalized)) {
+      if (/\b(1\s*bhk|one\s*bhk|1 bedroom|one bedroom|one b|1 b|2\s*bhk|two\s*bhk|two\s*b\s*h\s*k|2 bedroom|two bedroom|2 bed|two bed|two b|2 b|two be|two bee|to bhk|too bhk|two b apartment|two bhk apartments?|2 bhk apartments?|vsk apartment|bsk apartment|bhk apartment|do we expect|do bhk|do b h k|do bedroom|do b|3\s*bhk|three\s*bhk|3 bedroom|three bedroom|three b|3 b|cbhk|c bhk|free bhk)\b/i.test(normalized)) {
+        console.log("[CONFIGURATION_SIGNAL_EXTRACTED]", userText);
         signals.push({ field: "configuration", value: normalizeQualificationSignalValue("configuration", userText) });
       }
       if (/\b(lakh|lakhs|lac|crore|cr|budget|under|around|between)\b/i.test(normalized)) {
@@ -2678,6 +2727,7 @@ async function startServer() {
         return false;
       }
       leadData.answers[index] = value;
+      if (field === "configuration") console.log("[CONFIGURATION_SIGNAL_STORED]", value);
       console.log("[QUALIFICATION_SIGNAL_STORED]", field, value);
       console.log("[ANSWER STORED]", index, value);
       console.log("[LEAD MEMORY UPDATED]", index, "->", value);
@@ -2764,7 +2814,7 @@ async function startServer() {
         return /\b(self[ -]?use|own use|personal use|investment|invest|investor|both)\b/i.test(normalizedAnswer);
       }
       if (question.includes("configuration") || question.includes("bhk")) {
-        return /\b(\d+\s*bhk|1bhk|2bhk|3bhk|4bhk|one\s*bhk|two\s*bhk|three\s*bhk|one bedroom|two bedroom|three bedroom|1 bedroom|2 bedroom|3 bedroom|two b|2 b|two be|to bhk|too bhk|one b|three b|studio)\b/i.test(normalizedAnswer);
+        return /\b(\d+\s*bhk|1bhk|2bhk|3bhk|4bhk|one\s*bhk|two\s*bhk|two\s*b\s*h\s*k|three\s*bhk|one bedroom|two bedroom|three bedroom|1 bedroom|2 bedroom|3 bedroom|2 bed|two bed|two b|2 b|two be|two bee|to bhk|too bhk|two b apartment|two bhk apartments?|2 bhk apartments?|vsk apartment|bsk apartment|bhk apartment|do bhk|do b h k|do bedroom|do b|one b|three b|studio)\b/i.test(normalizedAnswer);
       }
       if (question.includes("budget")) {
         return /\b((\d+.*(lakh|lac|crore|cr))|budget|range|around|under|between)\b/i.test(normalizedAnswer);
@@ -3113,6 +3163,19 @@ async function startServer() {
         return null;
       };
 
+      const isAppointmentConfirmationQuestion = (value: string) =>
+        /\b(will i get confirmation|get confirmation|confirmation from|confirmation|will your team confirm|team confirm|will i receive|message|whatsapp|sms|call back)\b/i.test(value);
+
+      const answerAppointmentConfirmationQuestion = () => {
+        console.log("[APPOINTMENT_CONFIRMATION_QUESTION_DETECTED]", transcript);
+        console.log("[APPOINTMENT_CONFIRMATION_ANSWERED]");
+        if (appointmentData.confirmed) {
+          const type = appointmentData.type || "appointment";
+          return decision(`Yes, our team will confirm the ${type} details with you shortly.`, "post_qualification", false, 14);
+        }
+        return decision("I can help with that. What date and time works for you?", "appointment", false, 12);
+      };
+
       const answerFromKB = async () => {
         if (!hasClearBusinessIntent(transcript) && !isIdentityQuestion(transcript) && !isPurposeQuestion(transcript)) {
           console.log("[INTENT_CONFIDENCE_LOW]");
@@ -3253,6 +3316,10 @@ async function startServer() {
         return handleLanguageSwitch(transcript);
       }
 
+      if ((conversationStage === "appointment" || appointmentData.requested || appointmentData.confirmed) && isAppointmentConfirmationQuestion(transcript)) {
+        return answerAppointmentConfirmationQuestion();
+      }
+
       extractAndStoreQualificationSignals(transcript, kb);
 
       if ((conversationStage === "availability" || conversationStage === "permission") && (isIdentityQuestion(transcript) || isPurposeQuestion(transcript))) {
@@ -3345,7 +3412,9 @@ async function startServer() {
         if (appointmentData.date && appointmentData.time) {
           appointmentData.confirmed = true;
           console.log("[SCHEDULING CONFIRMED]", JSON.stringify(appointmentData));
-          return decision(buildAppointmentMemoryConfirmation(), "post_qualification", false, 10);
+          console.log("[APPOINTMENT CONFIRMED]", JSON.stringify(appointmentData));
+          console.log("[REPEAT_FALLBACK_BLOCKED_APPOINTMENT_CONFIRMED]");
+          return decision(buildAppointmentMemoryConfirmation(), "post_qualification", false, 18);
         }
         return decision(buildAppointmentPromptForMissingInfo(), "appointment", false, 8);
       }
@@ -3495,8 +3564,9 @@ async function startServer() {
           console.log("[APPOINTMENT TIME ALREADY KNOWN]");
           console.log("[SCHEDULING CONFIRMED]", JSON.stringify(appointmentData));
           console.log("[APPOINTMENT CONFIRMED]", JSON.stringify(appointmentData));
+          console.log("[REPEAT_FALLBACK_BLOCKED_APPOINTMENT_CONFIRMED]");
           console.log("[GEMINI SKIPPED]");
-          return decision(buildAppointmentMemoryConfirmation(), "post_qualification", false, 12);
+          return decision(buildAppointmentMemoryConfirmation(), "post_qualification", false, 18);
         }
         if (appointmentData.time || appointmentData.date) {
           console.log("[APPOINTMENT DATA UPDATED]", JSON.stringify(appointmentData));
@@ -3520,7 +3590,8 @@ async function startServer() {
           console.log("[APPOINTMENT TIME ALREADY KNOWN]");
           console.log("[SCHEDULING CONFIRMED]", JSON.stringify(appointmentData));
           console.log("[APPOINTMENT CONFIRMED]", JSON.stringify(appointmentData));
-          return decision(buildAppointmentMemoryConfirmation(), "post_qualification", false, 12);
+          console.log("[REPEAT_FALLBACK_BLOCKED_APPOINTMENT_CONFIRMED]");
+          return decision(buildAppointmentMemoryConfirmation(), "post_qualification", false, 18);
         }
         console.log("[GEMINI SKIPPED]");
         return decision(buildAppointmentPromptForMissingInfo(), "appointment", false, 10);
@@ -3727,7 +3798,9 @@ async function startServer() {
       console.log("[GREETING FINAL]", greetingText);
       conversationStage = "greeting";
       console.log("[STAGE FLOW]", conversationStage);
-      const optimizedGreetingText = compressReplyForLiveCall(greetingText, 16);
+      const optimizedGreetingText = /\b(my name is|this is|am i speaking|speaking with)\b/i.test(greetingText)
+        ? (console.log("[GREETING_COMPRESSION_SKIPPED_IDENTITY]"), greetingText)
+        : compressReplyForLiveCall(greetingText, 16);
       const greetingAudio = await timedStep("TTS", () => fetchTtsAudio(optimizedGreetingText, ownerId));
       if (isEnded()) return;
 
@@ -3850,6 +3923,7 @@ async function startServer() {
           if (partialAgeMs <= 2000) {
             transcript = `${pendingPartialTranscript} ${transcript}`.trim();
             console.log("[PARTIAL_TRANSCRIPT_MERGED]", transcript);
+            if (conversationStage === "appointment") console.log("[APPOINTMENT_PARTIAL_MERGED]", transcript);
           }
           pendingPartialTranscript = "";
           pendingPartialTranscriptAt = 0;
