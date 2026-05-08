@@ -1971,6 +1971,7 @@ async function startServer() {
     let lastQualificationClarification = "";
     const recentUserTranscripts: string[] = [];
     const qualificationFieldAttempts: Record<string, number> = {};
+    const qualificationFieldValues: Record<string, string> = {};
     let lastQualificationAnswerAccepted = false;
     let lastAckReply = "";
     let pendingCompletedStage: ConversationStage | null = null;
@@ -2671,12 +2672,46 @@ async function startServer() {
       return fields;
     };
 
+    const normalizeQualificationFieldName = (field: string) => {
+      if (["configuration", "productOption", "selectedOption", "propertyConfiguration"].includes(field)) return "configuration";
+      if (["purpose", "intent"].includes(field)) return "purpose";
+      return field;
+    };
+
+    const getQualificationField = (_callData: any, field: string) => {
+      const canonical = normalizeQualificationFieldName(field);
+      return qualificationFieldValues[canonical] ||
+        (leadData as any)[canonical] ||
+        (canonical === "configuration" ? ((leadData as any).productOption || (leadData as any).selectedOption || (leadData as any).propertyConfiguration) : "");
+    };
+
+    const setQualificationField = (_callData: any, field: string, value: string) => {
+      const canonical = normalizeQualificationFieldName(field);
+      const clean = String(value || "").trim();
+      if (!clean) return;
+      qualificationFieldValues[canonical] = clean;
+      (leadData as any)[canonical] = clean;
+      if (canonical === "configuration") {
+        (leadData as any).productOption = clean;
+        (leadData as any).selectedOption = clean;
+        (leadData as any).propertyConfiguration = clean;
+      }
+      console.log("[QUALIFICATION_FIELD_CANONICAL_SET]", canonical, clean);
+      console.log("[QUALIFICATION_FIELD_ALIASES_UPDATED]");
+    };
+
     const getStoredQualificationFields = (kb: any) => {
       const questions = getQualificationQuestions(kb);
       const fields = new Set<string>();
       Object.entries(leadData.answers).forEach(([index, answer]) => {
         const field = inferQualificationField(questions[Number(index)]?.text || "");
-        if (field && String(answer || "").trim()) fields.add(field);
+        if (field && String(answer || "").trim()) fields.add(normalizeQualificationFieldName(field));
+      });
+      Object.entries(qualificationFieldValues).forEach(([field, answer]) => {
+        if (String(answer || "").trim()) fields.add(normalizeQualificationFieldName(field));
+      });
+      ["purpose", "configuration", "budget", "timeline"].forEach((field) => {
+        if (getQualificationField(leadData, field)) fields.add(field);
       });
       return fields;
     };
@@ -2713,7 +2748,18 @@ async function startServer() {
       if (!t) return "";
       if (/\b(1\s*bhk|1bhk|one\s*bhk|one bedroom|1 bedroom|one b|1 b)\b/i.test(t)) return "1 BHK";
       if (/\b(2\s*bhk|2bhk|two\s*bhk|two\s*b\s*h\s*k|2\s*b\s*h\s*k|2 bedroom|two bedroom|2 bed|two bed|2 b|two b|two be|two bee|to bhk|too bhk|do bhk|do b h k|do bedroom|do b|interested in 2\s*bhk|looking for 2\s*bhk|i said 2\s*bhk|i told you 2\s*bhk|already told you 2\s*bhk)\b/i.test(t)) return "2 BHK";
-      if (/\b(3\s*bhk|3bhk|three\s*bhk|three bedroom|3 bedroom|three b|3 b)\b/i.test(t)) return "3 BHK";
+      if (/\b(3\s*bhk|3bhk|three\s*bhk|three bedroom|3 bedroom|three b|3 b|3\s+3\s*bhk|i said 3\s*bhk|i told you 3\s*bhk|already told you 3\s*bhk|3\s*bhk\s*3\s*bhk)\b/i.test(t)) return "3 BHK";
+      return "";
+    };
+
+    const extractActiveConfigurationAnswer = (userText: string) => {
+      const t = normalizeTurnText(userText);
+      if (!t) return "";
+      const explicit = extractConfigurationAnswer(userText);
+      if (explicit) return explicit;
+      if (/^(1|one)$/.test(t) || /\b(i said|i told you|already told you)\s+(1|one)\b/i.test(t)) return "1 BHK";
+      if (/^(2|two|do)$/.test(t) || /\b(i said|i told you|already told you)\s+(2|two|do)\b/i.test(t)) return "2 BHK";
+      if (/^(3|three)$/.test(t) || /\b(i said|i told you|already told you)\s+(3|three)\b/i.test(t) || /^3\s+3$/.test(t)) return "3 BHK";
       return "";
     };
 
@@ -2764,6 +2810,7 @@ async function startServer() {
         return false;
       }
       leadData.answers[index] = value;
+      setQualificationField(leadData, field, value);
       if (field === "configuration") {
         console.log("[CONFIGURATION_SIGNAL_STORED]", value);
         console.log("[CONFIGURATION_ALREADY_STORED_SKIP]", index);
@@ -2901,6 +2948,8 @@ async function startServer() {
         currentQuestionIndex += 1;
       }
       leadData.answers[currentQuestionIndex] = clean;
+      const storedField = inferQualificationField(questionText || "");
+      if (storedField) setQualificationField(leadData, storedField, clean);
       console.log("[ANSWER STORED]", currentQuestionIndex, clean);
       console.log("[LEAD MEMORY UPDATED]", currentQuestionIndex, "->", clean);
       currentQuestionIndex += 1;
@@ -3433,9 +3482,34 @@ async function startServer() {
       const stageConfirmationDecision = advanceScriptAfterConfirmation();
       if (stageConfirmationDecision) return stageConfirmationDecision;
 
+      const qualificationDebugSnapshot = (userText: string) => {
+        const questions = getQualificationQuestions(kb);
+        const currentQuestion = questions[currentQuestionIndex]?.text || "";
+        const inferredField = inferQualificationField(currentQuestion);
+        console.log("[QUALIFICATION_DEBUG_STATE]", JSON.stringify({
+          currentIndex: currentQuestionIndex,
+          currentQuestion,
+          inferredField,
+          storedPurpose: getQualificationField(callData, "purpose") || "",
+          storedConfiguration: getQualificationField(callData, "configuration") || "",
+          storedBudget: getQualificationField(callData, "budget") || "",
+          storedTimeline: getQualificationField(callData, "timeline") || "",
+          userText,
+        }));
+      };
+
+      const logQualificationDebugAfterStore = () => {
+        console.log("[QUALIFICATION_DEBUG_AFTER_STORE]", JSON.stringify({
+          storedPurpose: getQualificationField(callData, "purpose") || "",
+          storedConfiguration: getQualificationField(callData, "configuration") || "",
+          storedBudget: getQualificationField(callData, "budget") || "",
+          storedTimeline: getQualificationField(callData, "timeline") || "",
+        }));
+      };
+
       const findRecentConfigurationAnswer = () => {
         for (const recent of [...recentUserTranscripts].reverse()) {
-          const config = extractConfigurationAnswer(recent);
+          const config = extractActiveConfigurationAnswer(recent);
           if (config) {
             console.log("[RECENT_USER_BUFFER_SIGNAL_FOUND]", config);
             return config;
@@ -3448,7 +3522,8 @@ async function startServer() {
         const missing = getFirstMissingQualificationIndex(kb);
         if (missing?.field !== "configuration") return false;
         console.log("[ACTIVE_CONFIG_CAPTURE_ATTEMPT]", input);
-        let config = extractConfigurationAnswer(input);
+        qualificationDebugSnapshot(input);
+        let config = extractActiveConfigurationAnswer(input);
         const frustrationOnly = /^(i said|i told you|already told you|i already told you)$/i.test(normalizeTurnText(input));
         if (!config && frustrationOnly) {
           console.log("[FRUSTRATION_REPEAT_DETECTED]", input);
@@ -3466,9 +3541,12 @@ async function startServer() {
           return false;
         }
         console.log("[ACTIVE_CONFIG_CAPTURED]", config);
+        console.log("[CONFIGURATION_SIGNAL_NORMALIZED]", config);
         storeQualificationSignal("configuration", config, kb);
         currentQuestionIndex = (getQualificationFieldIndex(kb, "configuration") ?? currentQuestionIndex) + 1;
+        console.log("[QUALIFICATION_INDEX_ADVANCED_AFTER_CONFIG]", currentQuestionIndex);
         lastQualificationAnswerAccepted = true;
+        logQualificationDebugAfterStore();
         return true;
       };
 
@@ -3497,6 +3575,8 @@ async function startServer() {
         lastQualificationClarification = clarification;
         return clarification;
       };
+
+      if (conversationStage === "qualification") qualificationDebugSnapshot(transcript);
 
       if (conversationStage === "qualification" && storeActiveConfigurationIfPresent(transcript)) {
         const nextQuestionReply = askNextQualificationQuestion(callData, kb);
@@ -3749,6 +3829,7 @@ async function startServer() {
       }
 
       if (conversationStage === "qualification") {
+        qualificationDebugSnapshot(transcript);
         if (storeActiveConfigurationIfPresent(transcript)) {
           const nextQuestionReply = askNextQualificationQuestion(callData, kb);
           return decision(nextQuestionReply, conversationStage, false, 10);
