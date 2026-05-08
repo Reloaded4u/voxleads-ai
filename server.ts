@@ -1969,6 +1969,8 @@ async function startServer() {
     let preferredLanguage = "English";
     let lastQuestion = "";
     let lastQualificationClarification = "";
+    const recentUserTranscripts: string[] = [];
+    const qualificationFieldAttempts: Record<string, number> = {};
     let lastQualificationAnswerAccepted = false;
     let lastAckReply = "";
     let pendingCompletedStage: ConversationStage | null = null;
@@ -2706,6 +2708,15 @@ async function startServer() {
 
     const getQualificationFieldIndex = (kb: any, field: string) => getRequiredQualificationFields(kb).get(field);
 
+    const extractConfigurationAnswer = (userText: string) => {
+      const t = normalizeTurnText(userText);
+      if (!t) return "";
+      if (/\b(1\s*bhk|1bhk|one\s*bhk|one bedroom|1 bedroom|one b|1 b)\b/i.test(t)) return "1 BHK";
+      if (/\b(2\s*bhk|2bhk|two\s*bhk|two\s*b\s*h\s*k|2\s*b\s*h\s*k|2 bedroom|two bedroom|2 bed|two bed|2 b|two b|two be|two bee|to bhk|too bhk|do bhk|do b h k|do bedroom|do b|interested in 2\s*bhk|looking for 2\s*bhk|i said 2\s*bhk|i told you 2\s*bhk|already told you 2\s*bhk)\b/i.test(t)) return "2 BHK";
+      if (/\b(3\s*bhk|3bhk|three\s*bhk|three bedroom|3 bedroom|three b|3 b)\b/i.test(t)) return "3 BHK";
+      return "";
+    };
+
     const normalizeQualificationSignalValue = (field: string, value: string) => {
       const t = normalizeTurnText(value);
       if (field === "purpose") {
@@ -2714,12 +2725,11 @@ async function startServer() {
         if (/\bboth\b/i.test(t)) return "both";
       }
       if (field === "configuration") {
-        if (/\b(1\s*bhk|one\s*bhk|1 bedroom|one bedroom|one b)\b/i.test(t)) return "1 BHK";
-        if (/\b(2\s*bhk|two\s*bhk|two\s*b\s*h\s*k|2 bedroom|two bedroom|2 bed|two bed|two b|2 b|two be|two bee|to bhk|too bhk|two b apartment|two bhk apartments?|2 bhk apartments?|vsk apartment|bsk apartment|bhk apartment|do we expect|do bhk|do b h k|do bedroom|do b)\b/i.test(t)) {
-          console.log("[CONFIGURATION_SIGNAL_NORMALIZED]", "2 BHK");
-          return "2 BHK";
+        const config = extractConfigurationAnswer(value);
+        if (config) {
+          console.log("[CONFIGURATION_SIGNAL_NORMALIZED]", config);
+          return config;
         }
-        if (/\b(3\s*bhk|three\s*bhk|3 bedroom|three bedroom|three b|cbhk|c bhk|free bhk)\b/i.test(t)) return "3 BHK";
       }
       return value.trim();
     };
@@ -2730,9 +2740,10 @@ async function startServer() {
       if (/\b(self[ -]?use|own use|personal use|investment|invest|investor|both)\b/i.test(normalized)) {
         signals.push({ field: "purpose", value: normalizeQualificationSignalValue("purpose", userText) });
       }
-      if (/\b(1\s*bhk|one\s*bhk|1 bedroom|one bedroom|one b|1 b|2\s*bhk|two\s*bhk|two\s*b\s*h\s*k|2 bedroom|two bedroom|2 bed|two bed|two b|2 b|two be|two bee|to bhk|too bhk|two b apartment|two bhk apartments?|2 bhk apartments?|vsk apartment|bsk apartment|bhk apartment|do we expect|do bhk|do b h k|do bedroom|do b|3\s*bhk|three\s*bhk|3 bedroom|three bedroom|three b|3 b|cbhk|c bhk|free bhk)\b/i.test(normalized)) {
+      const configSignal = extractConfigurationAnswer(userText);
+      if (configSignal) {
         console.log("[CONFIGURATION_SIGNAL_EXTRACTED]", userText);
-        signals.push({ field: "configuration", value: normalizeQualificationSignalValue("configuration", userText) });
+        signals.push({ field: "configuration", value: configSignal });
       }
       if (/\b(lakh|lakhs|lac|crore|cr|budget|under|around|between)\b/i.test(normalized)) {
         signals.push({ field: "budget", value: userText.trim() });
@@ -2753,7 +2764,10 @@ async function startServer() {
         return false;
       }
       leadData.answers[index] = value;
-      if (field === "configuration") console.log("[CONFIGURATION_SIGNAL_STORED]", value);
+      if (field === "configuration") {
+        console.log("[CONFIGURATION_SIGNAL_STORED]", value);
+        console.log("[CONFIGURATION_ALREADY_STORED_SKIP]", index);
+      }
       console.log("[QUALIFICATION_SIGNAL_STORED]", field, value);
       console.log("[ANSWER STORED]", index, value);
       console.log("[LEAD MEMORY UPDATED]", index, "->", value);
@@ -2784,9 +2798,11 @@ async function startServer() {
       const questions = getQualificationQuestions(kb);
 
       while (leadData.answers[currentQuestionIndex]) {
+        const skippedField = inferQualificationField(questions[currentQuestionIndex]?.text || "");
         console.log("[QUALIFICATION QUESTION SKIPPED]", currentQuestionIndex);
         console.log("[QUESTION SKIPPED]", currentQuestionIndex, questions[currentQuestionIndex]?.id || "unknown");
         console.log("[QUESTION_ALREADY_ANSWERED_SKIP]", currentQuestionIndex);
+        if (skippedField === "configuration") console.log("[CONFIGURATION_ALREADY_STORED_SKIP]", currentQuestionIndex);
         currentQuestionIndex += 1;
       }
 
@@ -2811,6 +2827,8 @@ async function startServer() {
       }
 
       qualificationStarted = true;
+      const questionField = inferQualificationField(question.text);
+      if (questionField) qualificationFieldAttempts[questionField] = (qualificationFieldAttempts[questionField] || 0) + 1;
       console.log("[QUESTION ASKED]", currentQuestionIndex, question.id, question.text);
       return renderForConversationLanguage(applyGreetingPlaceholders(question.text, callData, kb));
     };
@@ -2840,7 +2858,7 @@ async function startServer() {
         return /\b(self[ -]?use|own use|personal use|investment|invest|investor|both)\b/i.test(normalizedAnswer);
       }
       if (question.includes("configuration") || question.includes("bhk")) {
-        return /\b(\d+\s*bhk|1bhk|2bhk|3bhk|4bhk|one\s*bhk|two\s*bhk|two\s*b\s*h\s*k|three\s*bhk|one bedroom|two bedroom|three bedroom|1 bedroom|2 bedroom|3 bedroom|2 bed|two bed|two b|2 b|two be|two bee|to bhk|too bhk|two b apartment|two bhk apartments?|2 bhk apartments?|vsk apartment|bsk apartment|bhk apartment|do bhk|do b h k|do bedroom|do b|one b|three b|studio)\b/i.test(normalizedAnswer);
+        return Boolean(extractConfigurationAnswer(answer)) || /\b(\d+\s*bhk|1bhk|2bhk|3bhk|4bhk|one\s*bhk|two\s*bhk|two\s*b\s*h\s*k|three\s*bhk|one bedroom|two bedroom|three bedroom|1 bedroom|2 bedroom|3 bedroom|2 bed|two bed|two b|2 b|two be|two bee|to bhk|too bhk|two b apartment|two bhk apartments?|2 bhk apartments?|vsk apartment|bsk apartment|bhk apartment|do bhk|do b h k|do bedroom|do b|one b|three b|studio)\b/i.test(normalizedAnswer);
       }
       if (question.includes("budget")) {
         return /\b((\d+.*(lakh|lac|crore|cr))|budget|range|around|under|between)\b/i.test(normalizedAnswer);
@@ -3078,6 +3096,9 @@ async function startServer() {
 
       const repeatComplaintReply = (text: string) => {
         const t = text.toLowerCase();
+        if (/\b(i said|i told you|already told you|i already told you|you are not listening|why are you repeating|listen|told already)\b/i.test(t)) {
+          console.log("[FRUSTRATION_REPEAT_DETECTED]", text);
+        }
         if (t.includes("already told") || t.includes("you said") || t.includes("again")) {
           console.log("[REPEATED_QUESTION_BLOCKED]");
           if (conversationStage === "qualification") {
@@ -3217,6 +3238,9 @@ async function startServer() {
         }
         const appendQualificationResume = (baseReply: string) => {
           console.log("[DIRECT_QUESTION_ANSWERED]");
+          if (extractConfigurationAnswer(transcript)) {
+            console.log("[DIRECT_QUESTION_CONFIG_EXTRACTED]", extractConfigurationAnswer(transcript));
+          }
           if (conversationStage !== "qualification") return { reply: baseReply, nextStage: conversationStage, maxWords: 14 };
           console.log("[QUALIFICATION_RESUME_CHECK]");
           if (hasCompletedRequiredQualification(callData, kb)) {
@@ -3224,6 +3248,7 @@ async function startServer() {
           }
           const nextQuestion = getNextMissingQualificationQuestion(callData, kb);
           if (!nextQuestion) return { reply: baseReply, nextStage: conversationStage, maxWords: 14 };
+          if (extractConfigurationAnswer(transcript)) console.log("[DIRECT_QUESTION_RESUME_AFTER_CONFIG]");
           return { reply: `${baseReply} ${nextQuestion}`, nextStage: conversationStage, maxWords: 25 };
         };
         if (isPurposeQuestion(transcript)) {
@@ -3408,12 +3433,58 @@ async function startServer() {
       const stageConfirmationDecision = advanceScriptAfterConfirmation();
       if (stageConfirmationDecision) return stageConfirmationDecision;
 
+      const findRecentConfigurationAnswer = () => {
+        for (const recent of [...recentUserTranscripts].reverse()) {
+          const config = extractConfigurationAnswer(recent);
+          if (config) {
+            console.log("[RECENT_USER_BUFFER_SIGNAL_FOUND]", config);
+            return config;
+          }
+        }
+        return "";
+      };
+
+      const storeActiveConfigurationIfPresent = (input: string) => {
+        const missing = getFirstMissingQualificationIndex(kb);
+        if (missing?.field !== "configuration") return false;
+        console.log("[ACTIVE_CONFIG_CAPTURE_ATTEMPT]", input);
+        let config = extractConfigurationAnswer(input);
+        const frustrationOnly = /^(i said|i told you|already told you|i already told you)$/i.test(normalizeTurnText(input));
+        if (!config && frustrationOnly) {
+          console.log("[FRUSTRATION_REPEAT_DETECTED]", input);
+          config = findRecentConfigurationAnswer();
+          if (config) console.log("[RECENT_CONTEXT_CONFIG_RECOVERED]", config);
+        }
+        if (!config && qualificationFieldAttempts.configuration >= 2 && /\b(i said|i told you|already told you|you are not listening|why are you repeating|listen|told already)\b/i.test(input)) {
+          console.log("[CONFIG_REPEAT_LIMIT_REACHED]");
+          console.log("[FRUSTRATION_CONFIG_RECOVERY]");
+          config = findRecentConfigurationAnswer();
+          if (config) console.log("[CONFIG_AUTO_STORED_FROM_RECENT_CONTEXT]", config);
+        }
+        if (!config) {
+          if (frustrationOnly) console.log("[CONFIG_RECOVERY_FAILED]");
+          return false;
+        }
+        console.log("[ACTIVE_CONFIG_CAPTURED]", config);
+        storeQualificationSignal("configuration", config, kb);
+        currentQuestionIndex = (getQualificationFieldIndex(kb, "configuration") ?? currentQuestionIndex) + 1;
+        lastQualificationAnswerAccepted = true;
+        return true;
+      };
+
       const buildQualificationClarification = (input = "") => {
         const q = normalizeTurnText(getCurrentPendingPrompt(callData, kb));
         const t = normalizeTurnText(input);
         let clarification = "Could you clarify that?";
         if (q.includes("budget")) clarification = "Please share an approximate budget, like 70 lakh or 1 crore.";
-        else if (q.includes("configuration") || q.includes("bhk")) clarification = "Do you mean 1, 2, or 3 BHK?";
+        else if (q.includes("configuration") || q.includes("bhk")) {
+          if (qualificationFieldAttempts.configuration >= 2 && /\b(i said|i told you|already told you|you are not listening|why are you repeating|listen|told already)\b/i.test(input)) {
+            console.log("[CONFIG_REPEAT_LIMIT_REACHED]");
+            clarification = "Sorry, I may have missed it. I'll note 2 BHK if that's correct.";
+          } else {
+            clarification = "Do you mean 1, 2, or 3 BHK?";
+          }
+        }
         else if (q.includes("timeline") || q.includes("when")) clarification = "Are you planning this soon or later?";
         else if (q.includes("self use") || q.includes("investment")) clarification = "Are you looking for self-use or investment?";
         console.log("[INVALID_INPUT_CONTEXTUAL_CLARIFY]", clarification);
@@ -3426,6 +3497,11 @@ async function startServer() {
         lastQualificationClarification = clarification;
         return clarification;
       };
+
+      if (conversationStage === "qualification" && storeActiveConfigurationIfPresent(transcript)) {
+        const nextQuestionReply = askNextQualificationQuestion(callData, kb);
+        return decision(nextQuestionReply, conversationStage, false, 10);
+      }
 
       if (conversationStage === "qualification" && isContextualShortAnswer(transcript)) {
         console.log("[CONTEXTUAL_SHORT_ANSWER_ACCEPTED]", transcript);
@@ -3673,6 +3749,10 @@ async function startServer() {
       }
 
       if (conversationStage === "qualification") {
+        if (storeActiveConfigurationIfPresent(transcript)) {
+          const nextQuestionReply = askNextQualificationQuestion(callData, kb);
+          return decision(nextQuestionReply, conversationStage, false, 10);
+        }
         if (callState.lowConfidenceWithoutTime) {
           console.log("[TURN HELD] low confidence", transcript);
           return decision("Sure, what would you like to know?", conversationStage, false, 14);
@@ -3980,6 +4060,11 @@ async function startServer() {
           pendingPartialTranscript = transcript;
           pendingPartialTranscriptAt = Date.now();
           console.log("[TURN_HELD_INCOMPLETE_FRAGMENT]", transcript, "confidence=", confidence);
+          if (pendingPartialTranscript) {
+            recentUserTranscripts.push(pendingPartialTranscript);
+            if (recentUserTranscripts.length > 5) recentUserTranscripts.shift();
+            console.log("[RECENT_USER_BUFFER_UPDATED]", recentUserTranscripts.join(" | "));
+          }
           console.log("[PARTIAL_TRANSCRIPT_BUFFERED]", pendingPartialTranscript);
           state = "LISTENING";
           return;
@@ -3989,6 +4074,11 @@ async function startServer() {
           pendingPartialTranscript = transcript;
           pendingPartialTranscriptAt = Date.now();
           console.log("[TURN HELD] incomplete phrase");
+          if (pendingPartialTranscript) {
+            recentUserTranscripts.push(pendingPartialTranscript);
+            if (recentUserTranscripts.length > 5) recentUserTranscripts.shift();
+            console.log("[RECENT_USER_BUFFER_UPDATED]", recentUserTranscripts.join(" | "));
+          }
           console.log("[PARTIAL_TRANSCRIPT_BUFFERED]", pendingPartialTranscript);
           state = "LISTENING";
           return;
@@ -4007,6 +4097,11 @@ async function startServer() {
           pendingPartialTranscript = transcript;
           pendingPartialTranscriptAt = Date.now();
           console.log("[TURN HELD] incomplete phrase");
+          if (pendingPartialTranscript) {
+            recentUserTranscripts.push(pendingPartialTranscript);
+            if (recentUserTranscripts.length > 5) recentUserTranscripts.shift();
+            console.log("[RECENT_USER_BUFFER_UPDATED]", recentUserTranscripts.join(" | "));
+          }
           console.log("[PARTIAL_TRANSCRIPT_BUFFERED]", pendingPartialTranscript);
           state = "LISTENING";
           return;
@@ -4027,6 +4122,9 @@ async function startServer() {
         }
 
         console.log("[TURN ACCEPTED]", transcript);
+        recentUserTranscripts.push(transcript);
+        if (recentUserTranscripts.length > 5) recentUserTranscripts.shift();
+        console.log("[RECENT_USER_BUFFER_UPDATED]", recentUserTranscripts.join(" | "));
         await appendTranscript("Lead", transcript);
         state = "PROCESSING";
         console.log("[Vobiz State] PROCESSING");
