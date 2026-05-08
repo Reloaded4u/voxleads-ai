@@ -2359,11 +2359,42 @@ async function startServer() {
       console.log("[KB SCRIPT FIELD USED]", field, "fallback");
       return prepareScriptField(fallback);
     };
+    const getScriptContextSubject = (kb: any) => {
+      const profile = kb?.businessProfile || kb?.profile || {};
+      const guidance = getCallGuidance(kb);
+      const subject = firstText(
+        guidance.projectName,
+        guidance.productName,
+        guidance.serviceName,
+        profile.projectName,
+        profile.productName,
+        profile.serviceName,
+        profile.name,
+        kb?.projectName,
+        kb?.productName,
+        kb?.serviceName,
+        collectKbText(kb?.productsServices).split(/[.!?\n]/)[0]
+      );
+      return subject || "your enquiry";
+    };
+
+    const contextualizePermissionLine = (text: string, kb: any) => {
+      if (!/^may i quickly explain\??$/i.test(text.trim())) return text;
+      console.log("[PERMISSION_CONTEXT_INCLUDED]");
+      return `May I quickly explain the details of ${getScriptContextSubject(kb)}?`;
+    };
+
+    const contextualizePitchLine = (text: string, kb: any) => {
+      if (!/shown interest\.?$/i.test(text.trim()) && !/^i'?m reaching out because you have shown interest\.?$/i.test(text.trim())) return text;
+      console.log("[PITCH_CONTEXT_INCLUDED]");
+      return `I'm reaching out because you showed interest in ${getScriptContextSubject(kb)}.`;
+    };
+
     const getOpeningHook = (kb: any) =>
-      getScriptField(kb, "hook", "May I take 30 seconds to explain?", ["openingLine"]);
+      contextualizePitchLine(getScriptField(kb, "hook", "I'm reaching out because you submitted an enquiry about our service.", ["openingLine"]), kb);
 
     const getMainPitch = (kb: any) =>
-      getScriptField(kb, "pitch", "I can share the key details briefly.", ["mainPitch"]);
+      contextualizePitchLine(getScriptField(kb, "pitch", "I can share the key details briefly.", ["mainPitch"]), kb);
 
     const getQualificationQuestions = (kb: any) => {
       const raw = getCallGuidance(kb)?.qualificationQuestions;
@@ -2415,6 +2446,13 @@ async function startServer() {
       if (conversationStage === "qualification") return isValidQualificationAnswer(text, lastQuestion || "");
       if (["availability", "permission", "hook", "pitch"].includes(conversationStage)) return isContinuationIntent(text) || isPositiveResponse(text);
       return detectIntentType(text) !== "general_question" || isIdentityQuestion(text) || isPurposeQuestion(text);
+    };
+
+    const isPostQualificationIncompleteQuestion = (text: string, confidence = 1) => {
+      if (conversationStage !== "post_qualification") return false;
+      const normalized = normalizeTurnText(text);
+      return /^(do you have any|do you have an|are you running any|are there any|do you offer any|any offer|any offers|any promotion|any promotional|what about|can you tell me about)$/i.test(normalized) ||
+        (/^do you hear any$/i.test(normalized) && confidence < 0.75);
     };
 
     const isIncompleteSpeechFragment = (text: string, confidence = 1) => {
@@ -2549,7 +2587,7 @@ async function startServer() {
       applyGreetingPlaceholders(getScriptField(kb, "availabilityCheck", "Is this a good time for a quick call?", ["availabilityQuestion"]), callData, kb);
 
     const buildPermissionQuestion = (callData: any, kb: any) =>
-      applyGreetingPlaceholders(getScriptField(kb, "permissionLine", "May I quickly explain?", ["permissionQuestion"]), callData, kb);
+      applyGreetingPlaceholders(contextualizePermissionLine(getScriptField(kb, "permissionLine", "May I quickly explain the details of your enquiry?", ["permissionQuestion"]), kb), callData, kb);
 
     const buildSchedulingQuestion = (callData: any, kb: any) => {
       const guidance = getCallGuidance(kb);
@@ -2870,7 +2908,8 @@ async function startServer() {
         moveStage("post_qualification");
         console.log("[APPOINTMENT DEFERRED]");
         console.log("[STAGE FLOW]", conversationStage);
-        return "Thanks, I have noted that.";
+        console.log("[POST_QUAL_NEXT_STEP_PROMPT_USED]");
+        return "Thanks. Would you like me to arrange a site visit or have the team share latest pricing details?";
       }
 
       qualificationStarted = true;
@@ -3273,6 +3312,11 @@ async function startServer() {
       };
 
       const answerFromKB = async () => {
+        const detectedIntentType = detectIntentType(transcript);
+        if (conversationStage === "post_qualification" && detectedIntentType === "offers") {
+          console.log("[OFFER_QUESTION_DETECTED]", transcript);
+          console.log("[POST_QUAL_DIRECT_QUESTION_HANDLED]");
+        }
         if (!hasClearBusinessIntent(transcript) && !isIdentityQuestion(transcript) && !isPurposeQuestion(transcript)) {
           console.log("[INTENT_CONFIDENCE_LOW]");
           console.log("[KB_SEARCH_BLOCKED]");
@@ -3326,7 +3370,8 @@ async function startServer() {
         console.log("[DECISION: FALLBACK]");
         console.log("[DIRECT QUESTION HANDLED]");
         console.log("[RETURNING TO STAGE]", conversationStage);
-        const resumed = appendQualificationResume(detectIntentType(transcript) === "pricing" ? pricingFallback : missingKbAnswerFallback);
+        const offerFallback = "Offers may depend on current availability and booking terms. Our team can share the latest active offers.";
+        const resumed = appendQualificationResume(detectedIntentType === "pricing" ? pricingFallback : detectedIntentType === "offers" ? offerFallback : missingKbAnswerFallback);
         return decision(resumed.reply, resumed.nextStage, false, resumed.maxWords);
       };
 
@@ -3639,6 +3684,11 @@ async function startServer() {
 
       if (["post_qualification", "appointment"].includes(conversationStage) && routedIntent !== "direct_question" && routedIntent !== "scheduling_request" && isWeakFillerInput(transcript)) {
         console.log("[GEMINI SKIPPED FILLER]", transcript);
+        if (conversationStage === "post_qualification") {
+          console.log("[WEAK_FILLER_BLOCKED_POST_QUAL]", transcript);
+          console.log("[POST_QUAL_CONTEXTUAL_OPTIONS_USED]");
+          return decision("Would you like to know pricing, offers, amenities, or schedule a site visit?", conversationStage, false, 14);
+        }
         const pendingPrompt = getCurrentPendingPrompt(callData, kb);
         return decision(pendingPrompt || "Sure, what would you like to know?", conversationStage, false, 14);
       }
@@ -3731,7 +3781,9 @@ async function startServer() {
         if (isContinueInfoRequest(transcript)) {
           console.log("[DECISION: CLARIFY]");
           console.log("[CONTINUE HANDLED AS INFO REQUEST]");
-          return decision("Sure, what would you like to know?", "post_qualification", false, 14);
+          console.log("[WEAK_FILLER_BLOCKED_POST_QUAL]");
+          console.log("[POST_QUAL_CONTEXTUAL_OPTIONS_USED]");
+          return decision("Would you like to know pricing, offers, amenities, or schedule a site visit?", "post_qualification", false, 14);
         }
         if (isAppointmentSuggestionIntent(transcript)) {
           console.log("[DECISION: ASK_NEXT]");
@@ -3741,7 +3793,9 @@ async function startServer() {
         }
         console.log("[DECISION: CLARIFY]");
         console.log("[APPOINTMENT DEFERRED]");
-        return decision("Sure, what would you like to know?", "post_qualification", false, 14);
+        console.log("[WEAK_FILLER_BLOCKED_POST_QUAL]");
+        console.log("[POST_QUAL_CONTEXTUAL_OPTIONS_USED]");
+        return decision("Are you asking about pricing, offers, amenities, or scheduling a visit?", "post_qualification", false, 14);
       }
 
       if (conversationStage === "appointment") {
@@ -4131,10 +4185,20 @@ async function startServer() {
             transcript = `${pendingPartialTranscript} ${transcript}`.trim();
             console.log("[PARTIAL_TRANSCRIPT_MERGED]", transcript);
             if (conversationStage === "appointment") console.log("[APPOINTMENT_PARTIAL_MERGED]", transcript);
+            if (conversationStage === "post_qualification") console.log("[POST_QUAL_PARTIAL_MERGED]", transcript);
           }
           pendingPartialTranscript = "";
           pendingPartialTranscriptAt = 0;
           console.log("[PARTIAL_TRANSCRIPT_CLEARED]");
+        }
+
+        if (isPostQualificationIncompleteQuestion(transcript, confidence)) {
+          pendingPartialTranscript = transcript;
+          pendingPartialTranscriptAt = Date.now();
+          console.log("[POST_QUAL_INCOMPLETE_QUESTION_HELD]", transcript);
+          console.log("[POST_QUAL_PARTIAL_BUFFERED]", pendingPartialTranscript);
+          state = "LISTENING";
+          return;
         }
 
         if (isIncompleteSpeechFragment(transcript, confidence)) {
