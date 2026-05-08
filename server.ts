@@ -289,6 +289,16 @@ function countWords(value: string) {
 
 function trimToSentenceOrWords(value: string, maxWords: number) {
   const clean = value.replace(/\s+/g, " ").trim();
+  const protectedPhrases = [
+    "good time for a quick call",
+    "quick call",
+    "May I quickly explain?",
+    "Am I speaking with",
+    "from the sales team",
+    "calling about your enquiry",
+    "I just wanted to check",
+  ];
+  if (protectedPhrases.some((phrase) => clean.toLowerCase().includes(phrase.toLowerCase()))) return clean;
   if (countWords(clean) <= maxWords) return clean;
 
   const sentences = clean.match(/[^.!?]+[.!?]+/g) || [];
@@ -321,7 +331,8 @@ function sanitizeOutboundReply(value: string, fallback = "Sorry, could you repea
 }
 
 function cleanFinalResponse(value: string, fallback = "Sure, what would you like to know?", maxWords = 15) {
-  let clean = value
+  const originalReply = String(value || "").replace(/\s+/g, " ").trim();
+  let clean = originalReply
     .replace(/\b\d{8,}\b/g, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -345,6 +356,13 @@ function cleanFinalResponse(value: string, fallback = "Sure, what would you like
   if (!/[.!?]$/.test(clean)) {
     console.log("[INCOMPLETE SENTENCE FIXED]", clean);
     clean += ".";
+  }
+  const incompleteReply = /\b(this is|a quick|good time for|wanted to check if|calling because|calling about|from the|speaking with|may i quickly)[.!?]?$/i;
+  if (incompleteReply.test(clean) && originalReply && !incompleteReply.test(originalReply)) {
+    console.log("[INCOMPLETE_REPLY_RESTORED]", clean, "->", originalReply);
+    console.log("[REPLY_CLEANER_ROLLBACK_USED]");
+    clean = sanitizeOutboundReply(originalReply, fallback);
+    if (!/[.!?]$/.test(clean)) clean += ".";
   }
   console.log("[FINAL CLEAN RESPONSE]", clean);
   return clean;
@@ -1902,6 +1920,7 @@ async function startServer() {
     let turnInProgress = false;
     let callCompletedLogged = false;
     let greetingDelivered = false;
+    let firstGreetingPlayed = false;
     let leadData: {
       nameConfirmed: boolean;
       answers: Record<number, string>;
@@ -2189,12 +2208,12 @@ async function startServer() {
 
     const isIdentityQuestion = (text: string) => {
       const t = normalizeTurnText(text);
-      return /\b(who is this|who's this|whos this|who are you|who is it|who am i speaking to|where are you calling from|your name|which company|whos calling|who's calling|who calling|who is calling|are you calling me|what was that)\b/i.test(t);
+      return /\b(who is this|who's this|whos this|who are you|who's there|whos there|who is there|who is it|who am i speaking to|where are you calling from|your name|which company|whos calling|who's calling|who calling|who is calling|are you calling me|what was that|quick what)\b/i.test(t);
     };
 
     const isPurposeQuestion = (text: string) => {
       const t = normalizeTurnText(text);
-      return /\b(why are you calling|why did you call|why calling|what is this about|what are you calling about|reason for calling)\b/i.test(t);
+      return /\b(why are you calling|why did you call|why calling|what is this about|what are you calling about|what do you want|reason for calling)\b/i.test(t);
     };
 
     const isKbQuestionIntent = (text: string) => {
@@ -2513,7 +2532,14 @@ async function startServer() {
 
     const buildInitialGreeting = (callData: any, kb: any) => {
       const greeting = getScriptField(kb, "greeting", "Hello, am I speaking to [Lead Name]?");
-      return applyGreetingPlaceholders(greeting, callData, kb);
+      const finalGreeting = applyGreetingPlaceholders(greeting, callData, kb);
+      const concise = finalGreeting.match(/my name is\s+(.+?)\.\s*(am i speaking.+[?])/i);
+      if (concise) {
+        const shortGreeting = `Hello, this is ${concise[1].trim()}. ${concise[2].trim()}`;
+        console.log("[GREETING_SHORT_IDENTITY_USED]", shortGreeting);
+        return shortGreeting;
+      }
+      return finalGreeting;
     };
 
     const buildAvailabilityQuestion = (callData: any, kb: any) =>
@@ -3326,8 +3352,13 @@ async function startServer() {
         console.log("[IDENTITY_QUESTION_DETECTED]", transcript);
         console.log("[IDENTITY_RESPONSE_USED]");
         console.log("[AVAILABILITY_AFTER_IDENTITY]");
-        const identityIntro = isPurposeQuestion(transcript) ? buildPurposeReply(callData, kb) : buildIdentityReply(callData, kb);
-        return decision(`${identityIntro} ${buildAvailabilityQuestion(callData, kb)}`, "availability", false, 24);
+        console.log("[STAGE_ADVANCE_BLOCKED_IDENTITY_CLARIFICATION]");
+        const identityIntro = isIdentityQuestion(transcript) ? buildIdentityReply(callData, kb) : buildPurposeReply(callData, kb);
+        const purposeIntro = isIdentityQuestion(transcript) ? buildPurposeReply(callData, kb) : "";
+        if (/\bquick what\b/i.test(normalizeTurnText(transcript))) {
+          return decision("A quick call about your enquiry.", "availability", false, 12);
+        }
+        return decision(`${identityIntro} ${purposeIntro} ${buildAvailabilityQuestion(callData, kb)}`.replace(/\s+/g, " ").trim(), "availability", false, 30);
       }
 
       const isChannelCheckDuringQualification = (value: string) =>
@@ -3809,6 +3840,7 @@ async function startServer() {
         await timedStep("audio send", () => sendVobizAudio(ws, greetingAudio, () => !playbackInterrupted));
         await appendTranscript("AI", optimizedGreetingText);
         greetingDelivered = true;
+        firstGreetingPlayed = true;
         markCompletedStage("greeting");
         conversationStage = "availability";
         console.log("[STAGE FLOW]", conversationStage);
@@ -3857,6 +3889,20 @@ async function startServer() {
       const stt = await timedStep("STT", () => transcribeBuffer(audioBuffer));
       const transcript = normalizeSttTranscript(stt.transcript || "");
       if (!transcript || !isBargeInPhrase(transcript)) return;
+      const normalizedBargeIn = normalizeTurnText(transcript);
+      const weakGreetingBargeIn = /^(hello|hi|hello\?|yes|yes\?|hmm|haan|ji|are you there)$/i.test(normalizedBargeIn);
+      const strongGreetingBargeIn =
+        isDisinterestIntent(transcript) ||
+        isIdentityQuestion(transcript) ||
+        isPurposeQuestion(transcript) ||
+        /\b(stop|repeat|busy|call later)\b/i.test(normalizedBargeIn);
+      if (conversationStage === "greeting" && !firstGreetingPlayed && weakGreetingBargeIn && !strongGreetingBargeIn) {
+        console.log("[GREETING_BARGE_IN_IGNORED_WEAK_SIGNAL]", transcript);
+        return;
+      }
+      if (conversationStage === "greeting" && !firstGreetingPlayed && strongGreetingBargeIn) {
+        console.log("[GREETING_BARGE_IN_ALLOWED_STRONG_INTENT]", transcript);
+      }
       console.log("[BARGE IN DETECTED]", transcript);
       console.log("[USER_INTERRUPT_DETECTED]", transcript);
       console.log("[USER_BARGE_IN]", transcript);
@@ -4024,7 +4070,20 @@ async function startServer() {
         console.log("[CONVERSATION STAGE]", conversationStage);
         if (isEnded()) return;
 
-        const aiReply = sanitizeOutboundReply(compressReplyForLiveCall(reply, liveReplyMaxWords));
+        const isIncompleteOutgoingReply = (value: string) =>
+          /\b(this is|a quick|good time for|I just wanted to check if|from the|speaking with)[.!?]?$/i.test(String(value || "").trim());
+        const safeStageReply = () => {
+          if (conversationStage === "availability") return "Is this a good time for a quick call?";
+          if (conversationStage === "permission") return "May I quickly explain why I called?";
+          if (conversationStage === "greeting") return "Hello, this is our team calling about your enquiry.";
+          return "Could you say that once more?";
+        };
+        let aiReply = sanitizeOutboundReply(compressReplyForLiveCall(reply, liveReplyMaxWords));
+        if (isIncompleteOutgoingReply(aiReply)) {
+          console.log("[OUTGOING_REPLY_INCOMPLETE_DETECTED]", aiReply);
+          aiReply = safeStageReply();
+          console.log("[OUTGOING_REPLY_REPLACED_SAFE]", aiReply);
+        }
         conversationHistory.push({ role: "user", text: transcript });
         conversationHistory.push({ role: "assistant", text: aiReply });
         lastTranscript = transcript.trim().toLowerCase();
