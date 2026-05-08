@@ -358,7 +358,11 @@ function compressReplyForLiveCall(value: string, maxWords = 16) {
     "Do you mean 1, 2, or 3 BHK?",
     "Are you looking for self-use or investment?",
   ];
-  if (original.split(/\s+/).filter(Boolean).length < 10 || protectedReplies.some((reply) => normalizeKbKey(reply) === normalizeKbKey(original))) {
+  if (
+    original.split(/\s+/).filter(Boolean).length < 10 ||
+    protectedReplies.some((reply) => normalizeKbKey(reply) === normalizeKbKey(original)) ||
+    (/^Haan, main Hindi mein baat kar sakti hoon\./i.test(original) && /\?$/.test(original))
+  ) {
     console.log("[RESPONSE_COMPRESSION_SKIPPED_SHORT_REPLY]", original);
     return original;
   }
@@ -2629,12 +2633,84 @@ async function startServer() {
       return true;
     };
 
+    const getQualificationFieldIndex = (kb: any, field: string) => getRequiredQualificationFields(kb).get(field);
+
+    const normalizeQualificationSignalValue = (field: string, value: string) => {
+      const t = normalizeTurnText(value);
+      if (field === "purpose") {
+        if (/\b(self use|selfuse|own use|personal use)\b/i.test(t)) return "self-use";
+        if (/\b(investment|invest|investor)\b/i.test(t)) return "investment";
+        if (/\bboth\b/i.test(t)) return "both";
+      }
+      if (field === "configuration") {
+        if (/\b(1\s*bhk|one\s*bhk|1 bedroom|one bedroom|one b)\b/i.test(t)) return "1 BHK";
+        if (/\b(2\s*bhk|two\s*bhk|2 bedroom|two bedroom|two b|2 b|two be|to bhk|too bhk)\b/i.test(t)) return "2 BHK";
+        if (/\b(3\s*bhk|three\s*bhk|3 bedroom|three bedroom|three b|cbhk|c bhk|free bhk)\b/i.test(t)) return "3 BHK";
+      }
+      return value.trim();
+    };
+
+    const extractQualificationSignalsFromTurn = (userText: string, currentQuestions: Array<{ id: string; text: string }>, _kb: any) => {
+      const normalized = normalizeTurnText(userText);
+      const signals: Array<{ field: string; value: string }> = [];
+      if (/\b(self[ -]?use|own use|personal use|investment|invest|investor|both)\b/i.test(normalized)) {
+        signals.push({ field: "purpose", value: normalizeQualificationSignalValue("purpose", userText) });
+      }
+      if (/\b(1\s*bhk|one\s*bhk|1 bedroom|one bedroom|2\s*bhk|two\s*bhk|2 bedroom|two bedroom|3\s*bhk|three\s*bhk|3 bedroom|three bedroom|two b|2 b|two be|to bhk|too bhk|one b|three b|cbhk|c bhk|free bhk)\b/i.test(normalized)) {
+        signals.push({ field: "configuration", value: normalizeQualificationSignalValue("configuration", userText) });
+      }
+      if (/\b(lakh|lakhs|lac|crore|cr|budget|under|around|between)\b/i.test(normalized)) {
+        signals.push({ field: "budget", value: userText.trim() });
+      }
+      if (/\b(now|this month|next month|immediately|soon|within|after|later|weeks|months)\b/i.test(normalized)) {
+        signals.push({ field: "timeline", value: userText.trim() });
+      }
+      signals.forEach((signal) => console.log("[QUALIFICATION_SIGNAL_EXTRACTED]", signal.field, signal.value));
+      return signals.filter((signal) => currentQuestions.some((question) => inferQualificationField(question.text) === signal.field));
+    };
+
+    const storeQualificationSignal = (field: string, value: string, kb: any) => {
+      const index = getQualificationFieldIndex(kb, field);
+      if (index === undefined) return false;
+      if (leadData.answers[index]) {
+        console.log("[QUALIFICATION_SIGNAL_SKIPPED_ALREADY_EXISTS]", field, leadData.answers[index]);
+        console.log("[QUESTION_ALREADY_ANSWERED_SKIP]", index);
+        return false;
+      }
+      leadData.answers[index] = value;
+      console.log("[QUALIFICATION_SIGNAL_STORED]", field, value);
+      console.log("[ANSWER STORED]", index, value);
+      console.log("[LEAD MEMORY UPDATED]", index, "->", value);
+      return true;
+    };
+
+    const extractAndStoreQualificationSignals = (userText: string, kb: any) => {
+      let stored = false;
+      const questions = getQualificationQuestions(kb);
+      for (const signal of extractQualificationSignalsFromTurn(userText, questions, kb)) {
+        stored = storeQualificationSignal(signal.field, signal.value, kb) || stored;
+      }
+      return stored;
+    };
+
+    const getNextMissingQualificationQuestion = (callData: any, kb: any) => {
+      const missing = getFirstMissingQualificationIndex(kb);
+      if (!missing) return "";
+      currentQuestionIndex = missing.index;
+      console.log("[QUALIFICATION_RESUME_CHECK]");
+      console.log("[SKIPPING_ALREADY_ANSWERED_QUALIFICATION]");
+      console.log("[NEXT_MISSING_QUALIFICATION_QUESTION]", missing.field, currentQuestionIndex);
+      const question = getQualificationQuestions(kb)[currentQuestionIndex];
+      return question?.text ? renderForConversationLanguage(applyGreetingPlaceholders(question.text, callData, kb)) : "";
+    };
+
     const askNextQualificationQuestion = (callData: any, kb: any) => {
       const questions = getQualificationQuestions(kb);
 
       while (leadData.answers[currentQuestionIndex]) {
         console.log("[QUALIFICATION QUESTION SKIPPED]", currentQuestionIndex);
         console.log("[QUESTION SKIPPED]", currentQuestionIndex, questions[currentQuestionIndex]?.id || "unknown");
+        console.log("[QUESTION_ALREADY_ANSWERED_SKIP]", currentQuestionIndex);
         currentQuestionIndex += 1;
       }
 
@@ -2810,8 +2886,24 @@ async function startServer() {
       return replyText === userText || replyText.startsWith(userText) || userText.startsWith(replyText);
     };
 
+    const getPrimaryQuestionForKb = (userInput: string) => {
+      const parts = userInput
+        .split(/(?<=[.!?])\s+|\s+(?=(?:what|where|which|how|why|can|could|do|does|is|are)\b)/i)
+        .map((part) => part.trim())
+        .filter(Boolean);
+      const questionParts = parts.filter((part) => {
+        const type = detectIntentType(part);
+        return ["pricing", "location", "amenities", "configuration", "offers", "possession", "investment"].includes(type) || isKbQuestionIntent(part);
+      });
+      if (questionParts.length > 1) console.log("[MULTI_INTENT_TURN_DETECTED]", questionParts.length);
+      const selected = questionParts[questionParts.length - 1] || userInput;
+      if (selected !== userInput) console.log("[MULTI_INTENT_PRIMARY_SELECTED]", selected);
+      return selected;
+    };
+
     const findKbAnswerForTurn = (userInput: string, kb: any) => {
-      const answer = getKbDirectAnswer(userInput, normalizeKbForAgent(kb));
+      const answerInput = getPrimaryQuestionForKb(userInput);
+      const answer = getKbDirectAnswer(answerInput, normalizeKbForAgent(kb));
       if (answer && isEchoReply(answer, userInput)) {
         console.log("[ECHO BLOCKED]", userInput);
         return "";
@@ -3034,17 +3126,30 @@ async function startServer() {
         } else {
           console.log("[INTENT OVERRIDE] user question detected, skipping appointment");
         }
+        const appendQualificationResume = (baseReply: string) => {
+          console.log("[DIRECT_QUESTION_ANSWERED]");
+          if (conversationStage !== "qualification") return { reply: baseReply, nextStage: conversationStage, maxWords: 14 };
+          console.log("[QUALIFICATION_RESUME_CHECK]");
+          if (hasCompletedRequiredQualification(callData, kb)) {
+            return { reply: baseReply, nextStage: "post_qualification" as ConversationStage, maxWords: 18 };
+          }
+          const nextQuestion = getNextMissingQualificationQuestion(callData, kb);
+          if (!nextQuestion) return { reply: baseReply, nextStage: conversationStage, maxWords: 14 };
+          return { reply: `${baseReply} ${nextQuestion}`, nextStage: conversationStage, maxWords: 25 };
+        };
         if (isPurposeQuestion(transcript)) {
           console.log("[DECISION: ANSWER]");
           console.log("[DIRECT QUESTION HANDLED]");
           console.log("[RETURNING TO STAGE]", conversationStage);
-          return decision(buildPurposeReply(callData, kb), conversationStage, false, 18);
+          const resumed = appendQualificationResume(buildPurposeReply(callData, kb));
+          return decision(resumed.reply, resumed.nextStage, false, resumed.maxWords);
         }
         if (isIdentityQuestion(transcript)) {
           console.log("[DECISION: ANSWER]");
           console.log("[DIRECT QUESTION HANDLED]");
           console.log("[RETURNING TO STAGE]", conversationStage);
-          return decision(buildIdentityReply(callData, kb), conversationStage, false, 14);
+          const resumed = appendQualificationResume(buildIdentityReply(callData, kb));
+          return decision(resumed.reply, resumed.nextStage, false, resumed.maxWords);
         }
         const answer = findKbAnswerForTurn(transcript, kb);
         if (answer) {
@@ -3052,12 +3157,14 @@ async function startServer() {
           console.log("[DIRECT QUESTION HANDLED]");
           console.log("[FAQ ANSWERED]");
           console.log("[RETURNING TO STAGE]", conversationStage);
-          return decision(sanitizeAiReplyForStage(answer, missingKbAnswerFallback), conversationStage, false, 14);
+          const resumed = appendQualificationResume(sanitizeAiReplyForStage(answer, missingKbAnswerFallback));
+          return decision(resumed.reply, resumed.nextStage, false, resumed.maxWords);
         }
         console.log("[DECISION: FALLBACK]");
         console.log("[DIRECT QUESTION HANDLED]");
         console.log("[RETURNING TO STAGE]", conversationStage);
-        return decision(detectIntentType(transcript) === "pricing" ? pricingFallback : missingKbAnswerFallback, conversationStage, false, 14);
+        const resumed = appendQualificationResume(detectIntentType(transcript) === "pricing" ? pricingFallback : missingKbAnswerFallback);
+        return decision(resumed.reply, resumed.nextStage, false, resumed.maxWords);
       };
 
       const decision = async (reply: string, nextStage: ConversationStage, needsGemini = false, maxWords = 10) => {
@@ -3134,14 +3241,26 @@ async function startServer() {
         console.log("[GEMINI SKIPPED]");
         console.log("[RETURNING TO STAGE]", conversationStage);
         const pending = conversationStage === "qualification" ? renderForConversationLanguage(getCurrentPendingPrompt(callData, kb)) : "";
+        if (pending && (preferredLanguage === "Hindi" || preferredLanguage === "Hinglish")) console.log("[QUALIFICATION_PROMPT_TRANSLATED]", pending);
         const languageReply = preferredLanguage === "Hindi" || preferredLanguage === "Hinglish"
-          ? `Haan, main simple Hindi mein baat kar sakti hoon.${pending ? " " + pending : ""}`
+          ? `Haan, main Hindi mein baat kar sakti hoon.${pending ? " " + pending : ""}`
           : buildLanguageReply();
-        return decision(languageReply, conversationStage, false, 14);
+        if (pending) console.log("[LANGUAGE_REPLY_WITH_PENDING_QUESTION]", languageReply);
+        return decision(languageReply, conversationStage, false, pending ? 22 : 10);
       };
 
       if (detectLanguageRequest(transcript)) {
         return handleLanguageSwitch(transcript);
+      }
+
+      extractAndStoreQualificationSignals(transcript, kb);
+
+      if ((conversationStage === "availability" || conversationStage === "permission") && (isIdentityQuestion(transcript) || isPurposeQuestion(transcript))) {
+        console.log("[IDENTITY_QUESTION_DETECTED]", transcript);
+        console.log("[IDENTITY_RESPONSE_USED]");
+        console.log("[AVAILABILITY_AFTER_IDENTITY]");
+        const identityIntro = isPurposeQuestion(transcript) ? buildPurposeReply(callData, kb) : buildIdentityReply(callData, kb);
+        return decision(`${identityIntro} ${buildAvailabilityQuestion(callData, kb)}`, "availability", false, 24);
       }
 
       const isChannelCheckDuringQualification = (value: string) =>
@@ -3822,7 +3941,8 @@ async function startServer() {
           console.log("[REPLY WORD COUNT]", reply.split(/\s+/).filter(Boolean).length);
         }
         reply = cleanFinalResponse(reply, "Sure, what would you like to know?", shouldTrimReply ? replyMaxWords : 60);
-        reply = compressReplyForLiveCall(reply, Math.min(16, Math.max(8, replyMaxWords || 10)));
+        const liveReplyMaxWords = replyMaxWords > 16 ? replyMaxWords : Math.min(16, Math.max(8, replyMaxWords || 10));
+        reply = compressReplyForLiveCall(reply, liveReplyMaxWords);
 
         console.log("[GEMINI OUTPUT]", reply);
         console.log("[GEMINI FINAL REPLY]", reply);
@@ -3830,7 +3950,7 @@ async function startServer() {
         console.log("[CONVERSATION STAGE]", conversationStage);
         if (isEnded()) return;
 
-        const aiReply = sanitizeOutboundReply(compressReplyForLiveCall(reply, 16));
+        const aiReply = sanitizeOutboundReply(compressReplyForLiveCall(reply, liveReplyMaxWords));
         conversationHistory.push({ role: "user", text: transcript });
         conversationHistory.push({ role: "assistant", text: aiReply });
         lastTranscript = transcript.trim().toLowerCase();
