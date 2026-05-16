@@ -2805,6 +2805,82 @@ async function startServer() {
       return "";
     };
 
+    const numberWordToDigit: Record<string, string> = {
+      one: "1",
+      two: "2",
+      three: "3",
+      four: "4",
+      five: "5",
+      six: "6",
+      seven: "7",
+      eight: "8",
+      nine: "9",
+      ten: "10",
+      a: "1",
+    };
+
+    const normalizeTimelineAnswer = (userText: string) => {
+      const t = normalizeTurnText(userText);
+      if (!t) return "";
+      if (/\bimmediately|right away|now\b/i.test(t)) return "immediately";
+      if (/\btoday\b/i.test(t)) return "today";
+      if (/\btomorrow\b/i.test(t)) return "tomorrow";
+      if (/\bthis week\b/i.test(t)) return "this week";
+      if (/\bnext week\b/i.test(t)) return "next week";
+      if (/\bthis month\b/i.test(t)) return "this month";
+      if (/\bnext month\b/i.test(t)) return "next month";
+      if (/\bnot now\b/i.test(t)) return "not now";
+
+      const afterMatch = t.match(/\bafter\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|a)\s+(day|days|week|weeks|month|months)\b/i);
+      if (afterMatch) {
+        const amount = numberWordToDigit[afterMatch[1]] || afterMatch[1];
+        const unit = afterMatch[2].startsWith("month") ? "month" : afterMatch[2].startsWith("week") ? "week" : "day";
+        return "after " + amount + " " + (amount === "1" ? unit : unit + "s");
+      }
+
+      const inMatch = t.match(/\b(?:in|within)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|a)\s+(day|days|week|weeks|month|months)\b/i);
+      if (inMatch) {
+        const amount = numberWordToDigit[inMatch[1]] || inMatch[1];
+        const unit = inMatch[2].startsWith("month") ? "month" : inMatch[2].startsWith("week") ? "week" : "day";
+        return "within " + amount + " " + (amount === "1" ? unit : unit + "s");
+      }
+
+      const bareDuration = t.match(/\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|a)\s+(day|days|week|weeks|month|months)\b/i);
+      if (bareDuration) {
+        const amount = numberWordToDigit[bareDuration[1]] || bareDuration[1];
+        const unit = bareDuration[2].startsWith("month") ? "month" : bareDuration[2].startsWith("week") ? "week" : "day";
+        return "within " + amount + " " + (amount === "1" ? unit : unit + "s");
+      }
+
+      return "";
+    };
+
+    const isIncompleteTimelineAnswer = (userText: string) => /^(next|later|soon|maybe|after|coming|upcoming)$/i.test(normalizeTurnText(userText));
+
+    const buildTimelineClarification = (userText: string) => {
+      console.log("[TIMELINE_INCOMPLETE_DETECTED]", userText);
+      console.log("[TIMELINE_CONTEXTUAL_CLARIFICATION_USED]");
+      console.log("[QUALIFICATION_INDEX_PRESERVED]", currentQuestionIndex);
+      return /\bsoon\b/i.test(normalizeTurnText(userText))
+        ? "Do you mean within this month or next month?"
+        : "Do you mean next week or next month?";
+    };
+
+    const recoverTimelineFromBuffer = (userText: string) => {
+      console.log("[TIMELINE_RECOVERY_ATTEMPT]", userText);
+      const candidates = [pendingPartialTranscript, ...recentUserTranscripts].filter(Boolean);
+      for (const candidate of candidates.reverse()) {
+        const combined = `${candidate} ${userText}`.trim();
+        const recovered = normalizeTimelineAnswer(combined) || normalizeTimelineAnswer(candidate);
+        if (recovered) {
+          console.log("[TIMELINE_RECOVERY_FROM_BUFFER]", recovered);
+          return recovered;
+        }
+      }
+      console.log("[TIMELINE_RECOVERY_NEEDS_CLARIFICATION]", userText);
+      return "";
+    };
+
     const normalizeQualificationSignalValue = (field: string, value: string) => {
       const t = normalizeTurnText(value);
       if (field === "purpose") {
@@ -2817,6 +2893,13 @@ async function startServer() {
         if (config) {
           console.log("[CONFIGURATION_SIGNAL_NORMALIZED]", config);
           return config;
+        }
+      }
+      if (field === "timeline") {
+        const timeline = normalizeTimelineAnswer(value);
+        if (timeline) {
+          console.log("[TIMELINE_SIGNAL_NORMALIZED]", timeline);
+          return timeline;
         }
       }
       return value.trim();
@@ -2836,8 +2919,10 @@ async function startServer() {
       if (/\b(lakh|lakhs|lac|crore|cr|budget|under|around|between)\b/i.test(normalized)) {
         signals.push({ field: "budget", value: userText.trim() });
       }
-      if (/\b(now|this month|next month|immediately|soon|within|after|later|weeks|months)\b/i.test(normalized)) {
-        signals.push({ field: "timeline", value: userText.trim() });
+      const timelineSignal = normalizeTimelineAnswer(userText);
+      if (timelineSignal) {
+        console.log("[TIMELINE_SIGNAL_EXTRACTED]", userText);
+        signals.push({ field: "timeline", value: timelineSignal });
       }
       signals.forEach((signal) => console.log("[QUALIFICATION_SIGNAL_EXTRACTED]", signal.field, signal.value));
       return signals.filter((signal) => currentQuestions.some((question) => inferQualificationField(question.text) === signal.field));
@@ -2857,6 +2942,7 @@ async function startServer() {
         console.log("[CONFIGURATION_SIGNAL_STORED]", value);
         console.log("[CONFIGURATION_ALREADY_STORED_SKIP]", index);
       }
+      if (field === "timeline") console.log("[TIMELINE_SIGNAL_STORED]", value);
       console.log("[QUALIFICATION_SIGNAL_STORED]", field, value);
       console.log("[ANSWER STORED]", index, value);
       console.log("[LEAD MEMORY UPDATED]", index, "->", value);
@@ -2954,7 +3040,7 @@ async function startServer() {
         return /\b((\d+.*(lakh|lac|crore|cr))|budget|range|around|under|between)\b/i.test(normalizedAnswer);
       }
       if (question.includes("timeline") || question.includes("when")) {
-        return /\b(now|immediately|this month|next month|within|after|later|soon|days|weeks|months|today|tomorrow|week|month|year|morning|afternoon|evening|\d{1,2}\s*(am|pm)?)\b/i.test(normalizedAnswer);
+        return Boolean(normalizeTimelineAnswer(answer));
       }
       return normalizedAnswer.split(" ").filter(Boolean).length <= 6;
     };
@@ -3617,7 +3703,9 @@ async function startServer() {
             clarification = "Do you mean 1, 2, or 3 BHK?";
           }
         }
-        else if (q.includes("timeline") || q.includes("when")) clarification = "Are you planning this soon or later?";
+        else if (q.includes("timeline") || q.includes("when")) clarification = isIncompleteTimelineAnswer(input)
+          ? buildTimelineClarification(input)
+          : "Do you mean next week or next month?";
         else if (q.includes("self use") || q.includes("investment")) clarification = "Are you looking for self-use or investment?";
         console.log("[INVALID_INPUT_CONTEXTUAL_CLARIFY]", clarification);
         console.log("[QUALIFICATION_INDEX_PRESERVED]", currentQuestionIndex);
@@ -3635,6 +3723,24 @@ async function startServer() {
       if (conversationStage === "qualification" && storeActiveConfigurationIfPresent(transcript)) {
         const nextQuestionReply = askNextQualificationQuestion(callData, kb);
         return decision(nextQuestionReply, conversationStage, false, 10);
+      }
+
+      if (conversationStage === "qualification" && getFirstMissingQualificationIndex(kb)?.field === "timeline") {
+        qualificationDebugSnapshot(transcript);
+        let timeline = normalizeTimelineAnswer(transcript);
+        if (!timeline && normalizeTurnText(transcript) === "next") timeline = recoverTimelineFromBuffer(transcript);
+        if (timeline) {
+          console.log("[TIMELINE_SIGNAL_EXTRACTED]", transcript);
+          console.log("[TIMELINE_SIGNAL_NORMALIZED]", timeline);
+          storeQualificationSignal("timeline", timeline, kb);
+          lastQualificationAnswerAccepted = true;
+          logQualificationDebugAfterStore();
+          const nextQuestionReply = askNextQualificationQuestion(callData, kb);
+          return decision(nextQuestionReply, conversationStage, false, 18);
+        }
+        if (isIncompleteTimelineAnswer(transcript)) {
+          return decision(buildTimelineClarification(transcript), conversationStage, false, 8);
+        }
       }
 
       if (conversationStage === "qualification" && isContextualShortAnswer(transcript)) {
@@ -4239,7 +4345,7 @@ async function startServer() {
 
         const isActivePurposeAnswer = (value: string) => /\b(self[ -]?use|own use|personal use|investment|invest|investor|both)\b/i.test(normalizeTurnText(value));
         const isActiveBudgetAnswer = (value: string) => /\b(\d+(?:\.\d+)?\s*(lakh|lakhs|lac|crore|cr)|around\s+\d+|under\s+\d+|between\s+\d+|budget|range)\b/i.test(normalizeTurnText(value));
-        const isActiveTimelineAnswer = (value: string) => /\b(now|immediately|this month|next month|within|after|later|soon|today|tomorrow|week|weeks|month|months)\b/i.test(normalizeTurnText(value));
+        const isActiveTimelineAnswer = (value: string) => Boolean(normalizeTimelineAnswer(value));
         const isChannelCheckTurn = (value: string) => /^(hello|hi|hello\?|are you there|can you hear me|you there|are you listening)$/i.test(normalizeTurnText(value));
         const isCriticalCommandTurn = (value: string) => {
           const t = normalizeTurnText(value);
@@ -5927,3 +6033,4 @@ server.listen(PORT, "0.0.0.0", () => {
 }
 
 startServer();
+
