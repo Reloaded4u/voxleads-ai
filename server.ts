@@ -4221,6 +4221,96 @@ async function startServer() {
           return true;
         };
 
+        type FinalizedUserTurn = {
+          action: "route" | "hold" | "ignore";
+          text: string;
+          reason: string;
+        };
+
+        const usefulTurnWords = (value: string) => normalizeTurnText(value)
+          .split(" ")
+          .filter((word) => word && !["uh", "um", "hmm"].includes(word));
+
+        const getActiveQualificationFieldForTurn = async () => {
+          if (conversationStage !== "qualification") return "";
+          const { kb } = await preloadCallContext();
+          return getFirstMissingQualificationIndex(kb)?.field || "";
+        };
+
+        const isActivePurposeAnswer = (value: string) => /\b(self[ -]?use|own use|personal use|investment|invest|investor|both)\b/i.test(normalizeTurnText(value));
+        const isActiveBudgetAnswer = (value: string) => /\b(\d+(?:\.\d+)?\s*(lakh|lakhs|lac|crore|cr)|around\s+\d+|under\s+\d+|between\s+\d+|budget|range)\b/i.test(normalizeTurnText(value));
+        const isActiveTimelineAnswer = (value: string) => /\b(now|immediately|this month|next month|within|after|later|soon|today|tomorrow|week|weeks|month|months)\b/i.test(normalizeTurnText(value));
+        const isChannelCheckTurn = (value: string) => /^(hello|hi|hello\?|are you there|can you hear me|you there|are you listening)$/i.test(normalizeTurnText(value));
+        const isCriticalCommandTurn = (value: string) => {
+          const t = normalizeTurnText(value);
+          return isDisinterestIntent(value) || isIdentityQuestion(value) || isPurposeQuestion(value) ||
+            /\b(stop calling|call later|busy|not now|who is this|who are you|why are you calling|what is this about)\b/i.test(t);
+        };
+        const isIncompleteQuestionStartForFinalizer = (value: string) => {
+          const t = normalizeTurnText(value);
+          return /^(what is the cost of|do you have any|are you running any|can you tell me about|i'm|im|i'm in the|im in the|i want to know)$/i.test(t) ||
+            /\b(what is the cost of|do you have any|are you running any|can you tell me about|i want to know)\s*$/i.test(t);
+        };
+
+        const finalizeUserTurn = async (value: string, turnConfidence: number, _callData?: any): Promise<FinalizedUserTurn> => {
+          const text = String(value || "").trim();
+          const normalized = normalizeTurnText(text);
+          const words = usefulTurnWords(text);
+          const route = (reason: string) => {
+            console.log("[TURN_FINALIZER_ROUTE]", text);
+            console.log("[TURN_FINALIZER_REASON]", reason);
+            return { action: "route" as const, text, reason };
+          };
+          const hold = (reason: string) => {
+            console.log("[TURN_FINALIZER_HOLD]", text);
+            console.log("[TURN_FINALIZER_REASON]", reason);
+            if (reason.includes("incomplete")) console.log("[INCOMPLETE_FRAGMENT_HELD]", text);
+            return { action: "hold" as const, text, reason };
+          };
+          const ignore = (reason: string) => {
+            console.log("[TURN_FINALIZER_IGNORE]", text);
+            console.log("[TURN_FINALIZER_REASON]", reason);
+            return { action: "ignore" as const, text, reason };
+          };
+
+          console.log("[TURN_FINALIZER_INPUT]", JSON.stringify({ stage: conversationStage, confidence: turnConfidence, text }));
+          if (!normalized) return ignore("empty_transcript");
+          if (isCriticalCommandTurn(text)) return route("critical_command");
+
+          const activeField = await getActiveQualificationFieldForTurn();
+          if (conversationStage === "qualification") {
+            if (activeField === "configuration" && extractActiveConfigurationAnswer(text)) {
+              console.log("[VALID_SHORT_ANSWER_ROUTED]", text);
+              return route("valid_active_configuration_answer");
+            }
+            if (activeField === "purpose" && isActivePurposeAnswer(text)) {
+              console.log("[VALID_SHORT_ANSWER_ROUTED]", text);
+              return route("valid_active_purpose_answer");
+            }
+            if (activeField === "budget" && isActiveBudgetAnswer(text)) {
+              console.log("[VALID_SHORT_ANSWER_ROUTED]", text);
+              return route("valid_active_budget_answer");
+            }
+            if (activeField === "timeline" && isActiveTimelineAnswer(text)) {
+              console.log("[VALID_SHORT_ANSWER_ROUTED]", text);
+              return route("valid_active_timeline_answer");
+            }
+            if (isChannelCheckTurn(text)) return route("channel_check");
+          }
+
+          if (isIncompleteQuestionStartForFinalizer(text) || isPostQualificationIncompleteQuestion(text, turnConfidence)) {
+            return hold("incomplete_question_start");
+          }
+          if (turnConfidence < 0.55 && words.length <= 2 && !isClearShortCommand(text)) {
+            return ignore("low_confidence_short_noise");
+          }
+          if (turnConfidence < 0.65 && words.length < 4 && !isClearShortCommand(text) && !isLikelyCurrentStageIntent(text)) {
+            return hold("low_confidence_short_fragment");
+          }
+
+          return route("complete_or_contextual_turn");
+        };
+
         if (pendingPartialTranscript && await tryEarlyActiveConfigCapture(pendingPartialTranscript, "pendingPartialTranscript")) {
           console.log("[PENDING_PARTIAL_CONFIG_FOUND_BEFORE_CLEAR]");
           console.log("[CONFIGURATION_SIGNAL_STORED_FROM_PARTIAL]");
@@ -4243,7 +4333,28 @@ async function startServer() {
           console.log("[PARTIAL_TRANSCRIPT_CLEARED]");
         }
 
-        if (isPostQualificationIncompleteQuestion(transcript, confidence)) {
+        const finalizedTurn = await finalizeUserTurn(transcript, confidence, preloadedCallContext?.callData);
+        transcript = finalizedTurn.text;
+        const bypassIncompleteFragmentHold = finalizedTurn.action === "route" && /^(valid_active_|channel_check|critical_command)/.test(finalizedTurn.reason);
+
+        if (finalizedTurn.action === "hold") {
+          pendingPartialTranscript = transcript;
+          pendingPartialTranscriptAt = Date.now();
+          if (conversationStage === "post_qualification") {
+            console.log("[POST_QUAL_INCOMPLETE_QUESTION_HELD]", transcript);
+            console.log("[POST_QUAL_PARTIAL_BUFFERED]", pendingPartialTranscript);
+          }
+          console.log("[PARTIAL_TRANSCRIPT_BUFFERED]", pendingPartialTranscript);
+          state = "LISTENING";
+          return;
+        }
+
+        if (finalizedTurn.action === "ignore") {
+          state = "LISTENING";
+          return;
+        }
+
+        if (!bypassIncompleteFragmentHold && isPostQualificationIncompleteQuestion(transcript, confidence)) {
           pendingPartialTranscript = transcript;
           pendingPartialTranscriptAt = Date.now();
           console.log("[POST_QUAL_INCOMPLETE_QUESTION_HELD]", transcript);
@@ -4252,7 +4363,7 @@ async function startServer() {
           return;
         }
 
-        if (isIncompleteSpeechFragment(transcript, confidence)) {
+        if (!bypassIncompleteFragmentHold && isIncompleteSpeechFragment(transcript, confidence)) {
           pendingPartialTranscript = transcript;
           pendingPartialTranscriptAt = Date.now();
           console.log("[TURN_HELD_INCOMPLETE_FRAGMENT]", transcript, "confidence=", confidence);
@@ -4266,7 +4377,7 @@ async function startServer() {
           return;
         }
 
-        if (isVaguePartialTranscript(transcript)) {
+        if (!bypassIncompleteFragmentHold && isVaguePartialTranscript(transcript)) {
           pendingPartialTranscript = transcript;
           pendingPartialTranscriptAt = Date.now();
           console.log("[TURN HELD] incomplete phrase");
@@ -4288,7 +4399,7 @@ async function startServer() {
         }
 
         const normalizedTranscript = normalizeTurnText(transcript);
-        if (isIncompletePhrase(normalizedTranscript)) {
+        if (!bypassIncompleteFragmentHold && isIncompletePhrase(normalizedTranscript)) {
           heldTranscript = transcript;
           pendingPartialTranscript = transcript;
           pendingPartialTranscriptAt = Date.now();
