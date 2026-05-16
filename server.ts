@@ -1978,6 +1978,12 @@ async function startServer() {
     const completedStages = new Set<ConversationStage>();
     let playbackInterrupted = false;
     let disinterestTerminationPending = false;
+    let pendingHangupAfterTts = false;
+    let callEndingRequested = false;
+    let hangupReason = "";
+    let awaitingClosingResponse = false;
+    let closingSilenceTimer: NodeJS.Timeout | null = null;
+    let recoveryAttemptsAfterCompletion = 0;
     let bargeInBuffers: Buffer[] = [];
     let pendingBargeInAudio: Buffer | null = null;
     const BARGE_IN_WINDOW_FRAMES = 35;
@@ -2109,6 +2115,95 @@ async function startServer() {
       if (appointmentData.date && !appointmentData.time) return "What time works for you?";
       if (appointmentData.time && !appointmentData.date) return "Which day works for you?";
       return "Sure. What time works for you?";
+    };
+
+    const isUserClosingResponse = (text: string) => /\b(no|no thanks|no thank you|okay|ok|fine|thank you|thanks|that's all|that is all|bye|not now)\b/i.test(normalizeTurnText(text));
+
+    const requestHangupAfterTts = (reason: string) => {
+      pendingHangupAfterTts = true;
+      callEndingRequested = true;
+      hangupReason = reason;
+      console.log("[PENDING_HANGUP_AFTER_TTS_SET]", reason);
+      console.log("[AI_HANGUP_REQUESTED]", reason);
+    };
+
+    const clearClosingSilenceTimer = () => {
+      if (closingSilenceTimer) {
+        clearTimeout(closingSilenceTimer);
+        closingSilenceTimer = null;
+      }
+    };
+
+    const markLiveCallEnded = async (reason: string) => {
+      if (callId) {
+        endedVobizCallIds.add(callId);
+        await db.collection("calls").doc(callId).update(sanitizeForFirestore({
+          status: "completed",
+          controlState: "call_ended",
+          callControlState: "call_ended",
+          endedBy: "ai",
+          endReason: reason,
+          endedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          leadData,
+          appointmentData,
+        })).catch((error) => console.error("[CALL CONTROL END UPDATE FAILED]", error));
+        liveCallTranscriptBuffers.delete(callId);
+      }
+    };
+
+    const hangupAfterFinalTts = async (reason: string) => {
+      clearClosingSilenceTimer();
+      console.log("[FINAL_TTS_PLAYED_HANGUP_NOW]", reason);
+      console.log("[AI_HANGUP_AFTER_TTS]", reason);
+      console.log("[WS_CLOSE_AI_COMPLETED_CALL]", callId);
+      await markLiveCallEnded(reason);
+      state = "ENDING";
+      moveStage("ended");
+      if (ws.readyState === 1) ws.close(1000, "AI completed call");
+      endCall();
+    };
+
+    const shouldEndCallAfterTurn = (_callData: any, stage: ConversationStage, latestUserText: string, latestAiReply: string) => {
+      console.log("[CALL_COMPLETION_CHECK]", JSON.stringify({ stage, latestUserText, latestAiReply }));
+      let result: { shouldEnd: boolean; reason: string; finalReply?: string } = { shouldEnd: false, reason: "not_complete" };
+      if (awaitingClosingResponse && isUserClosingResponse(latestUserText)) {
+        console.log("[USER_ACCEPTED_CALL_CLOSE]");
+        console.log("[AI_HANGUP_AFTER_QUALIFICATION]");
+        result = { shouldEnd: true, reason: "user_says_thanks_bye", finalReply: "Thanks. Our team will follow up shortly. Have a good day." };
+      } else if (isDisinterestIntent(latestUserText) || disinterestTerminationPending) {
+        result = { shouldEnd: true, reason: "disinterest_detected", finalReply: "Understood. I won't call again. Thank you." };
+      } else if (appointmentData.confirmed) {
+        result = { shouldEnd: true, reason: appointmentData.type === "callback" ? "callback_confirmed" : "appointment_confirmed", finalReply: "Done. Our team will confirm the details shortly. Thank you." };
+      } else if (stage === "post_qualification" && hasCompletedRequiredQualification(_callData, _callData?.knowledgeBaseSnapshot || {}) && isUserClosingResponse(latestUserText)) {
+        result = { shouldEnd: true, reason: "qualification_complete_no_more_questions", finalReply: "Thanks. Our team will follow up shortly. Have a good day." };
+      } else if (recoveryAttemptsAfterCompletion >= 3 && stage === "post_qualification") {
+        result = { shouldEnd: true, reason: "max_recovery_attempts_exceeded", finalReply: "Thanks. Our team will follow up shortly. Have a good day." };
+      }
+      console.log(result.shouldEnd ? "[CALL_COMPLETION_TRUE]" : "[CALL_COMPLETION_FALSE]", result.reason);
+      console.log("[CALL_COMPLETION_REASON]", result.reason);
+      return result;
+    };
+
+    const scheduleClosingSilenceHangup = () => {
+      clearClosingSilenceTimer();
+      if (!awaitingClosingResponse || pendingHangupAfterTts || callEndingRequested) return;
+      closingSilenceTimer = setTimeout(async () => {
+        if (!awaitingClosingResponse || pendingHangupAfterTts || callEndingRequested || isEnded() || state !== "LISTENING") return;
+        console.log("[CLOSING_SILENCE_TIMEOUT]", callId);
+        const finalReply = "I'll have the team follow up with you. Thank you.";
+        console.log("[FINAL_REPLY_BEFORE_HANGUP]", finalReply);
+        console.log("[AI_HANGUP_AFTER_CLOSING_SILENCE]");
+        requestHangupAfterTts("repeated_silence_after_completion");
+        state = "SPEAKING";
+        const finalAudio = ownerId ? await fetchTtsAudio(finalReply, ownerId) : null;
+        if (finalAudio) {
+          await sendVobizAudio(ws, finalAudio, () => true);
+          await appendTranscript("AI", finalReply);
+          console.log("[FINAL_REPLY_PLAYED]", finalReply);
+        }
+        await hangupAfterFinalTts("repeated_silence_after_completion");
+      }, 10000);
     };
 
     const getMaxWordsForStage = () => 14;
@@ -3908,6 +4003,7 @@ async function startServer() {
         }
         console.log("[DECISION: CLARIFY]");
         console.log("[APPOINTMENT DEFERRED]");
+        recoveryAttemptsAfterCompletion += 1;
         console.log("[WEAK_FILLER_BLOCKED_POST_QUAL]");
         console.log("[POST_QUAL_CONTEXTUAL_OPTIONS_USED]");
         return decision("Are you asking about pricing, offers, amenities, or scheduling a visit?", "post_qualification", false, 14);
@@ -4245,6 +4341,10 @@ async function startServer() {
     };
 
     const processListeningAudio = async (audioBuffer: Buffer) => {
+      if (callEndingRequested || pendingHangupAfterTts) {
+        console.log("[AUDIO_PROCESSING_BLOCKED_CALL_ENDING]", hangupReason || "pending_hangup");
+        return;
+      }
       if (conversationStage === "ended") {
         if (!callCompletedLogged) {
           console.log("[CALL COMPLETED] no further processing");
@@ -4292,6 +4392,12 @@ async function startServer() {
           state = "LISTENING";
           return;
         }
+        if (callEndingRequested || pendingHangupAfterTts) {
+          console.log("[TURN_IGNORED_CALL_ENDING]", hangupReason || "pending_hangup");
+          state = "LISTENING";
+          return;
+        }
+        clearClosingSilenceTimer();
 
         const confidence = typeof stt.confidence === "number" ? stt.confidence : 0;
         const lowConfidenceWithoutTime = confidence < 0.65 && !isLowConfidenceAllowed(transcript);
@@ -4577,11 +4683,26 @@ async function startServer() {
         const liveReplyMaxWords = replyMaxWords > 16 ? replyMaxWords : Math.min(16, Math.max(8, replyMaxWords || 10));
         reply = compressReplyForLiveCall(reply, liveReplyMaxWords);
 
+        const completion = shouldEndCallAfterTurn(callData, conversationStage, transcript, reply);
+        if (completion.shouldEnd) {
+          reply = completion.finalReply || reply;
+          console.log("[FINAL_REPLY_BEFORE_HANGUP]", reply);
+          if (completion.reason === "disinterest_detected") console.log("[DISINTEREST_FINAL_HANGUP]");
+          if (completion.reason === "qualification_complete_no_more_questions" || completion.reason === "user_says_thanks_bye") console.log("[AI_HANGUP_AFTER_QUALIFICATION]");
+          if (completion.reason === "appointment_confirmed" || completion.reason === "callback_confirmed") console.log("[APPOINTMENT CONFIRMED]", JSON.stringify(appointmentData));
+          requestHangupAfterTts(completion.reason);
+        } else if (/would you like me to arrange|team share latest details|team share the latest details/i.test(reply)) {
+          awaitingClosingResponse = true;
+          console.log("[QUALIFICATION_COMPLETE_CLOSING_OFFERED]");
+        }
+
         console.log("[GEMINI OUTPUT]", reply);
         console.log("[GEMINI FINAL REPLY]", reply);
         console.log("[TTS TEXT]", reply);
         console.log("[CONVERSATION STAGE]", conversationStage);
         if (isEnded()) return;
+
+        if (pendingHangupAfterTts || callEndingRequested) console.log("[TURN_IGNORED_CALL_ENDING]", hangupReason || "pending_hangup");
 
         const isIncompleteOutgoingReply = (value: string) =>
           /\b(this is|a quick|good time for|I just wanted to check if|from the|speaking with)[.!?]?$/i.test(String(value || "").trim());
@@ -4636,6 +4757,11 @@ async function startServer() {
         }
         await appendTranscript("AI", aiReply);
         console.log("[FINAL_REPLY_PLAYED]", aiReply);
+        if (pendingHangupAfterTts) {
+          if (hangupReason === "disinterest_detected") console.log("[AI_HANGUP_AFTER_DISINTEREST]");
+          await hangupAfterFinalTts(hangupReason || "ai_completed_call");
+          return;
+        }
         if (disinterestTerminationPending) {
           console.log("[FORCE_WS_CLOSE_AFTER_DISINTEREST]", callId);
           if (callId) {
@@ -4662,6 +4788,7 @@ async function startServer() {
         }
         pendingCompletedStage = null;
         mediaBuffers = [];
+        if (awaitingClosingResponse && !pendingHangupAfterTts && !callEndingRequested) scheduleClosingSilenceHangup();
         if (conversationStage === "closing" || conversationStage === "ended") {
           console.log("[CALL ENDING AFTER COMPLETION]");
           if (disinterestTerminationPending) {
@@ -4697,6 +4824,7 @@ async function startServer() {
       console.log("[CALL END START]", callId);
       console.log("[TRANSCRIPT BUFFER LENGTH]", transcriptBuffer.length);
       if (isEnded()) return;
+      clearClosingSilenceTimer();
       state = "ENDED";
       console.log("[Vobiz State] ENDED");
       if (turnInProgress) {
@@ -4789,6 +4917,10 @@ async function startServer() {
       }
 
       if (state === "SPEAKING") {
+        if (callEndingRequested || pendingHangupAfterTts) {
+          console.log("[AUDIO_PROCESSING_BLOCKED_CALL_ENDING]", hangupReason || "pending_hangup");
+          return;
+        }
         bargeInBuffers.push(decoded);
         if (bargeInBuffers.length >= BARGE_IN_WINDOW_FRAMES) {
           const combined = Buffer.concat(bargeInBuffers);
@@ -6033,4 +6165,6 @@ server.listen(PORT, "0.0.0.0", () => {
 }
 
 startServer();
+
+
 
