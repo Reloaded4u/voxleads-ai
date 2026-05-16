@@ -2979,7 +2979,10 @@ async function startServer() {
     const normalizeQualificationSignalValue = (field: string, value: string) => {
       const t = normalizeTurnText(value);
       if (field === "purpose") {
-        if (/\b(self use|selfuse|own use|personal use)\b/i.test(t)) return "self-use";
+        if (/\b(self use|selfuse|for self|looking for self|im looking for self|i am looking for self|own use|own|personal use|personal|self)\b/i.test(t)) {
+          console.log("[PURPOSE_SIGNAL_NORMALIZED]", "self-use");
+          return "self-use";
+        }
         if (/\b(investment|invest|investor)\b/i.test(t)) return "investment";
         if (/\bboth\b/i.test(t)) return "both";
       }
@@ -3031,16 +3034,18 @@ async function startServer() {
         console.log("[QUESTION_ALREADY_ANSWERED_SKIP]", index);
         return false;
       }
-      leadData.answers[index] = value;
-      setQualificationField(leadData, field, value);
+      const storedValue = normalizeQualificationSignalValue(field, value);
+      leadData.answers[index] = storedValue;
+      setQualificationField(leadData, field, storedValue);
       if (field === "configuration") {
         console.log("[CONFIGURATION_SIGNAL_STORED]", value);
         console.log("[CONFIGURATION_ALREADY_STORED_SKIP]", index);
       }
-      if (field === "timeline") console.log("[TIMELINE_SIGNAL_STORED]", value);
-      console.log("[QUALIFICATION_SIGNAL_STORED]", field, value);
-      console.log("[ANSWER STORED]", index, value);
-      console.log("[LEAD MEMORY UPDATED]", index, "->", value);
+      if (field === "timeline") console.log("[TIMELINE_SIGNAL_STORED]", storedValue);
+      if (field === "purpose") console.log("[PURPOSE_SIGNAL_STORED]", storedValue);
+      console.log("[QUALIFICATION_SIGNAL_STORED]", field, storedValue);
+      console.log("[ANSWER STORED]", index, storedValue);
+      console.log("[LEAD MEMORY UPDATED]", index, "->", storedValue);
       return true;
     };
 
@@ -3126,6 +3131,10 @@ async function startServer() {
       const globalNonAnswer = /\b(answer me|first answer|answer first|tell me first|explain first|price|cost|pricing|who are you|why are you calling|can you speak|speak hindi|hindi|repeat|what|hello|not interested|not into|no thanks)\b/i;
       if (!normalizedAnswer || globalNonAnswer.test(normalizedAnswer) || isConfusionInput(normalizedAnswer) || isIdentityQuestion(normalizedAnswer) || isPurposeQuestion(normalizedAnswer) || isLanguageRequest(answer) || isDisinterestIntent(answer) || normalizedAnswer.endsWith("?")) return false;
       if (question.includes("self use") || question.includes("investment")) {
+        if (/\b(self|for self|looking for self|im looking for self|i am looking for self|own|own use|personal|personal use)\b/i.test(normalizedAnswer)) {
+          console.log("[PURPOSE_PARTIAL_ACCEPTED]", answer);
+          return true;
+        }
         return /\b(self[ -]?use|own use|personal use|investment|invest|investor|both)\b/i.test(normalizedAnswer);
       }
       if (question.includes("configuration") || question.includes("bhk")) {
@@ -3171,11 +3180,13 @@ async function startServer() {
         console.log("[QUESTION SKIPPED]", currentQuestionIndex, "already answered");
         currentQuestionIndex += 1;
       }
-      leadData.answers[currentQuestionIndex] = clean;
       const storedField = inferQualificationField(questionText || "");
-      if (storedField) setQualificationField(leadData, storedField, clean);
-      console.log("[ANSWER STORED]", currentQuestionIndex, clean);
-      console.log("[LEAD MEMORY UPDATED]", currentQuestionIndex, "->", clean);
+      const storedClean = storedField ? normalizeQualificationSignalValue(storedField, clean) : clean;
+      leadData.answers[currentQuestionIndex] = storedClean;
+      if (storedField) setQualificationField(leadData, storedField, storedClean);
+      if (storedField === "purpose") console.log("[PURPOSE_SIGNAL_STORED]", storedClean);
+      console.log("[ANSWER STORED]", currentQuestionIndex, storedClean);
+      console.log("[LEAD MEMORY UPDATED]", currentQuestionIndex, "->", storedClean);
       currentQuestionIndex += 1;
       lastQualificationAnswerAccepted = true;
       return true;
