@@ -3000,10 +3000,17 @@ async function startServer() {
       return fields;
     };
 
+    const isValidPurposeValue = (value: string) => {
+      const t = normalizeTurnText(value);
+      const valid = /\b(selfuse|self use|self|for self|looking for self|im looking for self|i am looking for self|investment|invest|investor|both|own use|own|personal use|personal)\b/i.test(t);
+      if (valid) console.log("[PURPOSE_VALUE_VALIDATED]");
+      return valid;
+    };
+
     const isValidStoredQualificationValue = (field: string, value: string) => {
       const t = normalizeTurnText(value);
       if (!t) return false;
-      if (field === "purpose") return /\b(self use|self-use|self|investment|invest|investor|both|own use|own|personal use|personal)\b/i.test(t);
+      if (field === "purpose") return isValidPurposeValue(value);
       if (field === "configuration") return Boolean(extractActiveConfigurationAnswer(value)) || t.split(" ").filter(Boolean).length > 0;
       if (field === "budget") return /\b(\d+(?:\.\d+)?\s*(lakh|lakhs|lac|crore|cr)|around\s+\d+|under\s+\d+|between\s+\d+)\b/i.test(t);
       if (field === "timeline") return Boolean(normalizeTimelineAnswer(value));
@@ -3075,6 +3082,21 @@ async function startServer() {
       if (/^(1|one)$/.test(t) || /\b(i said|i told you|already told you)\s+(1|one)\b/i.test(t)) return "1 BHK";
       if (/^(2|two|do)$/.test(t) || /\b(i said|i told you|already told you)\s+(2|two|do)\b/i.test(t)) return "2 BHK";
       if (/^(3|three)$/.test(t) || /\b(i said|i told you|already told you)\s+(3|three)\b/i.test(t) || /^3\s+3$/.test(t)) return "3 BHK";
+      if (/\b(interested in|looking for|i want|want)\s+(1|one)\b/i.test(t)) {
+        console.log("[CONFIGURATION_CONTEXTUAL_PHRASE_DETECTED]", userText);
+        console.log("[CONFIGURATION_SIGNAL_NORMALIZED]", "1 BHK");
+        return "1 BHK";
+      }
+      if (/\b(interested in|looking for|i want|want)\s+(2|two|do)\b/i.test(t)) {
+        console.log("[CONFIGURATION_CONTEXTUAL_PHRASE_DETECTED]", userText);
+        console.log("[CONFIGURATION_SIGNAL_NORMALIZED]", "2 BHK");
+        return "2 BHK";
+      }
+      if (/\b(interested in|looking for|i want|want)\s+(3|three)\b/i.test(t)) {
+        console.log("[CONFIGURATION_CONTEXTUAL_PHRASE_DETECTED]", userText);
+        console.log("[CONFIGURATION_SIGNAL_NORMALIZED]", "3 BHK");
+        return "3 BHK";
+      }
       return "";
     };
 
@@ -3189,7 +3211,7 @@ async function startServer() {
     const extractQualificationSignalsFromTurn = (userText: string, currentQuestions: Array<{ id: string; text: string }>, _kb: any) => {
       const normalized = normalizeTurnText(userText);
       const signals: Array<{ field: string; value: string }> = [];
-      if (/\b(self[ -]?use|own use|personal use|investment|invest|investor|both)\b/i.test(normalized)) {
+      if (/\b(self[ -]?use|for self|looking for self|im looking for self|i am looking for self|own use|own|personal use|personal|investment|invest|investor|both)\b/i.test(normalized)) {
         signals.push({ field: "purpose", value: normalizeQualificationSignalValue("purpose", userText) });
       }
       const configSignal = extractConfigurationAnswer(userText);
@@ -3378,7 +3400,7 @@ async function startServer() {
 
       if (storedField && !isValidStoredQualificationValue(storedField, clean)) {
         if (storedField === "timeline") console.log("[TIMELINE_STORE_REJECTED_NON_TIMELINE]", clean);
-        console.log("[FIELD_STORE_BLOCKED_MISMATCH]", clean, "->", storedField);
+        console.log("[FIELD_STORE_BLOCKED_INVALID_VALUE]", storedField, clean);
         currentQuestionIndex = targetIndex;
         return false;
       }
@@ -3397,7 +3419,7 @@ async function startServer() {
       const storedClean = storedField ? normalizeQualificationSignalValue(storedField, clean) : clean;
       if (storedField && !isValidStoredQualificationValue(storedField, storedClean)) {
         if (storedField === "timeline") console.log("[TIMELINE_STORE_REJECTED_NON_TIMELINE]", storedClean);
-        console.log("[FIELD_STORE_BLOCKED_MISMATCH]", storedClean, "->", storedField);
+        console.log("[FIELD_STORE_BLOCKED_INVALID_VALUE]", storedField, storedClean);
         return false;
       }
       console.log("[FIELD_STORE_ALLOWED]", storedField || "unknown", storedClean);
