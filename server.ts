@@ -3065,6 +3065,11 @@ async function startServer() {
       if (/\bthis month\b/i.test(t)) return "this month";
       if (/\bnext month\b/i.test(t)) return "next month";
       if (/\bnot now\b/i.test(t)) return "not now";
+      if (/\b(i want to move forward|want to move forward|move forward with it|i want to proceed|want to proceed|ready to proceed|i am ready|im ready|as soon as possible)\b/i.test(t)) {
+        console.log("[TIMELINE_INTENT_PROCEED_DETECTED]", userText);
+        console.log("[TIMELINE_SIGNAL_NORMALIZED]", "soon");
+        return "soon";
+      }
 
       const afterMatch = t.match(/\bafter\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|a)\s+(day|days|week|weeks|month|months)\b/i);
       if (afterMatch) {
@@ -3609,6 +3614,12 @@ async function startServer() {
         if (isConfusionInput(t) || ["what", "why", "how", "where", "who", "are you", "why do", "what was", "what is", "can you"].includes(t)) return true;
         return meaningfulWordCount(value) > 0 && meaningfulWordCount(value) < 3 && detectIntentType(value) === "general_question";
       };
+
+      const isPostQualificationNextStepOffer = () => /\b(arrange.*visit|site visit|latest pricing|pricing details|share latest|team share.*details|team share.*pricing)\b/i.test(normalizeTurnText(lastAiReply));
+      const isPostQualPositive = (value: string) => /^(yes|yes sure|sure|okay|ok|okay sure|yes please|please|go ahead|yes do that)$/i.test(normalizeTurnText(value)) || /\b(arrange|site visit|visit|schedule|appointment|book visit|pricing|price|details|share details|team share|latest pricing|call me|team can call)\b/i.test(normalizeTurnText(value));
+      const isPostQualAmbiguousPositive = (value: string) => /^(yes|yes sure|sure|okay|ok|okay sure|yes please|please|go ahead|yes do that)$/i.test(normalizeTurnText(value));
+      const isPostQualSiteVisitChoice = (value: string) => /\b(site visit|visit|schedule|appointment|book visit|arrange visit|arrange site visit)\b/i.test(normalizeTurnText(value));
+      const isPostQualPricingDetailsChoice = (value: string) => /\b(pricing|price|details|share details|team share|latest pricing|latest details)\b/i.test(normalizeTurnText(value));
 
       const isGenericGreetingInput = (value: string) => ["hello", "hello?", "hi", "hi?"].includes(value.trim().toLowerCase());
       const isGenericContinueInput = (value: string) => isContinuationIntent(value);
@@ -4178,6 +4189,31 @@ async function startServer() {
       }
 
       if (conversationStage === "post_qualification") {
+        const hasNextStepContext = isPostQualificationNextStepOffer();
+        if (hasNextStepContext) console.log("[POST_QUAL_NEXT_STEP_CONTEXT_FOUND]");
+        if (hasNextStepContext && isPostQualPositive(transcript)) {
+          console.log("[POST_QUAL_POSITIVE_DETECTED]", transcript);
+          if (isPostQualSiteVisitChoice(transcript)) {
+            console.log("[POST_QUAL_SITE_VISIT_SELECTED]", transcript);
+            console.log("[SCHEDULING_STAGE_STARTED]");
+            appointmentData.requested = true;
+            appointmentData.type = appointmentData.type || "site visit";
+            console.log("[APPOINTMENT DATA UPDATED]", JSON.stringify(appointmentData));
+            return decision("Sure. What day and time works for the site visit?", "appointment", false, 12);
+          }
+          if (isPostQualPricingDetailsChoice(transcript)) {
+            console.log("[POST_QUAL_PRICING_DETAILS_SELECTED]", transcript);
+            const finalReply = "Sure. Our team will share the latest details with you shortly. Thank you.";
+            console.log("[FINAL_REPLY_BEFORE_HANGUP]", finalReply);
+            requestHangupAfterTts("post_qualification_pricing_details");
+            return decision(finalReply, "post_qualification", false, 14);
+          }
+          if (isPostQualAmbiguousPositive(transcript)) {
+            console.log("[POST_QUAL_AMBIGUOUS_POSITIVE_CLARIFIED]");
+            console.log("[POST_QUAL_REPEAT_FALLBACK_BLOCKED]");
+            return decision("Sure, would you prefer a site visit or latest pricing details?", "post_qualification", false, 12);
+          }
+        }
         if (routedIntent === "scheduling_request") {
           updateAppointmentData(transcript);
           console.log("[DECISION: ASK_NEXT]");
@@ -4203,6 +4239,10 @@ async function startServer() {
         recoveryAttemptsAfterCompletion += 1;
         console.log("[WEAK_FILLER_BLOCKED_POST_QUAL]");
         console.log("[POST_QUAL_CONTEXTUAL_OPTIONS_USED]");
+        if (hasNextStepContext) {
+          console.log("[POST_QUAL_GENERIC_REPEAT_BLOCKED]");
+          return decision("Would you prefer a site visit or latest pricing details?", "post_qualification", false, 12);
+        }
         return decision("Are you asking about pricing, offers, amenities, or scheduling a visit?", "post_qualification", false, 14);
       }
 
@@ -6373,6 +6413,8 @@ server.listen(PORT, "0.0.0.0", () => {
 }
 
 startServer();
+
+
 
 
 
