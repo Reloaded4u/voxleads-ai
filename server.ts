@@ -3192,7 +3192,7 @@ async function startServer() {
         if (/\bboth\b/i.test(t)) return "both";
       }
       if (field === "configuration") {
-        const config = extractConfigurationAnswer(value);
+        const config = extractActiveConfigurationAnswer(value) || extractConfigurationAnswer(value);
         if (config) {
           console.log("[CONFIGURATION_SIGNAL_NORMALIZED]", config);
           return config;
@@ -3343,7 +3343,7 @@ async function startServer() {
         return /\b(self[ -]?use|own use|personal use|investment|invest|investor|both)\b/i.test(normalizedAnswer);
       }
       if (question.includes("configuration") || question.includes("bhk")) {
-        return Boolean(extractConfigurationAnswer(answer)) || /\b(\d+\s*bhk|1bhk|2bhk|3bhk|4bhk|one\s*bhk|two\s*bhk|two\s*b\s*h\s*k|three\s*bhk|one bedroom|two bedroom|three bedroom|1 bedroom|2 bedroom|3 bedroom|2 bed|two bed|two b|2 b|two be|two bee|to bhk|too bhk|two b apartment|two bhk apartments?|2 bhk apartments?|vsk apartment|bsk apartment|bhk apartment|do bhk|do b h k|do bedroom|do b|one b|three b|studio)\b/i.test(normalizedAnswer);
+        return Boolean(extractActiveConfigurationAnswer(answer) || extractConfigurationAnswer(answer)) || /\b(\d+\s*bhk|1bhk|2bhk|3bhk|4bhk|one\s*bhk|two\s*bhk|two\s*b\s*h\s*k|three\s*bhk|one bedroom|two bedroom|three bedroom|1 bedroom|2 bedroom|3 bedroom|2 bed|two bed|two b|2 b|two be|two bee|to bhk|too bhk|two b apartment|two bhk apartments?|2 bhk apartments?|vsk apartment|bsk apartment|bhk apartment|do bhk|do b h k|do bedroom|do b|one b|three b|studio)\b/i.test(normalizedAnswer);
       }
       if (question.includes("budget")) {
         return /\b((\d+.*(lakh|lac|crore|cr))|budget|range|around|under|between)\b/i.test(normalizedAnswer);
@@ -3426,6 +3426,7 @@ async function startServer() {
       leadData.answers[currentQuestionIndex] = storedClean;
       if (storedField) setQualificationField(leadData, storedField, storedClean);
       if (storedField === "purpose") console.log("[PURPOSE_SIGNAL_STORED]", storedClean);
+      if (storedField === "configuration") console.log("[CONFIGURATION_SIGNAL_STORED]", storedClean);
       console.log("[ANSWER STORED]", currentQuestionIndex, storedClean);
       console.log("[LEAD MEMORY UPDATED]", currentQuestionIndex, "->", storedClean);
       currentQuestionIndex += 1;
