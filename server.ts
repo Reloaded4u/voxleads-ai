@@ -3190,11 +3190,11 @@ async function startServer() {
     const normalizeQualificationSignalValue = (field: string, value: string) => {
       const t = normalizeTurnText(value);
       if (field === "purpose") {
-        if (/\b(self use|selfuse|for self|looking for self|im looking for self|i am looking for self|own use|own|personal use|personal|self)\b/i.test(t)) {
+        if (/\b(self|self use|selfuse|for self|for the self|looking for self|looking for self use|looking for selfuse|looking for the self use|looking for the selfuse|im looking for self|i am looking for self|own use|own|personal use|personal|end use)\b/i.test(t)) {
           console.log("[PURPOSE_SIGNAL_NORMALIZED]", "self-use");
           return "self-use";
         }
-        if (/\b(investment|invest|investor)\b/i.test(t)) return "investment";
+        if (/\b(investment|invest|investor|for investment|looking for investment|rental income|resale)\b/i.test(t)) return "investment";
         if (/\bboth\b/i.test(t)) return "both";
       }
       if (field === "configuration") {
@@ -3217,7 +3217,7 @@ async function startServer() {
     const extractQualificationSignalsFromTurn = (userText: string, currentQuestions: Array<{ id: string; text: string }>, _kb: any) => {
       const normalized = normalizeTurnText(userText);
       const signals: Array<{ field: string; value: string }> = [];
-      if (/\b(self[ -]?use|for self|looking for self|im looking for self|i am looking for self|own use|own|personal use|personal|investment|invest|investor|both)\b/i.test(normalized)) {
+      if (/\b(self|self[ -]?use|for self|for the self|looking for self|looking for self use|looking for selfuse|looking for the self use|looking for the selfuse|im looking for self|i am looking for self|own use|own|personal use|personal|end use|investment|invest|investor|for investment|looking for investment|rental income|resale|both)\b/i.test(normalized)) {
         signals.push({ field: "purpose", value: normalizeQualificationSignalValue("purpose", userText) });
       }
       const configSignal = extractActiveConfigurationAnswer(userText) || extractConfigurationAnswer(userText);
@@ -3246,6 +3246,8 @@ async function startServer() {
         return false;
       }
       const storedValue = normalizeQualificationSignalValue(field, value);
+      if (field === "purpose") console.log("[FIELD_VALUE_VALIDATED]", field, storedValue);
+      console.log("[FIELD_STORE_ALLOWED]", field, storedValue);
       leadData.answers[index] = storedValue;
       setQualificationField(leadData, field, storedValue);
       if (field === "configuration") {
@@ -3346,7 +3348,7 @@ async function startServer() {
           console.log("[PURPOSE_PARTIAL_ACCEPTED]", answer);
           return true;
         }
-        return /\b(self[ -]?use|own use|personal use|investment|invest|investor|both)\b/i.test(normalizedAnswer);
+        return /\b(self|self[ -]?use|for self|for the self|looking for self|looking for self use|looking for selfuse|looking for the self use|looking for the selfuse|own use|own|personal use|personal|end use|investment|invest|investor|for investment|looking for investment|rental income|resale|both)\b/i.test(normalizedAnswer);
       }
       if (question.includes("configuration") || question.includes("bhk")) {
         return Boolean(extractActiveConfigurationAnswer(answer) || extractConfigurationAnswer(answer)) || /\b(\d+\s*bhk|1bhk|2bhk|3bhk|4bhk|one\s*bhk|two\s*bhk|two\s*b\s*h\s*k|three\s*bhk|one bedroom|two bedroom|three bedroom|1 bedroom|2 bedroom|3 bedroom|2 bed|two bed|two b|2 b|two be|two bee|to bhk|too bhk|two b apartment|two bhk apartments?|2 bhk apartments?|vsk apartment|bsk apartment|bhk apartment|do bhk|do b h k|do bedroom|do b|one b|three b|studio)\b/i.test(normalizedAnswer);
@@ -4028,6 +4030,45 @@ async function startServer() {
         return "";
       };
 
+      const extractActivePurposeAnswer = (userText: string) => {
+        const t = normalizeTurnText(userText);
+        if (!t) return "";
+        if (/\b(self|self use|selfuse|for self|for the self|looking for self|looking for self use|looking for selfuse|looking for the self use|looking for the selfuse|im looking for self|i am looking for self|own use|own|personal use|personal|end use)\b/i.test(t)) {
+          console.log("[ACTIVE_PURPOSE_SIGNAL_DETECTED]", userText);
+          console.log("[PURPOSE_SIGNAL_NORMALIZED]", "self-use");
+          return "self-use";
+        }
+        if (/\b(investment|invest|investor|for investment|looking for investment|rental income|resale)\b/i.test(t)) {
+          console.log("[ACTIVE_PURPOSE_SIGNAL_DETECTED]", userText);
+          console.log("[PURPOSE_SIGNAL_NORMALIZED]", "investment");
+          return "investment";
+        }
+        if (/\bboth\b/i.test(t)) {
+          console.log("[ACTIVE_PURPOSE_SIGNAL_DETECTED]", userText);
+          console.log("[PURPOSE_SIGNAL_NORMALIZED]", "both");
+          return "both";
+        }
+        return "";
+      };
+
+      const storeActivePurposeIfPresent = (input: string) => {
+        const missing = getFirstMissingQualificationIndex(kb);
+        if (missing?.field !== "purpose") return false;
+        console.log("[ACTIVE_PURPOSE_CAPTURE_ATTEMPT]", input);
+        qualificationDebugSnapshot(input);
+        const purpose = extractActivePurposeAnswer(input);
+        if (!purpose) return false;
+        console.log("[PURPOSE_FAST_PATH_BYPASSED_GENERIC_INTENT]");
+        storeQualificationSignal("purpose", purpose, kb);
+        currentQuestionIndex = (getQualificationFieldIndex(kb, "purpose") ?? currentQuestionIndex) + 1;
+        console.log("[QUALIFICATION_ADVANCE_AFTER_STORE]");
+        console.log("[POST_STORE_VALIDATION_SKIPPED]");
+        console.log("[POST_STORE_REPEAT_BLOCKED]");
+        lastQualificationAnswerAccepted = true;
+        logQualificationDebugAfterStore();
+        return true;
+      };
+
       const storeActiveConfigurationIfPresent = (input: string) => {
         const missing = getFirstMissingQualificationIndex(kb);
         if (missing?.field !== "configuration") return false;
@@ -4076,7 +4117,15 @@ async function startServer() {
         else if (q.includes("timeline") || q.includes("when")) clarification = isIncompleteTimelineAnswer(input)
           ? buildTimelineClarification(input)
           : "Do you mean next week or next month?";
-        else if (q.includes("self use") || q.includes("investment")) clarification = "Are you looking for self-use or investment?";
+        else if (q.includes("self use") || q.includes("investment")) {
+          if (/^(yes|okay|ok|sure)$/i.test(t)) {
+            console.log("[PURPOSE_YES_AMBIGUOUS]");
+            console.log("[PURPOSE_CONTEXTUAL_CLARIFICATION_USED]");
+            clarification = "Do you mean self-use or investment?";
+          } else {
+            clarification = "Are you looking for self-use or investment?";
+          }
+        }
         console.log("[INVALID_INPUT_CONTEXTUAL_CLARIFY]", clarification);
         console.log("[QUALIFICATION_INDEX_PRESERVED]", currentQuestionIndex);
         if (normalizeTurnText(clarification) === normalizeTurnText(lastQualificationClarification)) {
@@ -4089,6 +4138,11 @@ async function startServer() {
       };
 
       if (conversationStage === "qualification") qualificationDebugSnapshot(transcript);
+
+      if (conversationStage === "qualification" && storeActivePurposeIfPresent(transcript)) {
+        const nextQuestionReply = askNextQualificationQuestion(callData, kb);
+        return decision(nextQuestionReply, conversationStage, false, 10);
+      }
 
       if (conversationStage === "qualification" && storeActiveConfigurationIfPresent(transcript)) {
         const nextQuestionReply = askNextQualificationQuestion(callData, kb);
@@ -4753,7 +4807,7 @@ async function startServer() {
           return getFirstMissingQualificationIndex(kb)?.field || "";
         };
 
-        const isActivePurposeAnswer = (value: string) => /\b(self[ -]?use|own use|personal use|investment|invest|investor|both)\b/i.test(normalizeTurnText(value));
+        const isActivePurposeAnswer = (value: string) => /\b(self|self[ -]?use|for self|for the self|looking for self|looking for self use|looking for selfuse|looking for the self use|looking for the selfuse|own use|own|personal use|personal|end use|investment|invest|investor|for investment|looking for investment|rental income|resale|both)\b/i.test(normalizeTurnText(value));
         const isActiveBudgetAnswer = (value: string) => /\b(\d+(?:\.\d+)?\s*(lakh|lakhs|lac|crore|cr)|around\s+\d+|under\s+\d+|between\s+\d+|budget|range)\b/i.test(normalizeTurnText(value));
         const isActiveTimelineAnswer = (value: string) => Boolean(normalizeTimelineAnswer(value));
         const isChannelCheckTurn = (value: string) => /^(hello|hi|hello\?|are you there|can you hear me|you there|are you listening)$/i.test(normalizeTurnText(value));
