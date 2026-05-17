@@ -1409,7 +1409,6 @@ function getVobizProviderCallId(callData: any) {
     callData?.vobizCallId ||
     callData?.callSid ||
     callData?.call_id ||
-    callData?.callId ||
     callData?.uuid ||
     callData?.sessionId ||
     ""
@@ -2231,6 +2230,7 @@ async function startServer() {
       console.log("[AI_HANGUP_AFTER_TTS]", reason);
       const latestCallSnap = callId ? await db.collection("calls").doc(callId).get().catch(() => null) : null;
       const latestCallData = latestCallSnap?.data?.() || { ownerId };
+      console.log("[VOBIZ_HANGUP_REQUESTED]", reason);
       const hangupSucceeded = await terminateVobizCall({ ...latestCallData, ownerId: latestCallData.ownerId || ownerId }, reason);
       await markLiveCallEnded(reason);
       state = "ENDING";
@@ -2939,6 +2939,39 @@ async function startServer() {
       return fields;
     };
 
+    const getQualificationSignalFieldsForText = (text: string) => {
+      const t = normalizeTurnText(text);
+      const fields = new Set<string>();
+      if (/\b(self[ -]?use|for self|looking for self|own use|own|personal use|personal|investment|invest|investor|both)\b/i.test(t)) fields.add("purpose");
+      if (extractActiveConfigurationAnswer(text)) fields.add("configuration");
+      if (/\b(lakh|lakhs|lac|crore|cr|budget|under|around|between)\b/i.test(t)) fields.add("budget");
+      if (normalizeTimelineAnswer(text) || isIncompleteTimelineAnswer(text)) fields.add("timeline");
+      return fields;
+    };
+
+    const isValidStoredQualificationValue = (field: string, value: string) => {
+      const t = normalizeTurnText(value);
+      if (!t) return false;
+      if (field === "purpose") return /\b(self use|self-use|self|investment|invest|investor|both|own use|own|personal use|personal)\b/i.test(t);
+      if (field === "configuration") return Boolean(extractActiveConfigurationAnswer(value)) || t.split(" ").filter(Boolean).length > 0;
+      if (field === "budget") return /\b(\d+(?:\.\d+)?\s*(lakh|lakhs|lac|crore|cr)|around\s+\d+|under\s+\d+|between\s+\d+)\b/i.test(t);
+      if (field === "timeline") return Boolean(normalizeTimelineAnswer(value));
+      return true;
+    };
+
+    const clearQualificationFieldValue = (kb: any, field: string) => {
+      const canonical = normalizeQualificationFieldName(field);
+      delete qualificationFieldValues[canonical];
+      delete (leadData as any)[canonical];
+      if (canonical === "configuration") {
+        delete (leadData as any).productOption;
+        delete (leadData as any).selectedOption;
+        delete (leadData as any).propertyConfiguration;
+      }
+      const index = getQualificationFieldIndex(kb, canonical);
+      if (index !== undefined) delete leadData.answers[index];
+    };
+
     const getFirstMissingQualificationIndex = (kb: any) => {
       const required = getRequiredQualificationFields(kb);
       const stored = getStoredQualificationFields(kb);
@@ -2954,9 +2987,17 @@ async function startServer() {
       console.log("[QUALIFICATION_COMPLETE_CHECK]");
       console.log("[QUALIFICATION_REQUIRED_FIELDS]", Array.from(required.keys()).join(",") || "none");
       console.log("[QUALIFICATION_STORED_FIELDS]", Array.from(stored.keys()).join(",") || "none");
+      console.log("[QUALIFICATION_COMPLETE_VALUE_VALIDATION]");
       for (const field of required.keys()) {
         if (!stored.has(field)) {
           console.log("[QUALIFICATION_COMPLETE_FALSE]");
+          return false;
+        }
+        const value = getQualificationField(leadData, field);
+        if (!isValidStoredQualificationValue(field, value)) {
+          console.log("[QUALIFICATION_FIELD_VALUE_INVALID]", field, value);
+          clearQualificationFieldValue(kb, field);
+          console.log("[QUALIFICATION_COMPLETE_FALSE_INVALID_FIELD]", field);
           return false;
         }
       }
@@ -3235,17 +3276,54 @@ async function startServer() {
       return normalizedAnswer.split(" ").filter(Boolean).length <= 6;
     };
 
-    const storeQualificationAnswer = (transcript: string, questionText = "") => {
+    const storeQualificationAnswer = (transcript: string, questionText = "", kb?: any) => {
       lastQualificationAnswerAccepted = false;
       if (!qualificationStarted) return false;
       const clean = normalizeUserInput(transcript);
       const normalizedAnswer = normalizeTurnText(clean);
       if (!normalizedAnswer) return false;
-      if (!isValidQualificationAnswer(clean, questionText)) {
+
+      const questions = kb ? getQualificationQuestions(kb) : [];
+      let targetIndex = currentQuestionIndex;
+      while (leadData.answers[targetIndex]) {
+        console.log("[QUALIFICATION QUESTION SKIPPED]", targetIndex);
+        console.log("[QUESTION SKIPPED]", targetIndex, "already answered");
+        targetIndex += 1;
+      }
+      const effectiveQuestionText = questions[targetIndex]?.text || questionText || "";
+      const storedField = inferQualificationField(effectiveQuestionText);
+      const currentMissingField = kb ? getFirstMissingQualificationIndex(kb)?.field || storedField : storedField;
+      const signalFields = getQualificationSignalFieldsForText(clean);
+      console.log("[FIELD_STORE_GUARD_CHECK]", JSON.stringify({ currentIndex: currentQuestionIndex, targetIndex, storedField, currentMissingField, signalFields: Array.from(signalFields), text: clean }));
+
+      if (signalFields.size > 0 && storedField && !signalFields.has(storedField)) {
+        for (const signalField of signalFields) {
+          if (getQualificationField(leadData, signalField)) {
+            console.log("[DUPLICATE_FIELD_SIGNAL_DETECTED]", signalField, clean);
+            console.log("[FIELD_STORE_BLOCKED_DUPLICATE]", signalField, clean);
+            console.log("[DUPLICATE_FIELD_NOT_STORED_AS_NEXT_FIELD]");
+            currentQuestionIndex = targetIndex;
+            return false;
+          }
+        }
+        console.log("[FIELD_STORE_BLOCKED_MISMATCH]", Array.from(signalFields).join(","), "->", storedField);
+        currentQuestionIndex = targetIndex;
+        return false;
+      }
+
+      if (!isValidQualificationAnswer(clean, effectiveQuestionText)) {
         console.log("[QUALIFICATION_VALIDATION_FAILED]", transcript);
         console.log("[INVALID_ANSWER_REJECTED]", transcript);
-        console.log("[QUALIFICATION_INDEX_PRESERVED]", currentQuestionIndex);
+        console.log("[QUALIFICATION_INDEX_PRESERVED]", targetIndex);
         console.log("[ADVANCE_BLOCKED_INVALID_ANSWER]");
+        currentQuestionIndex = targetIndex;
+        return false;
+      }
+
+      if (storedField && !isValidStoredQualificationValue(storedField, clean)) {
+        if (storedField === "timeline") console.log("[TIMELINE_STORE_REJECTED_NON_TIMELINE]", clean);
+        console.log("[FIELD_STORE_BLOCKED_MISMATCH]", clean, "->", storedField);
+        currentQuestionIndex = targetIndex;
         return false;
       }
 
@@ -3253,21 +3331,20 @@ async function startServer() {
         .find(([, answer]) => normalizeTurnText(String(answer)) === normalizedAnswer)?.[0];
       if (duplicateIndex !== undefined) {
         console.log("[QUALIFICATION DUPLICATE BLOCKED]", duplicateIndex, clean);
-        if (leadData.answers[currentQuestionIndex]) {
-          console.log("[QUALIFICATION QUESTION SKIPPED]", currentQuestionIndex);
-          currentQuestionIndex += 1;
-        }
+        console.log("[FIELD_STORE_BLOCKED_DUPLICATE]", clean);
+        currentQuestionIndex = targetIndex;
         lastQualificationAnswerAccepted = true;
         return true;
       }
 
-      if (leadData.answers[currentQuestionIndex]) {
-        console.log("[QUALIFICATION QUESTION SKIPPED]", currentQuestionIndex);
-        console.log("[QUESTION SKIPPED]", currentQuestionIndex, "already answered");
-        currentQuestionIndex += 1;
-      }
-      const storedField = inferQualificationField(questionText || "");
+      currentQuestionIndex = targetIndex;
       const storedClean = storedField ? normalizeQualificationSignalValue(storedField, clean) : clean;
+      if (storedField && !isValidStoredQualificationValue(storedField, storedClean)) {
+        if (storedField === "timeline") console.log("[TIMELINE_STORE_REJECTED_NON_TIMELINE]", storedClean);
+        console.log("[FIELD_STORE_BLOCKED_MISMATCH]", storedClean, "->", storedField);
+        return false;
+      }
+      console.log("[FIELD_STORE_ALLOWED]", storedField || "unknown", storedClean);
       leadData.answers[currentQuestionIndex] = storedClean;
       if (storedField) setQualificationField(leadData, storedField, storedClean);
       if (storedField === "purpose") console.log("[PURPOSE_SIGNAL_STORED]", storedClean);
@@ -3937,7 +4014,7 @@ async function startServer() {
 
       if (conversationStage === "qualification" && isContextualShortAnswer(transcript)) {
         console.log("[CONTEXTUAL_SHORT_ANSWER_ACCEPTED]", transcript);
-        if (!storeQualificationAnswer(transcript, getCurrentPendingPrompt(callData, kb))) {
+        if (!storeQualificationAnswer(transcript, getCurrentPendingPrompt(callData, kb), kb)) {
           return decision(buildQualificationClarification(transcript), conversationStage, false, 8);
         }
         const nextQuestionReply = askNextQualificationQuestion(callData, kb);
@@ -4059,7 +4136,7 @@ async function startServer() {
           const questionText = getQualificationQuestions(kb)[currentQuestionIndex]?.text || "";
           if (isValidQualificationAnswer(transcript, questionText)) {
             qualificationStarted = true;
-            if (storeQualificationAnswer(transcript, questionText)) {
+            if (storeQualificationAnswer(transcript, questionText, kb)) {
               console.log("[LATE_QUALIFICATION_STORED]", missing.field);
               if (hasCompletedRequiredQualification(callData, kb)) {
                 moveStage("post_qualification");
@@ -4202,7 +4279,7 @@ async function startServer() {
           const nextMissingPrompt = getNextMissingQualificationQuestion(callData, kb);
           return decision(nextMissingPrompt || buildQualificationClarification(transcript), conversationStage, false, 10);
         }
-        if (qualificationStarted && !storeQualificationAnswer(transcript, getCurrentPendingPrompt(callData, kb))) {
+        if (qualificationStarted && !storeQualificationAnswer(transcript, getCurrentPendingPrompt(callData, kb), kb)) {
           return decision(buildQualificationClarification(transcript), conversationStage, false, 8);
         }
         if (lastQualificationAnswerAccepted !== true) {
@@ -5167,13 +5244,14 @@ async function startServer() {
             throw new Error(vobizData?.message || `Vobiz API failed with status ${vobizResponse.status}`);
           }
 
-          const vobizCallId = vobizData.call_id || vobizData.callId || vobizData.id || vobizData.uuid || vobizData.sessionId || vobizData.providerCallId || vobizData.vobizCallId || `vobiz-${Date.now()}`;
-          console.log("[VOBIZ_PROVIDER_CALL_ID_STORED]", vobizCallId);
+          const vobizCallId = vobizData.call_id || vobizData.callId || vobizData.id || vobizData.uuid || vobizData.sessionId || vobizData.providerCallId || vobizData.vobizCallId || "";
+          if (vobizCallId) console.log("[VOBIZ_PROVIDER_CALL_ID_STORED]", vobizCallId);
+          else console.log("[VOBIZ_PROVIDER_CALL_ID_MISSING]", JSON.stringify(Object.keys(vobizData || {})));
 
           await db.collection('calls').doc(callId).update(sanitizeForFirestore({
-            callSid: vobizCallId,
-            providerCallId: vobizCallId,
-            vobizCallId,
+            callSid: vobizCallId || undefined,
+            providerCallId: vobizCallId || undefined,
+            vobizCallId: vobizCallId || undefined,
             provider: 'vobiz',
             status: 'initiated',
             recordingStatus: recordingEnabled ? 'requested' : null,
