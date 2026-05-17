@@ -1201,9 +1201,12 @@ async function finalizeCallSummaryFromTranscript(callId: string, transcriptTextF
 
   if (!transcriptText) {
     console.log("[SUMMARY SKIPPED EMPTY]");
+    console.log("[CALL_END_NO_TRANSCRIPT]", callId);
     await callRef.update(sanitizeForFirestore({
       transcript: "",
       transcriptText: "",
+      finalized: true,
+      analysisStatus: "skipped_empty_transcript",
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }));
     return;
@@ -1404,15 +1407,49 @@ async function stopVobizRecording(callId: string, callUuid: string, vobizConfig:
 }
 
 function getVobizProviderCallId(callData: any) {
-  return String(
-    callData?.providerCallId ||
-    callData?.vobizCallId ||
-    callData?.callSid ||
-    callData?.call_id ||
-    callData?.uuid ||
-    callData?.sessionId ||
-    ""
-  ).trim();
+  const candidates: Array<{ source: string; value: any; usable?: boolean }> = [
+    { source: "vobizCallUuid", value: callData?.vobizCallUuid },
+    { source: "providerCallId", value: callData?.providerCallId },
+    { source: "vobizRequestUuid", value: callData?.vobizRequestUuid },
+    { source: "callSid", value: callData?.callSid },
+    { source: "vobizCallId", value: callData?.vobizCallId },
+    { source: "call_id", value: callData?.call_id },
+    { source: "uuid", value: callData?.uuid },
+    { source: "sessionId", value: callData?.sessionId },
+    { source: "vobizStreamId", value: callData?.vobizStreamId, usable: process.env.VOBIZ_ALLOW_STREAM_ID_HANGUP === "true" },
+    { source: "internalCallId", value: callData?.id, usable: process.env.VOBIZ_ALLOW_INTERNAL_CALL_ID_HANGUP === "true" },
+  ];
+
+  for (const candidate of candidates) {
+    const value = String(candidate.value || "").trim();
+    if (!value) continue;
+    if (candidate.usable === false) continue;
+    console.log("[VOBIZ_HANGUP_ID_SELECTED]", value);
+    console.log("[VOBIZ_HANGUP_ID_SOURCE]", candidate.source);
+    return value;
+  }
+
+  return "";
+}
+
+function getVobizIdsFromPayload(payload: any) {
+  return {
+    callUuid: payload?.CallUUID || payload?.call_uuid || payload?.callUuid || payload?.uuid || payload?.call_id,
+    streamId: payload?.StreamID || payload?.stream_id || payload?.streamId,
+    requestUuid: payload?.request_uuid || payload?.RequestUUID || payload?.requestUuid,
+    apiId: payload?.api_id || payload?.apiId || payload?.APIID,
+  };
+}
+
+function extractCallIdFromVobizServiceUrl(serviceUrl: string) {
+  try {
+    if (!serviceUrl) return "";
+    const parsed = new URL(serviceUrl);
+    return parsed.searchParams.get("callId") || "";
+  } catch {
+    const match = String(serviceUrl || "").match(/[?&]callId=([^&]+)/i);
+    return match ? decodeURIComponent(match[1]) : "";
+  }
 }
 
 async function terminateVobizCall(callData: any, reason: string) {
@@ -1421,6 +1458,7 @@ async function terminateVobizCall(callData: any, reason: string) {
   console.log("[VOBIZ_HANGUP_CALL_ID]", providerCallId || "missing");
 
   if (!providerCallId) {
+    console.log("[VOBIZ_HANGUP_NOT_CONFIGURED_OR_NO_PROVIDER_ID]", "missing provider call id");
     console.log("[VOBIZ_HANGUP_NOT_CONFIGURED]", "missing provider call id");
     return false;
   }
@@ -5309,19 +5347,39 @@ async function startServer() {
           });
 
           const vobizData = await vobizResponse.json();
+          const safeVobizPreview = {
+            api_id: vobizData?.api_id,
+            message: vobizData?.message,
+            request_uuid: vobizData?.request_uuid,
+            callId: vobizData?.callId,
+            id: vobizData?.id,
+            uuid: vobizData?.uuid,
+            sessionId: vobizData?.sessionId,
+            providerCallId: vobizData?.providerCallId,
+            vobizCallId: vobizData?.vobizCallId,
+          };
+          console.log("[VOBIZ_CREATE_CALL_RESPONSE_KEYS]", JSON.stringify(Object.keys(vobizData || {})));
+          console.log("[VOBIZ_CREATE_CALL_RESPONSE_SAFE_PREVIEW]", JSON.stringify(safeVobizPreview));
 
           if (!vobizResponse.ok) {
             throw new Error(vobizData?.message || `Vobiz API failed with status ${vobizResponse.status}`);
           }
 
-          const vobizCallId = vobizData.call_id || vobizData.callId || vobizData.id || vobizData.uuid || vobizData.sessionId || vobizData.providerCallId || vobizData.vobizCallId || "";
-          if (vobizCallId) console.log("[VOBIZ_PROVIDER_CALL_ID_STORED]", vobizCallId);
-          else console.log("[VOBIZ_PROVIDER_CALL_ID_MISSING]", JSON.stringify(Object.keys(vobizData || {})));
+          const vobizRequestUuid = vobizData.request_uuid || vobizData.RequestUUID || vobizData.requestUuid || "";
+          const vobizCallId = vobizData.call_id || vobizData.callId || vobizData.id || vobizData.uuid || vobizData.sessionId || vobizData.providerCallId || vobizData.vobizCallId || vobizRequestUuid || "";
+          if (vobizRequestUuid) console.log("[VOBIZ_REQUEST_UUID_STORED]", vobizRequestUuid);
+          if (vobizCallId) console.log("[VOBIZ_PROVIDER_CALL_ID_STORED]", vobizRequestUuid ? "request_uuid" : "provider_id", vobizCallId);
+          else {
+            console.log("[VOBIZ_PROVIDER_CALL_ID_MISSING]", JSON.stringify(Object.keys(vobizData || {})));
+            console.log("[VOBIZ_PROVIDER_CALL_ID_PENDING_FROM_CALLBACK]");
+          }
 
           await db.collection('calls').doc(callId).update(sanitizeForFirestore({
             callSid: vobizCallId || undefined,
             providerCallId: vobizCallId || undefined,
             vobizCallId: vobizCallId || undefined,
+            vobizRequestUuid: vobizRequestUuid || undefined,
+            vobizApiId: vobizData.api_id || undefined,
             provider: 'vobiz',
             status: 'initiated',
             recordingStatus: recordingEnabled ? 'requested' : null,
@@ -5578,9 +5636,34 @@ async function startServer() {
     res.send(xml);
   });
 
-  app.post("/api/vobiz/stream-status", (req, res) => {
-    console.log("[Vobiz Stream Callback] Event=" + req.body?.Event + " StreamID=" + req.body?.StreamID + " CallUUID=" + req.body?.CallUUID);
-    console.log("[Vobiz Stream Callback] Full body:", JSON.stringify(req.body));
+  app.post("/api/vobiz/stream-status", async (req, res) => {
+    const body = req.body || {};
+    console.log("[Vobiz Stream Callback] Event=" + body?.Event + " StreamID=" + body?.StreamID + " CallUUID=" + body?.CallUUID);
+    console.log("[Vobiz Stream Callback] Full body:", JSON.stringify(body));
+    try {
+      const serviceUrl = body.ServiceURL || body.serviceUrl || body.service_url || "";
+      const internalCallId = extractCallIdFromVobizServiceUrl(serviceUrl);
+      const ids = getVobizIdsFromPayload(body);
+      if (internalCallId) {
+        const update: any = {
+          vobizCallUuid: ids.callUuid || undefined,
+          vobizStreamId: ids.streamId || undefined,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        };
+        const callRef = db.collection("calls").doc(internalCallId);
+        const callSnap = await callRef.get();
+        const callData = callSnap.data() || {};
+        if (ids.callUuid && !callData.providerCallId) {
+          update.providerCallId = ids.callUuid;
+          console.log("[VOBIZ_PROVIDER_CALL_ID_UPDATED_FROM_STREAM]", ids.callUuid);
+        }
+        await callRef.update(sanitizeForFirestore(update));
+        if (ids.callUuid) console.log("[VOBIZ_CALL_UUID_STORED]", ids.callUuid);
+        if (ids.streamId) console.log("[VOBIZ_STREAM_ID_STORED]", ids.streamId);
+      }
+    } catch (error) {
+      console.error("[Vobiz Stream Callback] Update failed:", error);
+    }
     res.json({ ok: true });
   });
 
@@ -5730,8 +5813,10 @@ ${speakXml}  </Gather>
   // Vobiz Status Webhook
   app.post("/api/webhooks/vobiz/status", async (req, res) => {
     const { callId, event } = req.query;
+    const body = req.body || {};
 
     console.log(`[Vobiz Webhook] ${callId}: ${event}`);
+    console.log("[VOBIZ_WEBHOOK_EVENT_RECEIVED]", JSON.stringify({ callId, event, keys: Object.keys(body || {}) }));
 
     const statusMap: any = {
       ringing: "ringing",
@@ -5743,17 +5828,37 @@ ${speakXml}  </Gather>
     const isFinalStatus = ["completed", "failed", "busy", "no-answer"].includes(finalStatus);
 
     try {
+      const ids = getVobizIdsFromPayload(body);
+      if (ids.callUuid || ids.requestUuid || ids.streamId) console.log("[VOBIZ_WEBHOOK_PROVIDER_ID_FOUND]", ids.callUuid || ids.requestUuid || ids.streamId);
+      else console.log("[VOBIZ_WEBHOOK_PROVIDER_ID_MISSING]", JSON.stringify(Object.keys(body || {})));
+
+      const callRef = db.collection("calls").doc(callId as string);
+      const callSnap = await callRef.get();
+      const callData = callSnap.data() || {};
+      const hangupBeforeStream = String(event || "").toLowerCase() === "hangup" && !callData.vobizStreamId;
       const updates: any = {
-        status: finalStatus,
+        status: hangupBeforeStream ? "not_connected" : finalStatus,
+        providerCallId: callData.providerCallId || ids.callUuid || ids.requestUuid || undefined,
+        vobizCallUuid: ids.callUuid || undefined,
+        vobizStreamId: ids.streamId || undefined,
+        vobizRequestUuid: ids.requestUuid || undefined,
+        vobizApiId: ids.apiId || undefined,
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       };
+
+      if (hangupBeforeStream) {
+        console.log("[VOBIZ_CALL_HANGUP_BEFORE_STREAM]", callId);
+        console.log("[VOBIZ_CALL_NEVER_CONNECTED]", callId);
+        console.log("[VOBIZ_CALL_ENDED_BY_PROVIDER_OR_CALLEE]", callId);
+        updates.endReason = "provider_hangup_before_stream";
+      }
 
       if (isFinalStatus) {
         updates.endedAt = admin.firestore.FieldValue.serverTimestamp();
         updates.controlState = "call_ended";
       }
 
-      await db.collection("calls").doc(callId as string).update(
+      await callRef.update(
         sanitizeForFirestore(updates)
       );
 
