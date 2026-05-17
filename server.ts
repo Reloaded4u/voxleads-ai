@@ -370,6 +370,9 @@ function cleanFinalResponse(value: string, fallback = "Sure, what would you like
 
 function compressReplyForLiveCall(value: string, maxWords = 16) {
   const original = String(value || "").replace(/\s+/g, " ").trim();
+  const requestedMaxWords = maxWords;
+  maxWords = Math.min(maxWords || 16, 25);
+  if (countWords(original) > maxWords || requestedMaxWords > 25) console.log("[LIVE_REPLY_LENGTH_LIMIT_APPLIED]", JSON.stringify({ requestedMaxWords, appliedMaxWords: maxWords, originalWords: countWords(original) }));
   const protectedReplies = [
     "What would you like to know?",
     "Could you please repeat that?",
@@ -395,7 +398,10 @@ function compressReplyForLiveCall(value: string, maxWords = 16) {
     .trim();
 
   clean = cleanFinalResponse(clean, "Sure. What would you like to know?", maxWords);
-  if (clean !== original) console.log("[RESPONSE_COMPRESSED]", original, "->", clean);
+  if (clean !== original) {
+    console.log("[RESPONSE_COMPRESSED]", original, "->", clean);
+    if (countWords(original) > 25) console.log("[LONG_KB_REPLY_COMPRESSED]", clean);
+  }
   console.log("[TTS_OPTIMIZED]", clean.split(/\s+/).filter(Boolean).length);
   return clean;
 }
@@ -3214,7 +3220,7 @@ async function startServer() {
       if (/\b(self[ -]?use|for self|looking for self|im looking for self|i am looking for self|own use|own|personal use|personal|investment|invest|investor|both)\b/i.test(normalized)) {
         signals.push({ field: "purpose", value: normalizeQualificationSignalValue("purpose", userText) });
       }
-      const configSignal = extractConfigurationAnswer(userText);
+      const configSignal = extractActiveConfigurationAnswer(userText) || extractConfigurationAnswer(userText);
       if (configSignal) {
         console.log("[CONFIGURATION_SIGNAL_EXTRACTED]", userText);
         signals.push({ field: "configuration", value: configSignal });
@@ -5704,10 +5710,24 @@ async function startServer() {
 
     try {
       console.log("[Vobiz Recording Webhook] Full body:", JSON.stringify(body));
-      const recordingUrl = body.RecordUrl || body.RecordFile || body.RecordingURL || body.recording_url || body.record_url || body.url || body.URL || body.file || body.file_url || body.download_url;
-      const recordingSid = body.RecordingID || body.recording_id || body.recordingId || body.RecordID || body.id;
-      const recordingStatus = recordingUrl ? "available" : (recordingSid ? "processing" : "failed");
+      let recordingPayload: any = body;
+      if (typeof body.response === "string" && body.response.trim()) {
+        try {
+          recordingPayload = { ...body, ...JSON.parse(body.response) };
+          console.log("[RECORDING_RESPONSE_PARSED]");
+        } catch (parseError) {
+          console.log("[RECORDING FAILED REASON]", "response JSON parse failed");
+        }
+      } else if (body.response && typeof body.response === "object") {
+        recordingPayload = { ...body, ...body.response };
+        console.log("[RECORDING_RESPONSE_PARSED]");
+      }
+      const recordingUrl = recordingPayload.RecordUrl || recordingPayload.RecordFile || recordingPayload.RecordingURL || recordingPayload.recording_url || recordingPayload.record_url || recordingPayload.url || recordingPayload.URL || recordingPayload.file || recordingPayload.file_url || recordingPayload.download_url;
+      const recordingSid = recordingPayload.RecordingID || recordingPayload.recording_id || recordingPayload.recordingId || recordingPayload.RecordID || recordingPayload.id;
+      const recordingCallUuid = recordingPayload.CallUUID || recordingPayload.call_uuid || recordingPayload.callUuid;
+      const recordingStatus = recordingUrl ? "completed" : (recordingSid ? "processing" : "failed");
       if (recordingUrl) {
+        console.log("[RECORDING_URL_EXTRACTED]", recordingUrl);
         console.log("[RECORDING URL SAVED]", recordingUrl);
       } else {
         console.log("[RECORDING PAYLOAD MISSING URL]", JSON.stringify(body));
@@ -5721,8 +5741,9 @@ async function startServer() {
         recordingProviderId: recordingSid,
         recordingProvider: "vobiz",
         recordingStatus,
-        recordingDuration: body.recording_duration ? parseInt(String(body.recording_duration), 10) : undefined,
-        recordingDurationMs: body.recording_duration_ms ? parseInt(String(body.recording_duration_ms), 10) : undefined,
+        vobizCallUuid: recordingCallUuid || undefined,
+        recordingDuration: recordingPayload.recording_duration ? parseInt(String(recordingPayload.recording_duration), 10) : undefined,
+        recordingDurationMs: recordingPayload.recording_duration_ms ? parseInt(String(recordingPayload.recording_duration_ms), 10) : undefined,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }));
     } catch (error) {
