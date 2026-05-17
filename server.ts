@@ -3204,7 +3204,7 @@ async function startServer() {
       return "";
     };
 
-    const extractActiveBudgetAnswer = (userText: string) => {
+    const extractActiveBudgetAnswer = (userText: string, allowBareNumber = false) => {
       const raw = normalizeTurnText(userText);
       if (!raw) return "";
       let t = raw
@@ -3242,11 +3242,15 @@ async function startServer() {
       }
 
       const bareContextualNumber = t.match(/\b(?:is|budget|range)\s+(\d+(?:\.\d+)?)\b/i) || t.match(/^\d+(?:\.\d+)?$/) || t.match(/\b(\d+(?:\.\d+)?)\b/);
-      if (bareContextualNumber && /\b(budget|range|around|under|is)\b/i.test(raw)) {
+      if (bareContextualNumber && (/\b(budget|range|around|under|is)\b/i.test(raw) || allowBareNumber)) {
         const amount = bareContextualNumber[1] || bareContextualNumber[0];
         const value = amount + " lakhs";
+        console.log("[ACTIVE_NUMERIC_FIELD_CAPTURE_ATTEMPT]", userText);
+        console.log("[BARE_NUMBER_MONEY_SIGNAL_DETECTED]", amount);
+        console.log("[MONEY_DEFAULT_UNIT_APPLIED]", "lakhs");
         console.log("[ACTIVE_BUDGET_SIGNAL_DETECTED]", userText);
         console.log("[BUDGET_SIGNAL_NORMALIZED]", value);
+        console.log("[GENERIC_NUMERIC_FIELD_STORED]", value);
         return value;
       }
 
@@ -4179,7 +4183,7 @@ async function startServer() {
         if (missing?.field !== "budget") return false;
         console.log("[ACTIVE_BUDGET_CAPTURE_ATTEMPT]", input);
         qualificationDebugSnapshot(input);
-        const budget = extractActiveBudgetAnswer(input);
+        const budget = extractActiveBudgetAnswer(input, true);
         if (!budget) return false;
         console.log("[BUDGET_FAST_PATH_BYPASSED_GENERIC_INTENT]");
         storeQualificationSignal("budget", budget, kb);
@@ -4952,7 +4956,7 @@ async function startServer() {
         };
 
         const isActivePurposeAnswer = (value: string) => /\b(self|self[ -]?use|for self|for the self|looking for self|looking for self use|looking for selfuse|looking for the self use|looking for the selfuse|own use|own|personal use|personal|end use|investment|invest|investor|for investment|looking for investment|rental income|resale|both)\b/i.test(normalizeTurnText(value));
-        const isActiveBudgetAnswer = (value: string) => Boolean(extractActiveBudgetAnswer(value)) || isIncompleteBudgetAnswer(value);
+        const isActiveBudgetAnswer = (value: string) => Boolean(extractActiveBudgetAnswer(value, true)) || isIncompleteBudgetAnswer(value);
         const isActiveTimelineAnswer = (value: string) => Boolean(normalizeTimelineAnswer(value));
         const isChannelCheckTurn = (value: string) => /^(hello|hi|hello\?|are you there|can you hear me|you there|are you listening)$/i.test(normalizeTurnText(value));
         const isCriticalCommandTurn = (value: string) => {
@@ -5035,6 +5039,12 @@ async function startServer() {
             }
             if (activeField === "budget" && isActiveBudgetAnswer(text)) {
               console.log("[VALID_SHORT_ANSWER_ROUTED]", text);
+              if (/\d/.test(text)) {
+                console.log("[NUMERIC_FIELD_LOW_CONFIDENCE_BYPASSED]", text);
+                console.log("[INCOMPLETE_HOLD_BYPASSED_ACTIVE_NUMERIC_FIELD]", text);
+                console.log("[NUMERIC_PARTIAL_NOT_BUFFERED]", text);
+                console.log("[PARTIAL_MERGE_BLOCKED_ACTIVE_NUMERIC_FIELD]", text);
+              }
               return route("valid_active_budget_answer");
             }
             if (activeField === "timeline" && isActiveTimelineAnswer(text)) {
