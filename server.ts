@@ -3751,7 +3751,7 @@ async function startServer() {
       const isPostQualPositive = (value: string) => /^(yes|yes sure|sure|okay|ok|okay sure|yes please|please|go ahead|yes do that)$/i.test(normalizeTurnText(value)) || /\b(arrange|site visit|visit|schedule|appointment|book visit|pricing|price|details|share details|team share|latest pricing|call me|team can call)\b/i.test(normalizeTurnText(value));
       const isPostQualAmbiguousPositive = (value: string) => /^(yes|yes sure|sure|okay|ok|okay sure|yes please|please|go ahead|yes do that)$/i.test(normalizeTurnText(value));
       const isPostQualSiteVisitChoice = (value: string) => /\b(site visit|visit|schedule|appointment|book visit|arrange visit|arrange site visit)\b/i.test(normalizeTurnText(value));
-      const isPostQualPricingDetailsChoice = (value: string) => /\b(pricing|price|details|share details|team share|latest pricing|latest details)\b/i.test(normalizeTurnText(value));
+      const isPostQualPricingDetailsChoice = (value: string) => /\b(details|pricing|price|latest details|pricing details|share details|share pricing|share the pricing|send details|send pricing|team share|latest pricing)\b/i.test(normalizeTurnText(value));
 
       const isGenericGreetingInput = (value: string) => ["hello", "hello?", "hi", "hi?"].includes(value.trim().toLowerCase());
       const isGenericContinueInput = (value: string) => isContinuationIntent(value);
@@ -4406,7 +4406,7 @@ async function startServer() {
       if (conversationStage === "post_qualification") {
         const hasNextStepContext = isPostQualificationNextStepOffer();
         if (hasNextStepContext) console.log("[POST_QUAL_NEXT_STEP_CONTEXT_FOUND]");
-        if (hasNextStepContext && isPostQualPositive(transcript)) {
+        if ((hasNextStepContext && isPostQualPositive(transcript)) || isPostQualSiteVisitChoice(transcript) || isPostQualPricingDetailsChoice(transcript)) {
           console.log("[POST_QUAL_POSITIVE_DETECTED]", transcript);
           if (isPostQualSiteVisitChoice(transcript)) {
             console.log("[POST_QUAL_SITE_VISIT_SELECTED]", transcript);
@@ -4417,10 +4417,12 @@ async function startServer() {
             return decision("Sure. What day and time works for the site visit?", "appointment", false, 12);
           }
           if (isPostQualPricingDetailsChoice(transcript)) {
+            console.log("[POST_QUAL_DETAILS_SELECTED]", transcript);
             console.log("[POST_QUAL_PRICING_DETAILS_SELECTED]", transcript);
-            const finalReply = "Sure. Our team will share the latest details with you shortly. Thank you.";
+            const finalReply = "Sure. Our team will share the latest pricing details shortly. Thank you.";
+            console.log("[POST_QUAL_PRICING_KB_FINALIZED]");
             console.log("[FINAL_REPLY_BEFORE_HANGUP]", finalReply);
-            requestHangupAfterTts("post_qualification_pricing_details");
+            requestHangupAfterTts("pricing_details_requested");
             return decision(finalReply, "post_qualification", false, 14);
           }
           if (isPostQualAmbiguousPositive(transcript)) {
@@ -4946,6 +4948,12 @@ async function startServer() {
             console.log("[AVAILABILITY_POSITIVE_ROUTED]", text);
             console.log("[INCOMPLETE_HOLD_BYPASSED_AVAILABILITY_POSITIVE]", text);
             return route("availability_positive");
+          }
+
+          if (conversationStage === "post_qualification" && isPostQualificationNextStepOffer() && (isPostQualPricingDetailsChoice(text) || isPostQualSiteVisitChoice(text))) {
+            console.log("[POST_QUAL_SHORT_CHOICE_ROUTED]", text);
+            console.log("[LOW_CONFIDENCE_HOLD_BYPASSED_POST_QUAL_CHOICE]", text);
+            return route("post_qualification_next_step_choice");
           }
 
           const activeField = await getActiveQualificationFieldForTurn();
