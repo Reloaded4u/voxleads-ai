@@ -3001,7 +3001,7 @@ async function startServer() {
       const fields = new Set<string>();
       if (/\b(self[ -]?use|for self|looking for self|own use|own|personal use|personal|investment|invest|investor|both)\b/i.test(t)) fields.add("purpose");
       if (extractActiveConfigurationAnswer(text)) fields.add("configuration");
-      if (/\b(lakh|lakhs|lac|crore|cr|budget|under|around|between)\b/i.test(t)) fields.add("budget");
+      if (/\b(lakh|lakhs|lac|lacs|lak|lex|crore|cr|budget|under|around|approx|approximately|between|range)\b/i.test(t)) fields.add("budget");
       if (normalizeTimelineAnswer(text) || isIncompleteTimelineAnswer(text)) fields.add("timeline");
       return fields;
     };
@@ -3018,7 +3018,11 @@ async function startServer() {
       if (!t) return false;
       if (field === "purpose") return isValidPurposeValue(value);
       if (field === "configuration") return Boolean(extractActiveConfigurationAnswer(value)) || t.split(" ").filter(Boolean).length > 0;
-      if (field === "budget") return /\b(\d+(?:\.\d+)?\s*(lakh|lakhs|lac|crore|cr)|around\s+\d+|under\s+\d+|between\s+\d+)\b/i.test(t);
+      if (field === "budget") {
+        const budget = extractActiveBudgetAnswer(value);
+        if (budget) console.log("[FIELD_VALUE_VALIDATED]", field, budget);
+        return Boolean(budget);
+      }
       if (field === "timeline") return Boolean(normalizeTimelineAnswer(value));
       return true;
     };
@@ -3187,6 +3191,59 @@ async function startServer() {
       return "";
     };
 
+    const extractActiveBudgetAnswer = (userText: string) => {
+      const raw = normalizeTurnText(userText);
+      if (!raw) return "";
+      let t = raw
+        .replace(/\b(my bad|sorry|actually|it is|its|it's|my budget is|budget is|my approximate budget range is|approximate budget range is|approximately|approx)\b/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (t !== raw) console.log("[BUDGET_FILLER_REMOVED]", userText);
+
+      const normalizeUnit = (amount: string, unit: string, prefix = "") => {
+        const normalizedUnit = /\b(crore|cr)\b/i.test(unit) ? "crore" : "lakhs";
+        const value = (prefix + amount + " " + normalizedUnit).trim();
+        console.log("[ACTIVE_BUDGET_SIGNAL_DETECTED]", userText);
+        console.log("[BUDGET_SIGNAL_NORMALIZED]", value);
+        return value;
+      };
+
+      const range = t.match(/\b(\d+(?:\.\d+)?)\s*(?:to|-)\s*(\d+(?:\.\d+)?)\s*(lakh|lakhs|lac|lacs|lak|lex|l|crore|cr)\b/i);
+      if (range) {
+        const unit = /\b(crore|cr)\b/i.test(range[3]) ? "crore" : "lakhs";
+        const value = range[1] + " to " + range[2] + " " + unit;
+        console.log("[ACTIVE_BUDGET_SIGNAL_DETECTED]", userText);
+        console.log("[BUDGET_SIGNAL_NORMALIZED]", value);
+        return value;
+      }
+
+      const explicit = t.match(/\b(\d+(?:\.\d+)?)\s*(lakh|lakhs|lac|lacs|lak|lex|l|crore|cr)\b/i);
+      if (explicit) return normalizeUnit(explicit[1], explicit[2]);
+
+      const around = t.match(/\b(around|under|between)\s+(\d+(?:\.\d+)?)\b/i);
+      if (around) {
+        const value = around[1] + " " + around[2] + " lakhs";
+        console.log("[ACTIVE_BUDGET_SIGNAL_DETECTED]", userText);
+        console.log("[BUDGET_SIGNAL_NORMALIZED]", value);
+        return value;
+      }
+
+      const bareContextualNumber = t.match(/\b(?:is|budget|range)\s+(\d+(?:\.\d+)?)\b/i) || t.match(/^\d+(?:\.\d+)?$/) || t.match(/\b(\d+(?:\.\d+)?)\b/);
+      if (bareContextualNumber && /\b(budget|range|around|under|is)\b/i.test(raw)) {
+        const amount = bareContextualNumber[1] || bareContextualNumber[0];
+        const value = amount + " lakhs";
+        console.log("[ACTIVE_BUDGET_SIGNAL_DETECTED]", userText);
+        console.log("[BUDGET_SIGNAL_NORMALIZED]", value);
+        return value;
+      }
+
+      return "";
+    };
+
+    const isIncompleteBudgetAnswer = (userText: string) => {
+      const t = normalizeTurnText(userText);
+      return /\b(my budget is|budget is|approximate budget|approximate budget range|budget range is|my approximate budget range is)\b/i.test(t) && !/\d/.test(t);
+    };
     const normalizeQualificationSignalValue = (field: string, value: string) => {
       const t = normalizeTurnText(value);
       if (field === "purpose") {
@@ -3203,6 +3260,10 @@ async function startServer() {
           console.log("[CONFIGURATION_SIGNAL_NORMALIZED]", config);
           return config;
         }
+      }
+      if (field === "budget") {
+        const budget = extractActiveBudgetAnswer(value);
+        if (budget) return budget;
       }
       if (field === "timeline") {
         const timeline = normalizeTimelineAnswer(value);
@@ -3225,8 +3286,9 @@ async function startServer() {
         console.log("[CONFIGURATION_SIGNAL_EXTRACTED]", userText);
         signals.push({ field: "configuration", value: configSignal });
       }
-      if (/\b(lakh|lakhs|lac|crore|cr|budget|under|around|between)\b/i.test(normalized)) {
-        signals.push({ field: "budget", value: userText.trim() });
+      const budgetSignal = extractActiveBudgetAnswer(userText);
+      if (budgetSignal || /\b(lakh|lakhs|lac|lacs|lak|lex|crore|cr|budget|under|around|approx|approximately|between|range)\b/i.test(normalized)) {
+        signals.push({ field: "budget", value: budgetSignal || userText.trim() });
       }
       const timelineSignal = normalizeTimelineAnswer(userText);
       if (timelineSignal) {
@@ -3246,7 +3308,7 @@ async function startServer() {
         return false;
       }
       const storedValue = normalizeQualificationSignalValue(field, value);
-      if (field === "purpose") console.log("[FIELD_VALUE_VALIDATED]", field, storedValue);
+      if (field === "purpose" || field === "budget") console.log("[FIELD_VALUE_VALIDATED]", field, storedValue);
       console.log("[FIELD_STORE_ALLOWED]", field, storedValue);
       leadData.answers[index] = storedValue;
       setQualificationField(leadData, field, storedValue);
@@ -3254,6 +3316,7 @@ async function startServer() {
         console.log("[CONFIGURATION_SIGNAL_STORED]", value);
         console.log("[CONFIGURATION_ALREADY_STORED_SKIP]", index);
       }
+      if (field === "budget") console.log("[BUDGET_SIGNAL_STORED]", storedValue);
       if (field === "timeline") console.log("[TIMELINE_SIGNAL_STORED]", storedValue);
       if (field === "purpose") console.log("[PURPOSE_SIGNAL_STORED]", storedValue);
       console.log("[QUALIFICATION_SIGNAL_STORED]", field, storedValue);
@@ -4069,6 +4132,24 @@ async function startServer() {
         return true;
       };
 
+      const storeActiveBudgetIfPresent = (input: string) => {
+        const missing = getFirstMissingQualificationIndex(kb);
+        if (missing?.field !== "budget") return false;
+        console.log("[ACTIVE_BUDGET_CAPTURE_ATTEMPT]", input);
+        qualificationDebugSnapshot(input);
+        const budget = extractActiveBudgetAnswer(input);
+        if (!budget) return false;
+        console.log("[BUDGET_FAST_PATH_BYPASSED_GENERIC_INTENT]");
+        storeQualificationSignal("budget", budget, kb);
+        currentQuestionIndex = (getQualificationFieldIndex(kb, "budget") ?? currentQuestionIndex) + 1;
+        console.log("[QUALIFICATION_ADVANCE_AFTER_STORE]");
+        console.log("[POST_STORE_VALIDATION_SKIPPED]");
+        console.log("[POST_STORE_REPEAT_BLOCKED]");
+        lastQualificationAnswerAccepted = true;
+        logQualificationDebugAfterStore();
+        return true;
+      };
+
       const storeActiveConfigurationIfPresent = (input: string) => {
         const missing = getFirstMissingQualificationIndex(kb);
         if (missing?.field !== "configuration") return false;
@@ -4105,7 +4186,15 @@ async function startServer() {
         const q = normalizeTurnText(getCurrentPendingPrompt(callData, kb));
         const t = normalizeTurnText(input);
         let clarification = "Could you clarify that?";
-        if (q.includes("budget")) clarification = "Please share an approximate budget, like 70 lakh or 1 crore.";
+        if (q.includes("budget")) {
+          if (isIncompleteBudgetAnswer(input)) {
+            console.log("[BUDGET_INCOMPLETE_AMOUNT_MISSING]", input);
+            console.log("[BUDGET_CONTEXTUAL_CLARIFICATION_USED]");
+            clarification = "Please share the amount, like 70 lakh or 1 crore.";
+          } else {
+            clarification = "Please share an approximate budget, like 70 lakh or 1 crore.";
+          }
+        }
         else if (q.includes("configuration") || q.includes("bhk")) {
           if (qualificationFieldAttempts.configuration >= 2 && /\b(i said|i told you|already told you|you are not listening|why are you repeating|listen|told already)\b/i.test(input)) {
             console.log("[CONFIG_REPEAT_LIMIT_REACHED]");
@@ -4145,6 +4234,11 @@ async function startServer() {
       }
 
       if (conversationStage === "qualification" && storeActiveConfigurationIfPresent(transcript)) {
+        const nextQuestionReply = askNextQualificationQuestion(callData, kb);
+        return decision(nextQuestionReply, conversationStage, false, 10);
+      }
+
+      if (conversationStage === "qualification" && storeActiveBudgetIfPresent(transcript)) {
         const nextQuestionReply = askNextQualificationQuestion(callData, kb);
         return decision(nextQuestionReply, conversationStage, false, 10);
       }
@@ -4808,7 +4902,7 @@ async function startServer() {
         };
 
         const isActivePurposeAnswer = (value: string) => /\b(self|self[ -]?use|for self|for the self|looking for self|looking for self use|looking for selfuse|looking for the self use|looking for the selfuse|own use|own|personal use|personal|end use|investment|invest|investor|for investment|looking for investment|rental income|resale|both)\b/i.test(normalizeTurnText(value));
-        const isActiveBudgetAnswer = (value: string) => /\b(\d+(?:\.\d+)?\s*(lakh|lakhs|lac|crore|cr)|around\s+\d+|under\s+\d+|between\s+\d+|budget|range)\b/i.test(normalizeTurnText(value));
+        const isActiveBudgetAnswer = (value: string) => Boolean(extractActiveBudgetAnswer(value)) || isIncompleteBudgetAnswer(value);
         const isActiveTimelineAnswer = (value: string) => Boolean(normalizeTimelineAnswer(value));
         const isChannelCheckTurn = (value: string) => /^(hello|hi|hello\?|are you there|can you hear me|you there|are you listening)$/i.test(normalizeTurnText(value));
         const isCriticalCommandTurn = (value: string) => {
