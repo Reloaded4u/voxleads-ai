@@ -2042,6 +2042,8 @@ async function startServer() {
     let pitchDelivered = false;
     let qualificationStarted = false;
     let appointmentPromptDelivered = false;
+    let lastQuestionType = "";
+    let awaitingIdentityConfirmation = false;
     type ConversationStage = "greeting" | "availability" | "permission" | "hook" | "pitch" | "qualification" | "post_qualification" | "appointment" | "closing" | "ended";
     let conversationStage: ConversationStage = "greeting";
     const conversationHistory: Array<{ role: string; text: string }> = [];
@@ -2827,6 +2829,17 @@ async function startServer() {
 
     const buildAvailabilityQuestion = (callData: any, kb: any) =>
       applyGreetingPlaceholders(getScriptField(kb, "availabilityCheck", "Is this a good time for a quick call?", ["availabilityQuestion"]), callData, kb);
+
+    const isIdentityConfirmationPrompt = (value: string) => /\b(am i speaking|speaking with|speaking to)\b/i.test(String(value || ""));
+    const isIdentityPositiveReply = (value: string) => {
+      const t = normalizeTurnText(value);
+      return /^(yes|yes yes|yeah|ya|yup|ji|haan|han|correct|speaking|yes speaking|speaking here|here|yes here|this call|test call here|yes this call|yes tell me|boliye|ji boliye)$/i.test(t) ||
+        /\b(yes|yeah|ya|yup|ji|haan|han|correct|speaking|here|this call|test call|boliye)\b/i.test(t);
+    };
+    const isIdentityNegativeReply = (value: string) => {
+      const t = normalizeTurnText(value);
+      return /\b(no|wrong number|not me|who is this)\b/i.test(t);
+    };
 
     const buildPermissionQuestion = (callData: any, kb: any) =>
       applyGreetingPlaceholders(contextualizePermissionLine(getScriptField(kb, "permissionLine", "May I quickly explain the details of your enquiry?", ["permissionQuestion"]), kb), callData, kb);
@@ -3989,6 +4002,35 @@ async function startServer() {
         return decision(nextQuestionReply, conversationStage, false, 18);
       }
 
+      if (awaitingIdentityConfirmation && isIdentityNegativeReply(transcript)) {
+        console.log("[IDENTITY_CONFIRMATION_NEGATIVE]", transcript);
+        const finalReply = "Sorry about that. I'll update our records. Thank you.";
+        console.log("[WRONG_PERSON_FINAL_REPLY]", finalReply);
+        requestHangupAfterTts("wrong_person");
+        return decision(finalReply, "ended", false, 12);
+      }
+
+      if (awaitingIdentityConfirmation && isIdentityPositiveReply(transcript)) {
+        console.log("[IDENTITY_CONFIRMATION_DETECTED]", transcript);
+        console.log("[IDENTITY_CONFIRMATION_TEXT_ACCEPTED]", transcript);
+        console.log("[IDENTITY_CONFIRMED]");
+        awaitingIdentityConfirmation = false;
+        lastQuestionType = "";
+        nameConfirmed = true;
+        leadData.nameConfirmed = true;
+        console.log("[AWAITING_IDENTITY_CONFIRMATION_CLEARED]");
+        console.log("[INITIAL_FLOW_ADVANCED]");
+        console.log("[PERMISSION_PROMPT_USED]");
+        return decision(buildPermissionQuestion(callData, kb), "permission", false, 12);
+      }
+
+      if (["greeting", "availability", "permission"].includes(conversationStage) && /^(hello|hi|are you there|can you hear me|you there|are you listening)$/i.test(normalizeTurnText(transcript))) {
+        console.log("[EARLY_CHANNEL_CHECK_DETECTED]", transcript);
+        console.log("[EARLY_CHANNEL_CHECK_RESPONDED]");
+        console.log("[CHANNEL_CHECK_HOLD_BYPASSED]");
+        return decision("Yes, I'm here. May I quickly explain the details?", "permission", false, 10);
+      }
+
       if ((conversationStage === "availability" || conversationStage === "permission") && (isIdentityQuestion(transcript) || isPurposeQuestion(transcript))) {
         console.log("[IDENTITY_QUESTION_DETECTED]", transcript);
         console.log("[IDENTITY_RESPONSE_USED]");
@@ -4707,6 +4749,12 @@ async function startServer() {
 
       const { callData, kb } = await loadCallContext();
       const greetingText = sanitizeOutboundReply(buildInitialGreeting(callData, kb));
+      if (isIdentityConfirmationPrompt(greetingText)) {
+        lastQuestionType = "identity_confirmation";
+        awaitingIdentityConfirmation = true;
+        console.log("[IDENTITY_CONFIRMATION_ASKED]");
+        console.log("[AWAITING_IDENTITY_CONFIRMATION_SET]");
+      }
       console.log("[GREETING SOURCE]", getCallGuidance(kb)?.greeting ? "kb" : "fallback");
       console.log("[GREETING FINAL]", greetingText);
       conversationStage = "greeting";
@@ -4943,11 +4991,30 @@ async function startServer() {
           if (!normalized) return ignore("empty_transcript");
           if (isCriticalCommandTurn(text)) return route("critical_command");
 
+          if (awaitingIdentityConfirmation && turnConfidence >= 0.5 && isIdentityPositiveReply(text)) {
+            console.log("[IDENTITY_CONFIRMATION_DETECTED]", text);
+            console.log("[IDENTITY_CONFIRMATION_TEXT_ACCEPTED]", text);
+            console.log("[IDENTITY_LOW_CONFIDENCE_BYPASSED]", turnConfidence);
+            console.log("[INCOMPLETE_HOLD_BYPASSED_IDENTITY_CONFIRMATION]", text);
+            return route("identity_confirmation_positive");
+          }
+
+          if (awaitingIdentityConfirmation && isIdentityNegativeReply(text)) {
+            console.log("[IDENTITY_CONFIRMATION_NEGATIVE]", text);
+            return route("identity_confirmation_negative");
+          }
+
           if (["availability", "permission"].includes(conversationStage) && isAvailabilityPositivePhrase(text)) {
             console.log("[AVAILABILITY_POSITIVE_DETECTED]", text);
             console.log("[AVAILABILITY_POSITIVE_ROUTED]", text);
             console.log("[INCOMPLETE_HOLD_BYPASSED_AVAILABILITY_POSITIVE]", text);
             return route("availability_positive");
+          }
+
+          if (["greeting", "availability", "permission"].includes(conversationStage) && isChannelCheckTurn(text)) {
+            console.log("[EARLY_CHANNEL_CHECK_DETECTED]", text);
+            console.log("[CHANNEL_CHECK_HOLD_BYPASSED]", text);
+            return route("early_channel_check");
           }
 
           if (conversationStage === "post_qualification" && isPostQualificationNextStepOffer() && (isPostQualPricingDetailsChoice(text) || isPostQualSiteVisitChoice(text))) {
@@ -5004,6 +5071,10 @@ async function startServer() {
           if (partialAgeMs <= 2000) {
             transcript = `${pendingPartialTranscript} ${transcript}`.trim();
             console.log("[PARTIAL_TRANSCRIPT_MERGED]", transcript);
+            if (awaitingIdentityConfirmation && isIdentityPositiveReply(transcript)) {
+              console.log("[PARTIAL_IDENTITY_CONFIRMATION_MERGED]", transcript);
+              console.log("[PARTIAL_IDENTITY_CONFIRMATION_ROUTED]", transcript);
+            }
             if (conversationStage === "appointment") console.log("[APPOINTMENT_PARTIAL_MERGED]", transcript);
             if (conversationStage === "post_qualification") console.log("[POST_QUAL_PARTIAL_MERGED]", transcript);
           }
@@ -5014,7 +5085,7 @@ async function startServer() {
 
         const finalizedTurn = await finalizeUserTurn(transcript, confidence, preloadedCallContext?.callData);
         transcript = finalizedTurn.text;
-        const bypassIncompleteFragmentHold = finalizedTurn.action === "route" && /^(valid_active_|channel_check|critical_command|availability_positive)/.test(finalizedTurn.reason);
+        const bypassIncompleteFragmentHold = finalizedTurn.action === "route" && /^(valid_active_|channel_check|critical_command|availability_positive|post_qualification_next_step_choice|identity_confirmation_|early_channel_check)/.test(finalizedTurn.reason);
 
         if (finalizedTurn.action === "hold") {
           pendingPartialTranscript = transcript;
