@@ -2094,6 +2094,7 @@ async function startServer() {
     let bargeInBuffers: Buffer[] = [];
     let pendingBargeInAudio: Buffer | null = null;
     const BARGE_IN_WINDOW_FRAMES = 35;
+    const BARGE_IN_ENABLED = process.env.VOBIZ_BARGE_IN_ENABLED === "true";
     const appointmentData: {
       requested: boolean;
       type: string | null;
@@ -2241,6 +2242,7 @@ async function startServer() {
       }
       console.log("[PENDING_HANGUP_AFTER_TTS_SET]", reason);
       console.log("[AI_HANGUP_REQUESTED]", reason);
+      console.log("[CALL_HANGUP_REQUESTED]", reason);
     };
 
     const clearClosingSilenceTimer = () => {
@@ -4456,18 +4458,26 @@ async function startServer() {
           console.log("[POST_QUAL_POSITIVE_DETECTED]", transcript);
           if (isPostQualSiteVisitChoice(transcript)) {
             console.log("[POST_QUAL_SITE_VISIT_SELECTED]", transcript);
-            console.log("[SCHEDULING_STAGE_STARTED]");
             appointmentData.requested = true;
             appointmentData.type = appointmentData.type || "site visit";
+            leadData.outcome = "qualified";
             console.log("[APPOINTMENT DATA UPDATED]", JSON.stringify(appointmentData));
-            return decision("Sure. What day and time works for the site visit?", "appointment", false, 12);
+            const finalReply = "Sure. I'll have the team help with the site visit. Thank you for your time.";
+            console.log("[POST_QUAL_FINAL_REPLY]", finalReply);
+            console.log("[FINAL_REPLY_BEFORE_HANGUP]", finalReply);
+            console.log("[CALL_COMPLETION_TRUE]", "post_qualification_site_visit_requested");
+            requestHangupAfterTts("post_qualification_site_visit_requested");
+            return decision(finalReply, "post_qualification", false, 16);
           }
           if (isPostQualPricingDetailsChoice(transcript)) {
             console.log("[POST_QUAL_DETAILS_SELECTED]", transcript);
             console.log("[POST_QUAL_PRICING_DETAILS_SELECTED]", transcript);
+            leadData.outcome = "qualified";
             const finalReply = "Sure. Our team will share the latest pricing details shortly. Thank you.";
             console.log("[POST_QUAL_PRICING_KB_FINALIZED]");
+            console.log("[POST_QUAL_FINAL_REPLY]", finalReply);
             console.log("[FINAL_REPLY_BEFORE_HANGUP]", finalReply);
+            console.log("[CALL_COMPLETION_TRUE]", "pricing_details_requested");
             requestHangupAfterTts("pricing_details_requested");
             return decision(finalReply, "post_qualification", false, 14);
           }
@@ -4856,6 +4866,14 @@ async function startServer() {
           console.log("[CALL COMPLETED] no further processing");
           callCompletedLogged = true;
         }
+        return;
+      }
+      if (state === "SPEAKING") {
+        console.log("[STT_SUPPRESSED_DURING_SPEAKING]");
+        return;
+      }
+      if (state === "COOLDOWN") {
+        console.log("[STT_SUPPRESSED_DURING_COOLDOWN]");
         return;
       }
       if (state !== "LISTENING" || isEnded()) return;
@@ -5469,6 +5487,8 @@ async function startServer() {
           console.log("[AUDIO_PROCESSING_BLOCKED_CALL_ENDING]", hangupReason || "pending_hangup");
           return;
         }
+        console.log("[STT_SUPPRESSED_DURING_SPEAKING]");
+        if (!BARGE_IN_ENABLED) return;
         bargeInBuffers.push(decoded);
         if (bargeInBuffers.length >= BARGE_IN_WINDOW_FRAMES) {
           const combined = Buffer.concat(bargeInBuffers);
@@ -5478,7 +5498,12 @@ async function startServer() {
         return;
       }
 
-      if (state === "PROCESSING" || state === "COOLDOWN" || isEnded()) {
+      if (state === "COOLDOWN") {
+        console.log("[STT_SUPPRESSED_DURING_COOLDOWN]");
+        return;
+      }
+
+      if (state === "PROCESSING" || isEnded()) {
         return;
       }
 
