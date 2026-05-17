@@ -2465,26 +2465,39 @@ async function startServer() {
       return "general";
     };
 
-    const isContinuationIntent = (text: string) => {
+    const isAvailabilityPositivePhrase = (text: string) => {
       const t = normalizeTurnText(text);
       return [
         "yes",
-        "yes we can talk",
-        "okay",
-        "ok",
-        "okay go ahead",
-        "go ahead",
-        "continue",
+        "yes please",
+        "yes tell me",
         "tell me",
-        "yes explain",
-        "explain",
+        "go ahead",
+        "please explain",
+        "can talk",
+        "we can talk",
+        "yes we can talk",
+        "i can talk",
+        "okay tell me",
+        "okay go ahead",
         "sure",
-        "speak",
-        "proceed",
+        "continue",
       ].includes(t) || /\b(yes|okay|ok|sure)\b.*\b(explain|continue|go ahead|tell me|speak|proceed)\b/i.test(t);
     };
 
-    const isSemanticAvailabilityConfirmation = (text: string) => isContinuationIntent(text) || isPositiveNameConfirmation(text);
+    const isContinuationIntent = (text: string) => {
+      const t = normalizeTurnText(text);
+      return isAvailabilityPositivePhrase(text) || [
+        "okay",
+        "ok",
+        "yes explain",
+        "explain",
+        "speak",
+        "proceed",
+      ].includes(t);
+    };
+
+    const isSemanticAvailabilityConfirmation = (text: string) => isAvailabilityPositivePhrase(text) || isContinuationIntent(text) || isPositiveNameConfirmation(text);
     const isPermissionPositive = (text: string) => isContinuationIntent(text) || isPositiveNameConfirmation(text);
     const isPermissionNegative = (text: string) => /\b(no|not interested)\b/i.test(text);
     const isBusyOrCallLater = (text: string) => isExplicitSchedulingRequest(text);
@@ -3824,7 +3837,14 @@ async function startServer() {
         return answerAppointmentConfirmationQuestion();
       }
 
-      extractAndStoreQualificationSignals(transcript, kb);
+      const storedAnyQualificationSignalThisTurn = extractAndStoreQualificationSignals(transcript, kb);
+      if (conversationStage === "qualification" && storedAnyQualificationSignalThisTurn) {
+        console.log("[QUALIFICATION_ADVANCE_AFTER_STORE]");
+        console.log("[POST_STORE_VALIDATION_SKIPPED]");
+        console.log("[POST_STORE_REPEAT_BLOCKED]");
+        const nextQuestionReply = askNextQualificationQuestion(callData, kb);
+        return decision(nextQuestionReply, conversationStage, false, 18);
+      }
 
       if ((conversationStage === "availability" || conversationStage === "permission") && (isIdentityQuestion(transcript) || isPurposeQuestion(transcript))) {
         console.log("[IDENTITY_QUESTION_DETECTED]", transcript);
@@ -3856,15 +3876,18 @@ async function startServer() {
 
       const advanceScriptAfterConfirmation = () => {
         if (conversationStage === "availability" && isSemanticAvailabilityConfirmation(transcript)) {
+          console.log("[AVAILABILITY_POSITIVE_DETECTED]", transcript);
           console.log("[SEMANTIC_CONFIRMATION_DETECTED]", transcript);
           availabilityDelivered = true;
           markCompletedStage("availability");
           console.log("[AVAILABILITY_COMPLETED]");
+          console.log("[AVAILABILITY_STAGE_ADVANCED]");
           console.log("[STAGE_REPLAY_BLOCKED]", "availability");
           const nextStageReply = getStageReply("permission", callData, kb);
           return decision(nextStageReply.reply, nextStageReply.nextStage, false, 14);
         }
         if (conversationStage === "permission" && isContinuationIntent(transcript)) {
+          console.log("[AVAILABILITY_POSITIVE_DETECTED]", transcript);
           console.log("[SEMANTIC_CONFIRMATION_DETECTED]", transcript);
           permissionDelivered = true;
           markCompletedStage("permission");
@@ -4663,6 +4686,13 @@ async function startServer() {
           if (!normalized) return ignore("empty_transcript");
           if (isCriticalCommandTurn(text)) return route("critical_command");
 
+          if (["availability", "permission"].includes(conversationStage) && isAvailabilityPositivePhrase(text)) {
+            console.log("[AVAILABILITY_POSITIVE_DETECTED]", text);
+            console.log("[AVAILABILITY_POSITIVE_ROUTED]", text);
+            console.log("[INCOMPLETE_HOLD_BYPASSED_AVAILABILITY_POSITIVE]", text);
+            return route("availability_positive");
+          }
+
           const activeField = await getActiveQualificationFieldForTurn();
           if (conversationStage === "qualification") {
             if (activeField === "configuration" && extractActiveConfigurationAnswer(text)) {
@@ -4721,7 +4751,7 @@ async function startServer() {
 
         const finalizedTurn = await finalizeUserTurn(transcript, confidence, preloadedCallContext?.callData);
         transcript = finalizedTurn.text;
-        const bypassIncompleteFragmentHold = finalizedTurn.action === "route" && /^(valid_active_|channel_check|critical_command)/.test(finalizedTurn.reason);
+        const bypassIncompleteFragmentHold = finalizedTurn.action === "route" && /^(valid_active_|channel_check|critical_command|availability_positive)/.test(finalizedTurn.reason);
 
         if (finalizedTurn.action === "hold") {
           pendingPartialTranscript = transcript;
