@@ -5835,7 +5835,33 @@ ${speakXml}  </Gather>
       const callRef = db.collection("calls").doc(callId as string);
       const callSnap = await callRef.get();
       const callData = callSnap.data() || {};
-      const hangupBeforeStream = String(event || "").toLowerCase() === "hangup" && !callData.vobizStreamId;
+      const eventName = String(event || "").toLowerCase();
+      const isHangupEvent = eventName === "hangup";
+      const hangupBeforeStream = isHangupEvent && !callData.vobizStreamId;
+      const pickBodyValue = (...keys: string[]) => {
+        for (const key of keys) {
+          const value = body?.[key];
+          if (value !== undefined && value !== null && String(value).trim()) return value;
+        }
+        return undefined;
+      };
+      const hangupDiagnostics = {
+        internalCallId: callId || "",
+        requestUuid: ids.requestUuid || callData.vobizRequestUuid || "",
+        callUuid: ids.callUuid || callData.vobizCallUuid || "",
+        callStatus: pickBodyValue("CallStatus", "callStatus", "call_status", "Status", "status"),
+        hangupCause: pickBodyValue("HangupCause", "hangupCause", "hangup_cause", "Cause", "cause"),
+        hangupCauseCode: pickBodyValue("HangupCauseCode", "hangupCauseCode", "hangup_cause_code", "CauseCode", "causeCode"),
+        hangupCauseName: pickBodyValue("HangupCauseName", "hangupCauseName", "hangup_cause_name", "CauseName", "causeName"),
+        hangupSource: pickBodyValue("HangupSource", "hangupSource", "hangup_source", "HangupBy", "hangupBy"),
+        duration: pickBodyValue("Duration", "duration", "CallDuration", "callDuration"),
+        billDuration: pickBodyValue("BillDuration", "billDuration", "bill_duration", "BillingDuration", "billingDuration"),
+        answerTime: pickBodyValue("AnswerTime", "answerTime", "answer_time", "AnsweredAt", "answeredAt"),
+        startTime: pickBodyValue("StartTime", "startTime", "start_time", "StartedAt", "startedAt"),
+        endTime: pickBodyValue("EndTime", "endTime", "end_time", "EndedAt", "endedAt"),
+        from: pickBodyValue("From", "from", "Caller", "caller"),
+        to: pickBodyValue("To", "to", "Callee", "callee"),
+      };
       const updates: any = {
         status: hangupBeforeStream ? "not_connected" : finalStatus,
         providerCallId: callData.providerCallId || ids.callUuid || ids.requestUuid || undefined,
@@ -5845,6 +5871,26 @@ ${speakXml}  </Gather>
         vobizApiId: ids.apiId || undefined,
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       };
+
+      if (isHangupEvent) {
+        console.log("[VOBIZ_HANGUP_DIAGNOSTICS]", JSON.stringify(hangupDiagnostics));
+        updates.vobizHangupCause = hangupDiagnostics.hangupCause || undefined;
+        updates.vobizHangupCauseCode = hangupDiagnostics.hangupCauseCode || undefined;
+        updates.vobizHangupCauseName = hangupDiagnostics.hangupCauseName || undefined;
+        updates.vobizHangupSource = hangupDiagnostics.hangupSource || undefined;
+        updates.vobizCallStatus = hangupDiagnostics.callStatus || undefined;
+        updates.vobizDuration = hangupDiagnostics.duration || undefined;
+        updates.vobizBillDuration = hangupDiagnostics.billDuration || undefined;
+        updates.endReason = hangupDiagnostics.hangupCauseName || hangupDiagnostics.hangupCause || hangupDiagnostics.callStatus || "provider_hangup";
+        console.log("[VOBIZ_HANGUP_REASON_SAVED]", JSON.stringify({
+          internalCallId: callId || "",
+          endReason: updates.endReason,
+          hangupCause: updates.vobizHangupCause || "",
+          hangupCauseCode: updates.vobizHangupCauseCode || "",
+          hangupCauseName: updates.vobizHangupCauseName || "",
+          hangupSource: updates.vobizHangupSource || ""
+        }));
+      }
 
       if (hangupBeforeStream) {
         console.log("[VOBIZ_CALL_HANGUP_BEFORE_STREAM]", callId);
