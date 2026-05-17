@@ -1403,6 +1403,68 @@ async function stopVobizRecording(callId: string, callUuid: string, vobizConfig:
   console.log(`[Vobiz Recording] stopped callId=${callId} callUuid=${callUuid}`);
 }
 
+function getVobizProviderCallId(callData: any) {
+  return String(
+    callData?.providerCallId ||
+    callData?.vobizCallId ||
+    callData?.callSid ||
+    callData?.call_id ||
+    callData?.callId ||
+    callData?.uuid ||
+    callData?.sessionId ||
+    ""
+  ).trim();
+}
+
+async function terminateVobizCall(callData: any, reason: string) {
+  console.log("[VOBIZ_HANGUP_REQUESTED]", reason);
+  const providerCallId = getVobizProviderCallId(callData);
+  console.log("[VOBIZ_HANGUP_CALL_ID]", providerCallId || "missing");
+
+  if (!providerCallId) {
+    console.log("[VOBIZ_HANGUP_NOT_CONFIGURED]", "missing provider call id");
+    return false;
+  }
+
+  const ownerId = String(callData?.ownerId || "").trim();
+  const vobizConfig = ownerId ? await getVobizConfig(ownerId) : null;
+  if (!vobizConfig) {
+    console.log("[VOBIZ_HANGUP_NOT_CONFIGURED]", "missing Vobiz auth config");
+    return false;
+  }
+
+  const template = String(process.env.VOBIZ_HANGUP_URL_TEMPLATE || process.env.VOBIZ_CALL_HANGUP_URL_TEMPLATE || "").trim();
+  const endpoint = template
+    ? template
+        .replace(/\{authId\}/g, encodeURIComponent(vobizConfig.authId))
+        .replace(/\{callId\}/g, encodeURIComponent(providerCallId))
+        .replace(/\{callUuid\}/g, encodeURIComponent(providerCallId))
+    : `https://api.vobiz.ai/api/v1/Account/${encodeURIComponent(vobizConfig.authId)}/Call/${encodeURIComponent(providerCallId)}/`;
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "DELETE",
+      headers: {
+        "X-Auth-ID": vobizConfig.authId,
+        "X-Auth-Token": vobizConfig.authToken,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ reason }),
+    });
+    console.log("[VOBIZ_HANGUP_RESPONSE_STATUS]", response.status);
+    if (!response.ok && response.status !== 202 && response.status !== 204) {
+      const body = await response.text().catch(() => "");
+      console.log("[VOBIZ_HANGUP_FAILED]", body.slice(0, 300) || `status ${response.status}`);
+      return false;
+    }
+    console.log("[VOBIZ_HANGUP_SUCCESS]", providerCallId);
+    return true;
+  } catch (error) {
+    console.log("[VOBIZ_HANGUP_FAILED]", error instanceof Error ? error.message : String(error));
+    return false;
+  }
+}
+
 async function ensureVobizRecordingStarted(callId?: string | null, ownerId?: string | null) {
   if (!callId || !ownerId) return;
 
@@ -2123,6 +2185,15 @@ async function startServer() {
       pendingHangupAfterTts = true;
       callEndingRequested = true;
       hangupReason = reason;
+      if (callId) {
+        void db.collection("calls").doc(callId).update(sanitizeForFirestore({
+          ending: true,
+          callControlState: "ending",
+          controlState: "ending",
+          callEndReason: reason,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        })).catch((error) => console.error("[CALL CONTROL END UPDATE FAILED]", error));
+      }
       console.log("[PENDING_HANGUP_AFTER_TTS_SET]", reason);
       console.log("[AI_HANGUP_REQUESTED]", reason);
     };
@@ -2141,6 +2212,7 @@ async function startServer() {
           status: "completed",
           controlState: "call_ended",
           callControlState: "call_ended",
+          ending: false,
           endedBy: "ai",
           endReason: reason,
           endedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -2148,6 +2220,7 @@ async function startServer() {
           leadData,
           appointmentData,
         })).catch((error) => console.error("[CALL CONTROL END UPDATE FAILED]", error));
+        console.log("[CONTROL_STATE_CALL_ENDED_AI_HANGUP]", callId);
         liveCallTranscriptBuffers.delete(callId);
       }
     };
@@ -2156,11 +2229,24 @@ async function startServer() {
       clearClosingSilenceTimer();
       console.log("[FINAL_TTS_PLAYED_HANGUP_NOW]", reason);
       console.log("[AI_HANGUP_AFTER_TTS]", reason);
-      console.log("[WS_CLOSE_AI_COMPLETED_CALL]", callId);
+      const latestCallSnap = callId ? await db.collection("calls").doc(callId).get().catch(() => null) : null;
+      const latestCallData = latestCallSnap?.data?.() || { ownerId };
+      const hangupSucceeded = await terminateVobizCall({ ...latestCallData, ownerId: latestCallData.ownerId || ownerId }, reason);
       await markLiveCallEnded(reason);
       state = "ENDING";
       moveStage("ended");
+      console.log("[WS_CLOSE_AI_COMPLETED_CALL]", callId);
       if (ws.readyState === 1) ws.close(1000, "AI completed call");
+      setTimeout(async () => {
+        if (!hangupSucceeded || ws.readyState !== 3) {
+          console.log("[VOBIZ_HANGUP_RETRY]", callId);
+          if (!hangupSucceeded) await terminateVobizCall({ ...latestCallData, ownerId: latestCallData.ownerId || ownerId }, reason);
+          if (ws.readyState !== 3 && typeof ws.terminate === "function") {
+            console.log("[WS_FORCE_TERMINATE_AFTER_HANGUP_TIMEOUT]", callId);
+            ws.terminate();
+          }
+        }
+      }, 3000);
       endCall();
     };
 
@@ -5081,10 +5167,13 @@ async function startServer() {
             throw new Error(vobizData?.message || `Vobiz API failed with status ${vobizResponse.status}`);
           }
 
-          const vobizCallId = vobizData.call_id || vobizData.id || vobizData.uuid || `vobiz-${Date.now()}`;
+          const vobizCallId = vobizData.call_id || vobizData.callId || vobizData.id || vobizData.uuid || vobizData.sessionId || vobizData.providerCallId || vobizData.vobizCallId || `vobiz-${Date.now()}`;
+          console.log("[VOBIZ_PROVIDER_CALL_ID_STORED]", vobizCallId);
 
           await db.collection('calls').doc(callId).update(sanitizeForFirestore({
             callSid: vobizCallId,
+            providerCallId: vobizCallId,
+            vobizCallId,
             provider: 'vobiz',
             status: 'initiated',
             recordingStatus: recordingEnabled ? 'requested' : null,
@@ -6176,6 +6265,7 @@ server.listen(PORT, "0.0.0.0", () => {
 }
 
 startServer();
+
 
 
 
