@@ -2697,6 +2697,17 @@ async function startServer() {
         (/^do you hear any$/i.test(normalized) && confidence < 0.75);
     };
 
+    const isPostQualificationNextStepOffer = (text = lastAiReply): boolean => {
+      const normalized = normalizeTurnText(String(text || ""));
+      if (!normalized) return false;
+      const positiveSignals = [
+        "yes", "yeah", "yep", "sure", "ok", "okay", "please", "go ahead",
+        "share", "send", "tell me", "details", "pricing", "price", "latest pricing",
+        "brochure", "site visit", "visit", "arrange", "callback", "call back", "team", "contact me",
+      ];
+      return positiveSignals.some((signal) => normalized.includes(signal));
+    };
+
     const isIncompleteSpeechFragment = (text: string, confidence = 1) => {
       const normalized = normalizeTurnText(text);
       if (!normalized || isClearShortCommand(text) || isDisinterestIntent(text)) return false;
@@ -3766,7 +3777,7 @@ async function startServer() {
         return meaningfulWordCount(value) > 0 && meaningfulWordCount(value) < 3 && detectIntentType(value) === "general_question";
       };
 
-      const isPostQualificationNextStepOffer = () => /\b(arrange.*visit|site visit|latest pricing|pricing details|share latest|team share.*details|team share.*pricing)\b/i.test(normalizeTurnText(lastAiReply));
+      const wasPostQualificationNextStepOffer = () => /\b(arrange.*visit|site visit|latest pricing|pricing details|share latest|team share.*details|team share.*pricing)\b/i.test(normalizeTurnText(lastAiReply));
       const isPostQualPositive = (value: string) => /^(yes|yes sure|sure|okay|ok|okay sure|yes please|please|go ahead|yes do that)$/i.test(normalizeTurnText(value)) || /\b(arrange|site visit|visit|schedule|appointment|book visit|pricing|price|details|share details|team share|latest pricing|call me|team can call)\b/i.test(normalizeTurnText(value));
       const isPostQualAmbiguousPositive = (value: string) => /^(yes|yes sure|sure|okay|ok|okay sure|yes please|please|go ahead|yes do that)$/i.test(normalizeTurnText(value));
       const isPostQualSiteVisitChoice = (value: string) => /\b(site visit|visit|schedule|appointment|book visit|arrange visit|arrange site visit)\b/i.test(normalizeTurnText(value));
@@ -4452,8 +4463,20 @@ async function startServer() {
       }
 
       if (conversationStage === "post_qualification") {
-        const hasNextStepContext = isPostQualificationNextStepOffer();
+        const hasNextStepContext = wasPostQualificationNextStepOffer();
+        const wantsPostQualNextStep = typeof isPostQualificationNextStepOffer === "function"
+          ? isPostQualificationNextStepOffer(transcript)
+          : /yes|sure|share|pricing|details|site visit|callback/i.test(transcript || "");
         if (hasNextStepContext) console.log("[POST_QUAL_NEXT_STEP_CONTEXT_FOUND]");
+        if (hasNextStepContext && wantsPostQualNextStep) {
+          leadData.outcome = "qualified";
+          const finalReply = "Sure. The team will share latest pricing details and help with the next step. Thank you.";
+          console.log("[POST_QUAL_FINAL_REPLY]", finalReply);
+          console.log("[FINAL_REPLY_BEFORE_HANGUP]", finalReply);
+          console.log("[CALL_COMPLETION_TRUE]", "post_qualification_next_step_confirmed");
+          requestHangupAfterTts("post_qualification_next_step_confirmed");
+          return decision(finalReply, "post_qualification", false, 18);
+        }
         if ((hasNextStepContext && isPostQualPositive(transcript)) || isPostQualSiteVisitChoice(transcript) || isPostQualPricingDetailsChoice(transcript)) {
           console.log("[POST_QUAL_POSITIVE_DETECTED]", transcript);
           if (isPostQualSiteVisitChoice(transcript)) {
@@ -5039,10 +5062,15 @@ async function startServer() {
             return route("early_channel_check");
           }
 
-          if (conversationStage === "post_qualification" && isPostQualificationNextStepOffer() && (isPostQualPricingDetailsChoice(text) || isPostQualSiteVisitChoice(text))) {
-            console.log("[POST_QUAL_SHORT_CHOICE_ROUTED]", text);
-            console.log("[LOW_CONFIDENCE_HOLD_BYPASSED_POST_QUAL_CHOICE]", text);
-            return route("post_qualification_next_step_choice");
+          if (conversationStage === "post_qualification") {
+            const wantsPostQualNextStep = typeof isPostQualificationNextStepOffer === "function"
+              ? isPostQualificationNextStepOffer(text)
+              : /yes|sure|share|pricing|details|site visit|callback/i.test(text || "");
+            if (wantsPostQualNextStep || isPostQualPricingDetailsChoice(text) || isPostQualSiteVisitChoice(text)) {
+              console.log("[POST_QUAL_SHORT_CHOICE_ROUTED]", text);
+              console.log("[LOW_CONFIDENCE_HOLD_BYPASSED_POST_QUAL_CHOICE]", text);
+              return route("post_qualification_next_step_choice");
+            }
           }
 
           const activeField = await getActiveQualificationFieldForTurn();
